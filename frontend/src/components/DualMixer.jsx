@@ -946,13 +946,15 @@ export default function DualMixer() {
                     const status = beatmatchStatus[slot];
                     const statusEmoji = status === 'beatmatching' ? '⏳' : status === 'done' ? '✅' : '❌';
                     const sourceBpm = getEffectiveBpm(slot);
+                    const sourceKey = getEffectiveKey(slot);
                     const targetBpmForSlot = targetBpm || (slot === 1 ? getEffectiveBpm(0) : null);
+                    const targetKeyForSlot = targetKey || sourceKey;
 
                     return (
                       <div key={slot} style={{ color: '#aaa' }}>
                         <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong>
                         <br />
-                        {sourceBpm} → {targetBpmForSlot} BPM <span style={{ marginLeft: '8px' }}>{statusEmoji} {status === 'beatmatching' ? 'Beatmatching...' : status === 'done' ? 'Ready' : 'Failed'}</span>
+                        {sourceBpm} → {targetBpmForSlot} BPM {sourceKey && targetKeyForSlot && `| ${sourceKey} → ${targetKeyForSlot}`} <span style={{ marginLeft: '8px' }}>{statusEmoji} {status === 'beatmatching' ? 'Beatmatching...' : status === 'done' ? 'Ready' : 'Failed'}</span>
                       </div>
                     );
                   })}
