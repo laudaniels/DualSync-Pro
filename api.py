@@ -69,11 +69,9 @@ def separate_stems():
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
-        # Get BPM and key
-        logging.info("Analyzing BPM...")
-        bpm, _ = engine.analyze_track(str(file_path))
-        logging.info("Analyzing Key...")
-        key = engine.analyze_key(str(file_path))
+        # Get BPM and key (combined single-pass analysis)
+        logging.info("Analyzing BPM and Key...")
+        bpm, beat_anchor, key = engine.analyze_track_and_key(str(file_path))
         key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
 
         # Separate stems
@@ -418,10 +416,17 @@ def render_final_mix():
             try:
                 audio = FLAC(str(final_flac))
                 audio['TITLE'] = f'{mix_name} Mix'
-                audio['BPM'] = str(int(float(bpm)))
+                # Extract numeric BPM from various formats (e.g., "115", "115.5", "115-manual-115-measured")
+                bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
+                try:
+                    audio['BPM'] = str(int(float(bpm_str)))
+                except (ValueError, IndexError):
+                    audio['BPM'] = str(bpm)
                 audio['INITIALKEY'] = str(key)
+                audio['ARTIST'] = 'DualSync Pro'
+                audio['COMMENT'] = 'Mixed with DualSync Pro'
                 audio.save()
-                logging.info(f"✅ Tagged FLAC: {final_flac.name}")
+                logging.info(f"✅ Tagged FLAC: {final_flac.name} (BPM: {audio['BPM'][0] if 'BPM' in audio else '?'}, Key: {key})")
             except Exception as tag_err:
                 logging.error(f"FLAC tagging failed: {tag_err}")
 
@@ -503,9 +508,16 @@ def download_stems_zip():
                                 # Add FLAC tags
                                 try:
                                     audio = FLAC(str(flac_path))
-                                    audio['TITLE'] = song_name
-                                    audio['BPM'] = str(int(float(bpm)))
+                                    audio['TITLE'] = f'{song_name} ({stem})'
+                                    # Extract numeric BPM from various formats
+                                    bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
+                                    try:
+                                        audio['BPM'] = str(int(float(bpm_str)))
+                                    except (ValueError, IndexError):
+                                        audio['BPM'] = str(bpm)
                                     audio['INITIALKEY'] = str(key)
+                                    audio['ARTIST'] = song_name
+                                    audio['COMMENT'] = f'{stem} stem - DualSync Pro'
                                     audio.save()
                                     logging.info(f"✅ Tagged FLAC: {flac_name}")
                                 except Exception as tag_err:
@@ -540,9 +552,16 @@ def download_stems_zip():
                                 # Add FLAC tags
                                 try:
                                     audio = FLAC(str(flac_path))
-                                    audio['TITLE'] = song_name
-                                    audio['BPM'] = str(int(float(bpm)))
+                                    audio['TITLE'] = f'{song_name} ({stem})'
+                                    # Extract numeric BPM from various formats
+                                    bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
+                                    try:
+                                        audio['BPM'] = str(int(float(bpm_str)))
+                                    except (ValueError, IndexError):
+                                        audio['BPM'] = str(bpm)
                                     audio['INITIALKEY'] = str(key)
+                                    audio['ARTIST'] = song_name
+                                    audio['COMMENT'] = f'{stem} stem - DualSync Pro'
                                     audio.save()
                                     logging.info(f"✅ Tagged FLAC: {flac_name}")
                                 except Exception as tag_err:

@@ -461,60 +461,23 @@ export default function DualMixer() {
     }
   };
 
-  // Handle target key change
-  const handleTargetKeyChange = async (newTargetKey) => {
-    if (!newTargetKey) {
-      alert('⚠️  Please select a target key');
-      return;
-    }
-
-    setIsTransposing(true);
-    setTransposingProgress(0);
-
-    // Fake progress animation
-    const progressInterval = setInterval(() => {
-      setTransposingProgress(prev => Math.min(prev + Math.random() * 20, 80));
-    }, 600);
-
-    try {
-      // Process all loaded songs
-      for (let slot = 0; slot < 2; slot++) {
-        if (stems[slot]) {
-          await processStems(slot, targetBpm, newTargetKey);
-        }
-      }
-      // Complete progress
-      setTransposingProgress(100);
-      // Track last processed Key
-      setLastProcessedKey(newTargetKey);
-      // Update metadata with new key after transposition
-      setMetadata(prev => {
-        const updated = [...prev];
-        for (let i = 0; i < updated.length; i++) {
-          if (updated[i]) {
-            updated[i] = { ...updated[i], key: newTargetKey };
-          }
-        }
-        return updated;
-      });
-    } finally {
-      clearInterval(progressInterval);
-      setTimeout(() => {
-        setIsTransposing(false);
-        setTransposingProgress(0);
-      }, 500);
-    }
-  };
-
-  // Handle target BPM change with combined processing
+  // Handle target BPM change
   const handleTargetBpmChange = (newTargetBpm) => {
-    // Just update state, don't trigger processing
-    setTargetBpm(newTargetBpm);
+    setTargetBpm(newTargetBpm ? parseFloat(newTargetBpm) : null);
   };
 
-  const handleProcessBpmClick = async () => {
-    if (!targetBpm || targetBpm <= 0) {
-      alert('⚠️  Please enter a valid target BPM (> 0)');
+  // Handle target key change
+  const handleTargetKeyChange = (newTargetKey) => {
+    setTargetKey(newTargetKey || null);
+  };
+
+  // Unified process for both BPM and Key changes
+  const handleProcessAllChanges = async () => {
+    const needsBpmChange = targetBpm && targetBpm > 0 && bpmChanged;
+    const needsKeyChange = targetKey && keyChanged;
+
+    if (!needsBpmChange && !needsKeyChange) {
+      alert('⚠️  Please set a target BPM or key, and ensure it differs from current');
       return;
     }
 
@@ -527,7 +490,7 @@ export default function DualMixer() {
     }, 600);
 
     try {
-      // Process all loaded songs
+      // Process all loaded songs with both BPM and Key
       for (let slot = 0; slot < 2; slot++) {
         if (stems[slot]) {
           await processStems(slot, targetBpm, targetKey);
@@ -535,8 +498,22 @@ export default function DualMixer() {
       }
       // Complete progress
       setProcessingProgress(100);
-      // Track last processed BPM
-      setLastProcessedBpm(targetBpm);
+      // Track last processed values
+      if (needsBpmChange) setLastProcessedBpm(targetBpm);
+      if (needsKeyChange) setLastProcessedKey(targetKey);
+
+      // Update metadata with new key if transposed
+      if (needsKeyChange) {
+        setMetadata(prev => {
+          const updated = [...prev];
+          for (let i = 0; i < updated.length; i++) {
+            if (updated[i]) {
+              updated[i] = { ...updated[i], key: targetKey };
+            }
+          }
+          return updated;
+        });
+      }
     } finally {
       clearInterval(progressInterval);
       setTimeout(() => {
@@ -818,13 +795,19 @@ export default function DualMixer() {
                 color: '#94a3b8',
                 marginTop: '10px'
               }}>
-                📦 Using stems from: {stems[0] && `Song 1 [${getEffectiveKey(0)} ${getEffectiveBpm(0)} BPM]`} {stems[1] && `+ Song 2 [${getEffectiveKey(1)} ${getEffectiveBpm(1)} BPM]`}
+                📦 Current stems: {stems[0] && `Song 1 [${getEffectiveKey(0)} ${getEffectiveBpm(0)} BPM]`} {stems[1] && `+ Song 2 [${getEffectiveKey(1)} ${getEffectiveBpm(1)} BPM]`}
+                {(targetBpm || targetKey) && !isLocked && (
+                  <>
+                    <br />
+                    🎯 Will process to: {stems[0] && `Song 1 [${targetKey || getEffectiveKey(0)} ${targetBpm || getEffectiveBpm(0)} BPM]`} {stems[1] && `+ Song 2 [${targetKey || getEffectiveKey(1)} ${targetBpm || getEffectiveBpm(1)} BPM]`}
+                  </>
+                )}
               </div>
             )}
           </div>
         ) : null}
 
-        {/* Beatmatching */}
+        {/* Processing Section: BPM & Key */}
         {stems[0] || stems[1] ? (
           <div style={{
             background: 'rgba(99, 102, 241, 0.05)',
@@ -833,46 +816,83 @@ export default function DualMixer() {
             borderRadius: '12px',
             marginTop: '20px'
           }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '10px' }}>
-              ⏱️ Target BPM (for beatmatching)
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '15px' }}>
+              ⚙️ Processing (BPM & Key)
             </label>
-            <div style={{ display: 'flex', gap: '10px', marginBottom: '10px' }}>
+
+            {/* BPM Input */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ fontSize: '12px', color: '#999', marginBottom: '5px', display: 'block' }}>
+                ⏱️ Target BPM (for beatmatching)
+              </label>
               <input
                 type="number"
                 value={targetBpm || ''}
-                onChange={(e) => handleTargetBpmChange(e.target.value ? parseFloat(e.target.value) : null)}
+                onChange={(e) => handleTargetBpmChange(e.target.value)}
                 placeholder="Enter target BPM"
                 disabled={isLocked || !stems[0] || !stems[1]}
                 style={{
-                  flex: 1,
+                  width: '100%',
                   padding: '8px',
                   background: 'rgba(99, 102, 241, 0.2)',
                   border: '1px solid #6366f1',
                   color: '#fff',
                   borderRadius: '6px',
                   fontSize: '14px',
+                  boxSizing: 'border-box',
                   opacity: (isLocked || !stems[0] || !stems[1]) ? 0.5 : 1,
                   cursor: (isLocked || !stems[0] || !stems[1]) ? 'not-allowed' : 'text'
                 }}
               />
-              <button
-                onClick={handleProcessBpmClick}
-                disabled={isLocked || !stems[0] || !stems[1] || !bpmChanged}
+            </div>
+
+            {/* Key Input */}
+            <div style={{ marginBottom: '15px' }}>
+              <label style={{ fontSize: '12px', color: '#999', marginBottom: '5px', display: 'block' }}>
+                🎼 Target Key (for transposition)
+              </label>
+              <select
+                value={targetKey || ''}
+                onChange={(e) => handleTargetKeyChange(e.target.value)}
+                disabled={isLocked}
                 style={{
-                  padding: '8px 16px',
-                  background: (isLocked || !stems[0] || !stems[1] || !bpmChanged) ? '#444' : '#6366f1',
-                  border: 'none',
+                  width: '100%',
+                  padding: '8px',
+                  background: '#1a1f3a',
+                  border: '1px solid #6366f1',
                   color: '#fff',
                   borderRadius: '6px',
-                  cursor: (isLocked || !stems[0] || !stems[1] || !bpmChanged) ? 'not-allowed' : 'pointer',
-                  fontWeight: 'bold',
                   fontSize: '14px',
-                  opacity: (isLocked || !stems[0] || !stems[1] || !bpmChanged) ? 0.5 : 1
+                  boxSizing: 'border-box',
+                  colorScheme: 'dark',
+                  opacity: isLocked ? 0.5 : 1,
+                  cursor: isLocked ? 'not-allowed' : 'pointer'
                 }}
               >
-                🎯 Process
-              </button>
+                <option value="" style={{ background: '#1a1f3a', color: '#fff' }}>No transposition</option>
+                {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{k}</option>)}
+              </select>
             </div>
+
+            {/* Unified Process Button */}
+            <button
+              onClick={handleProcessAllChanges}
+              disabled={isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)}
+              style={{
+                width: '100%',
+                padding: '10px 16px',
+                background: (isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)) ? '#444' : '#6366f1',
+                border: 'none',
+                color: '#fff',
+                borderRadius: '6px',
+                cursor: (isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)) ? 'not-allowed' : 'pointer',
+                fontWeight: 'bold',
+                fontSize: '14px',
+                opacity: (isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)) ? 0.5 : 1
+              }}
+            >
+              🎯 Process All Changes
+            </button>
 
             {/* Processing Progress Bar */}
             {isProcessing && (
@@ -902,8 +922,13 @@ export default function DualMixer() {
               </div>
             )}
 
-            <p style={{ margin: '0 0 10px 0', color: '#999', fontSize: '12px' }}>
-              💡 {targetBpm ? `Songs will be aligned to ${targetBpm} BPM` : 'Set target BPM and click Process'}
+            <p style={{ margin: '10px 0 0 0', color: '#999', fontSize: '12px' }}>
+              💡 {(() => {
+                const parts = [];
+                if (targetBpm) parts.push(`aligned to ${targetBpm} BPM`);
+                if (targetKey) parts.push(`transposed to ${targetKey}`);
+                return parts.length > 0 ? `Songs will be ${parts.join(' and ')}` : 'Set target BPM or key and click Process';
+              })()}
             </p>
 
             {/* Beatmatch Status */}
@@ -937,8 +962,8 @@ export default function DualMixer() {
           </div>
         ) : null}
 
-        {/* Key Transposition */}
-        {stems[0] || stems[1] ? (
+        {/* Processing Status & Recommendations */}
+        {stems[0] && stems[1] && (targetBpm || targetKey) && (
           <div style={{
             background: 'rgba(99, 102, 241, 0.05)',
             border: '1px solid rgba(99, 102, 241, 0.2)',
@@ -946,134 +971,51 @@ export default function DualMixer() {
             borderRadius: '12px',
             marginTop: '20px'
           }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-              <label style={{ fontSize: '14px', fontWeight: 'bold', color: '#ccc' }}>
-                🎼 Target Key (for transposition)
-              </label>
-              {stems[0] && stems[1] && (
-                <button
-                  onClick={() => handleTargetKeyChange(getRecommendedKey())}
-                  style={{
-                    background: 'transparent',
-                    color: '#a78bfa',
-                    border: '1px solid #8b5cf6',
-                    padding: '4px 10px',
-                    borderRadius: '4px',
-                    cursor: 'pointer',
-                    fontSize: '11px',
-                    fontWeight: 'bold'
-                  }}
-                >
-                  💡 Recommend: {getRecommendedKey()}
-                </button>
-              )}
-            </div>
-            <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
-              <select
-                value={targetKey || ''}
-                onChange={(e) => setTargetKey(e.target.value || null)}
-                disabled={isLocked}
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '15px' }}>
+              💡 Recommended Key: <button
+                onClick={() => handleTargetKeyChange(getRecommendedKey())}
                 style={{
-                  flex: 1,
-                  padding: '8px',
-                  background: '#1a1f3a',
-                  border: '1px solid #6366f1',
-                  color: '#fff',
-                  borderRadius: '6px',
-                  fontSize: '14px',
-                  colorScheme: 'dark',
-                  opacity: isLocked ? 0.5 : 1,
-                  cursor: isLocked ? 'not-allowed' : 'pointer'
-                }}
-              >
-                <option value="" style={{ background: '#1a1f3a', color: '#fff' }}>No transposition</option>
-                {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{k}</option>)}
-              </select>
-              <button
-                onClick={() => handleTargetKeyChange(targetKey)}
-                disabled={isLocked || !targetKey || !keyChanged}
-                style={{
-                  padding: '8px 16px',
-                  background: (isLocked || !targetKey || !keyChanged) ? '#444' : '#6366f1',
-                  border: 'none',
-                  color: '#fff',
-                  borderRadius: '6px',
-                  cursor: (isLocked || !targetKey || !keyChanged) ? 'not-allowed' : 'pointer',
+                  background: 'transparent',
+                  color: '#a78bfa',
+                  border: '1px solid #8b5cf6',
+                  padding: '4px 10px',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '11px',
                   fontWeight: 'bold',
-                  fontSize: '14px',
-                  opacity: (isLocked || !targetKey || !keyChanged) ? 0.5 : 1
+                  marginLeft: '10px'
                 }}
               >
-                🎼 Process
+                {getRecommendedKey()}
               </button>
+            </label>
+
+            {/* Processing Preview */}
+            <div style={{
+              background: 'rgba(99, 102, 241, 0.1)',
+              border: '1px solid rgba(99, 102, 241, 0.2)',
+              padding: '12px',
+              borderRadius: '6px'
+            }}>
+              {[0, 1].map(slot => {
+                if (!stems[slot]) return null;
+                const sourceBpm = getEffectiveBpm(slot);
+                const sourceKey = getEffectiveKey(slot);
+                const keyShift = targetKey ? getSemitoneShift(sourceKey, targetKey) : 0;
+                const keyDirection = keyShift > 0 ? '↑' : keyShift < 0 ? '↓' : '=';
+
+                return (
+                  <div key={slot} style={{ marginBottom: slot === 0 ? '8px' : '0', color: '#aaa', fontSize: '12px' }}>
+                    <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong><br/>
+                    {targetBpm && `${sourceBpm} → ${targetBpm} BPM`}
+                    {targetBpm && targetKey && ' | '}
+                    {targetKey && `${sourceKey} → ${targetKey} ${keyDirection}`}
+                  </div>
+                );
+              })}
             </div>
-
-            {/* Transposition Progress Bar */}
-            {isTransposing && (
-              <div style={{
-                margin: '10px 0',
-                background: 'rgba(139, 92, 246, 0.1)',
-                border: '1px solid #8b5cf6',
-                borderRadius: '4px',
-                overflow: 'hidden',
-                height: '24px'
-              }}>
-                <div style={{
-                  width: `${transposingProgress}%`,
-                  height: '100%',
-                  background: 'linear-gradient(90deg, #8b5cf6, #d946ef)',
-                  transition: 'width 0.3s ease',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: '#fff',
-                  fontSize: '12px',
-                  fontWeight: 'bold'
-                }}>
-                  {transposingProgress < 100 && `${Math.round(transposingProgress)}%`}
-                  {transposingProgress === 100 && '✅ Complete'}
-                </div>
-              </div>
-            )}
-
-            {/* Advisory */}
-            {targetKey && (stems[0] || stems[1]) && (
-              <div style={{
-                background: 'rgba(139, 92, 246, 0.1)',
-                border: '1px solid rgba(139, 92, 246, 0.3)',
-                padding: '15px',
-                borderRadius: '8px',
-                fontSize: '13px'
-              }}>
-                <p style={{ margin: '0 0 10px 0', color: '#ddd', fontWeight: 'bold' }}>📍 Transposition Advisory:</p>
-                <div style={{ display: 'flex', gap: '20px', flexWrap: 'wrap' }}>
-                  {[0, 1].map(slot => {
-                    const sourceKey = getEffectiveKey(slot);
-                    if (!sourceKey || !stems[slot]) return null;
-                    const semitones = getSemitoneShift(sourceKey, targetKey);
-                    const direction = semitones > 0 ? '↑' : semitones < 0 ? '↓' : '=';
-                    const absSteps = Math.abs(semitones);
-                    const status = transposingStatus[slot];
-                    const statusEmoji = status === 'processing' ? '⏳' : status === 'transposing' ? '⏳' : status === 'done' ? '✅' : status === 'error' ? '❌' : '';
-                    const statusText = status === 'processing' ? 'Processing...' : status === 'transposing' ? 'Transposing...' : status === 'done' ? 'Ready' : 'Failed';
-
-                    return (
-                      <div key={slot} style={{ color: '#aaa' }}>
-                        <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong>
-                        <br />
-                        {sourceKey} → {targetKey} <span style={{ color: '#a78bfa', fontSize: '16px' }}>{direction}</span> {absSteps} semitone{absSteps !== 1 ? 's' : ''}
-                        {statusEmoji && <span style={{ marginLeft: '8px' }}>{statusEmoji} {statusText}</span>}
-                      </div>
-                    );
-                  })}
-                </div>
-                <p style={{ margin: '10px 0 0 0', color: '#999', fontSize: '12px' }}>
-                  🎵 Pitch-shifting in progress - stems will be transposed and ready for playback
-                </p>
-              </div>
-            )}
           </div>
-        ) : null}
+        )}
 
         {/* Downloads */}
         {(stems[0] || stems[1]) && (

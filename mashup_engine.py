@@ -176,6 +176,115 @@ class MashupEngine:
             logging.warning("All BPM samples failed")
             return 120.0, 0.0
 
+    def analyze_track_and_key(self, song_path):
+        """Detect BPM and key in a single pass (single audio load).
+        Returns tuple: (bpm, beat_anchor, key).
+        Key is 0-11 (C=0, C#=1, ..., B=11), or -1 if detection fails."""
+        import logging
+        import numpy as np
+        import librosa
+
+        logging.info(f"Analyzing BPM and key for: {song_path}")
+
+        # Load audio once for both analyses
+        try:
+            y, sr = librosa.load(song_path, sr=None, mono=True)
+        except Exception as e:
+            logging.error(f"Failed to load audio: {e}")
+            return 120.0, 0.0, -1
+
+        # BPM detection using Madmom first (better accuracy)
+        bpm = None
+        beat_anchor = None
+        try:
+            from madmom.features.beats import RNNBeatProcessor, BeatTrackingProcessor
+
+            logging.info("Using Madmom for BPM detection")
+            processor = RNNBeatProcessor()
+            beat_detector = BeatTrackingProcessor()
+            activations = processor(str(song_path))
+            beats = beat_detector(activations)
+
+            if len(beats) > 0:
+                beat_intervals = np.diff(beats[:min(100, len(beats))])
+                bpm = 60.0 / np.median(beat_intervals) if np.median(beat_intervals) > 0 else 120.0
+                beat_anchor = float(beats[0])
+                logging.info(f"✅ Madmom BPM: {bpm:.1f}, beat anchor: {beat_anchor:.2f}s")
+        except Exception as e:
+            logging.warning(f"Madmom failed: {e}, using Librosa")
+
+        # Fallback to Librosa if Madmom failed or unavailable
+        if bpm is None:
+            try:
+                # Multi-pass for robustness
+                total_duration = librosa.get_duration(y=y, sr=sr)
+                bpm_samples = []
+                beat_anchors_list = []
+
+                if total_duration > 120.0:
+                    offsets = [10.0, total_duration / 2 - 30.0, total_duration - 60.0]
+                elif total_duration > 60.0:
+                    offsets = [5.0, total_duration - 50.0]
+                else:
+                    offsets = [0.0]
+
+                for offset in offsets:
+                    offset = max(0.0, min(offset, total_duration - 10.0))
+                    window = min(40.0, total_duration - offset)
+                    try:
+                        y_sample, sr_sample = librosa.load(song_path, sr=sr, mono=True, offset=offset, duration=window)
+                        tempo, beat_frames = librosa.beat.beat_track(y=y_sample, sr=sr_sample)
+                        tempo = float(np.asarray(tempo).reshape(-1)[0])
+                        beat_times = librosa.frames_to_time(beat_frames, sr=sr_sample)
+                        beat_anchor_sample = float(beat_times[0]) + offset if len(beat_times) else offset
+                        bpm_samples.append(tempo)
+                        beat_anchors_list.append(beat_anchor_sample)
+                    except Exception as e:
+                        logging.warning(f"Sample @ {offset:.0f}s failed: {e}")
+
+                if bpm_samples:
+                    bpm = float(np.median(bpm_samples))
+                    beat_anchor = beat_anchors_list[len(bpm_samples) // 2]
+                    logging.info(f"✅ Librosa BPM (median): {bpm:.1f}, beat anchor: {beat_anchor:.2f}s")
+                else:
+                    bpm = 120.0
+                    beat_anchor = 0.0
+                    logging.warning("All BPM samples failed")
+            except Exception as e:
+                logging.error(f"Librosa BPM failed: {e}")
+                bpm = 120.0
+                beat_anchor = 0.0
+
+        # Key detection from already-loaded audio
+        key = -1
+        try:
+            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+            chroma_mean = chroma.mean(axis=1)
+            key = int(np.argmax(chroma_mean))
+            logging.info(f"✅ Key detected: {self._key_to_note(key)}")
+        except Exception as e:
+            logging.warning(f"Librosa key detection failed: {e}")
+
+            # Fallback to Essentia
+            try:
+                from essentia.standard import MonoLoader, KeyExtractor
+
+                loader = MonoLoader(filename=song_path, sampleRate=44100)
+                audio = loader()
+                key_extractor = KeyExtractor()
+                key_str, confidence = key_extractor(audio)
+
+                if key_str and confidence > 0.5:
+                    key_notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+                    key_name = key_str.split()[0]
+                    if key_name in key_notes:
+                        key = key_notes.index(key_name)
+                        logging.info(f"✅ Key via Essentia: {key_name} (confidence: {confidence:.2f})")
+            except Exception as e:
+                logging.warning(f"Essentia key detection also failed: {e}")
+
+        return bpm, beat_anchor, key
+
     def analyze_key(self, song_path):
         """Detect the musical key using librosa chroma (reliable) or essentia (fallback).
         Returns key as integer: 0=C, 1=C#, ..., 11=B.
