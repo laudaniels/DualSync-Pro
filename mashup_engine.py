@@ -86,6 +86,36 @@ class MashupEngine:
             missing = [name for name, path in stems.items() if not Path(path).is_file()]
             if missing:
                 raise RuntimeError(f"Demucs did not create all expected stems for {Path(song).name}: {', '.join(missing)}")
+
+            # Split drums into kick, snare, hi-hat, tom
+            import logging
+            try:
+                logging.info(f"🥁 Splitting drums for {Path(song).name}...")
+                drum_splits = self.split_drums(stems['drums'], str(folder))
+                # Replace 'drums' with individual drum components
+                del stems['drums']
+                stems.update(drum_splits)
+                logging.info(f"✅ Drums split into: kick, snare, hi-hat, tom")
+            except Exception as e:
+                logging.warning(f"⚠️  Drum split failed: {e}")
+                # If splitting fails, duplicate drums stem as all drum components
+                # so frontend always expects the same 7-stem structure
+                drums_path = stems['drums']
+                stem_name = Path(drums_path).stem
+                drums_dir = Path(drums_path).parent
+                drum_components = {
+                    'kick': str(drums_dir / f"{stem_name}_kick.wav"),
+                    'snare': str(drums_dir / f"{stem_name}_snare.wav"),
+                    'hihat': str(drums_dir / f"{stem_name}_hihat.wav"),
+                    'tom': str(drums_dir / f"{stem_name}_tom.wav"),
+                }
+                # Copy drums file to each drum component
+                for comp_name, comp_path in drum_components.items():
+                    shutil.copy2(drums_path, comp_path)
+                    logging.info(f"📋 Duplicated drums → {comp_name}: {comp_path}")
+                del stems['drums']
+                stems.update(drum_components)
+
             results.append(stems)
         return results
 
@@ -177,9 +207,14 @@ class MashupEngine:
             return 120.0, 0.0
 
     def analyze_track_and_key(self, song_path):
-        """Detect BPM and key in a single pass (single audio load).
+        """Detect BPM and key in a single pass with 5-pass BPM strategy.
         Returns tuple: (bpm, beat_anchor, key).
-        Key is 0-11 (C=0, C#=1, ..., B=11), or -1 if detection fails."""
+        Key is 0-11 (C=0, C#=1, ..., B=11), or -1 if detection fails.
+
+        Strategy:
+        - BPM: 5 passes for robustness (intro often BPM-less, use middle for small files)
+        - Key: Use both Librosa AND Essentia for verification
+        """
         import logging
         import numpy as np
         import librosa
@@ -213,22 +248,31 @@ class MashupEngine:
         except Exception as e:
             logging.warning(f"Madmom failed: {e}, using Librosa")
 
-        # Fallback to Librosa if Madmom failed or unavailable
+        # Fallback to Librosa if Madmom failed or unavailable (5-pass strategy)
         if bpm is None:
             try:
-                # Multi-pass for robustness
                 total_duration = librosa.get_duration(y=y, sr=sr)
                 bpm_samples = []
                 beat_anchors_list = []
 
-                if total_duration > 120.0:
-                    offsets = [10.0, total_duration / 2 - 30.0, total_duration - 60.0]
-                elif total_duration > 60.0:
-                    offsets = [5.0, total_duration - 50.0]
+                # 5-pass strategy: skip intro (BPM-less), use middle sections
+                if total_duration < 60.0:
+                    # Small file: sample from middle only
+                    offsets = [total_duration / 2 - 10.0]
+                    logging.info(f"Small file ({total_duration:.0f}s), sampling from middle")
+                elif total_duration < 120.0:
+                    # Medium: 3 passes, skip intro
+                    offsets = [10.0, total_duration / 2, total_duration - 30.0]
+                elif total_duration < 300.0:
+                    # Long: 4 passes, skip intro
+                    offsets = [15.0, total_duration / 3, total_duration / 2 + 15.0, total_duration - 40.0]
                 else:
-                    offsets = [0.0]
+                    # Very long: 5 passes, spread across middle sections
+                    offsets = [30.0, total_duration / 4, total_duration / 2, total_duration * 0.75, total_duration - 50.0]
 
-                for offset in offsets:
+                logging.info(f"📊 BPM analysis: {len(offsets)}-pass strategy (duration: {total_duration:.0f}s)")
+
+                for i, offset in enumerate(offsets):
                     offset = max(0.0, min(offset, total_duration - 10.0))
                     window = min(40.0, total_duration - offset)
                     try:
@@ -239,13 +283,14 @@ class MashupEngine:
                         beat_anchor_sample = float(beat_times[0]) + offset if len(beat_times) else offset
                         bpm_samples.append(tempo)
                         beat_anchors_list.append(beat_anchor_sample)
+                        logging.info(f"  Pass {i+1}: {tempo:.1f} BPM @ {offset:.0f}s")
                     except Exception as e:
-                        logging.warning(f"Sample @ {offset:.0f}s failed: {e}")
+                        logging.warning(f"  Pass {i+1} @ {offset:.0f}s failed: {e}")
 
                 if bpm_samples:
                     bpm = float(np.median(bpm_samples))
                     beat_anchor = beat_anchors_list[len(bpm_samples) // 2]
-                    logging.info(f"✅ Librosa BPM (median): {bpm:.1f}, beat anchor: {beat_anchor:.2f}s")
+                    logging.info(f"✅ Librosa BPM (median of {len(bpm_samples)} passes): {bpm:.1f}, beat anchor: {beat_anchor:.2f}s")
                 else:
                     bpm = 120.0
                     beat_anchor = 0.0
@@ -255,33 +300,48 @@ class MashupEngine:
                 bpm = 120.0
                 beat_anchor = 0.0
 
-        # Key detection from already-loaded audio
+        # Key detection: use BOTH Librosa AND Essentia for verification
         key = -1
+        key_librosa = -1
+        key_essentia = -1
+
+        # Primary: Librosa chroma
         try:
             chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
             chroma_mean = chroma.mean(axis=1)
-            key = int(np.argmax(chroma_mean))
-            logging.info(f"✅ Key detected: {self._key_to_note(key)}")
+            key_librosa = int(np.argmax(chroma_mean))
+            logging.info(f"✅ Librosa key: {self._key_to_note(key_librosa)}")
         except Exception as e:
             logging.warning(f"Librosa key detection failed: {e}")
 
-            # Fallback to Essentia
-            try:
-                from essentia.standard import MonoLoader, KeyExtractor
+        # Secondary: Essentia for verification/cross-check
+        try:
+            from essentia.standard import MonoLoader, KeyExtractor
 
-                loader = MonoLoader(filename=song_path, sampleRate=44100)
-                audio = loader()
-                key_extractor = KeyExtractor()
-                key_str, confidence = key_extractor(audio)
+            loader = MonoLoader(filename=song_path, sampleRate=44100)
+            audio = loader()
+            key_extractor = KeyExtractor()
+            key_str, confidence = key_extractor(audio)
 
-                if key_str and confidence > 0.5:
-                    key_notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-                    key_name = key_str.split()[0]
-                    if key_name in key_notes:
-                        key = key_notes.index(key_name)
-                        logging.info(f"✅ Key via Essentia: {key_name} (confidence: {confidence:.2f})")
-            except Exception as e:
-                logging.warning(f"Essentia key detection also failed: {e}")
+            if key_str and confidence > 0.5:
+                key_notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+                key_name = key_str.split()[0]
+                if key_name in key_notes:
+                    key_essentia = key_notes.index(key_name)
+                    logging.info(f"✅ Essentia key: {key_name} (confidence: {confidence:.2f})")
+        except Exception as e:
+            logging.warning(f"Essentia key detection failed: {e}")
+
+        # Use Librosa primary, verify with Essentia
+        if key_librosa >= 0:
+            key = key_librosa
+            if key_essentia >= 0 and key_essentia != key_librosa:
+                logging.warning(f"⚠️  Key mismatch: Librosa={self._key_to_note(key_librosa)}, Essentia={self._key_to_note(key_essentia)} (using Librosa)")
+            elif key_essentia >= 0:
+                logging.info(f"✓ Key verified by both methods: {self._key_to_note(key)}")
+        elif key_essentia >= 0:
+            key = key_essentia
+            logging.info(f"Using Essentia key (Librosa failed): {self._key_to_note(key)}")
 
         return bpm, beat_anchor, key
 
@@ -455,10 +515,10 @@ class MashupEngine:
             logging.error(f"Time stretch failed for {input_path}: {e}", exc_info=True)
             return False, None
 
-    def pitch_shift_audio(self, input_path, output_path, semitones):
+    def pitch_shift_audio(self, input_path, output_path, semitones, source_key=None):
         """Pitch-shift audio using FFmpeg asetrate filter (faster than librosa).
         Positive semitones = pitch up, negative = pitch down.
-        Returns True if successful, False if failed."""
+        Returns tuple (success, measured_key) where measured_key is the detected key of output."""
         import logging
         import os
         import subprocess
@@ -482,17 +542,35 @@ class MashupEngine:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
             if result.returncode == 0:
                 logging.info(f"✅ Pitch-shifted {input_path} → {output_path} by {semitones} semitones (ratio {pitch_ratio:.4f})")
-                return True
+
+                # Analyze the output to verify the key was shifted correctly
+                try:
+                    _, _, measured_key = self.analyze_track_and_key(str(output_path))
+
+                    # Calculate expected key after shift
+                    if source_key is not None and source_key >= 0:
+                        expected_key = (source_key + semitones) % 12
+                        key_name_measured = self._key_to_note(measured_key) if measured_key >= 0 else "?"
+                        key_name_expected = self._key_to_note(expected_key)
+                        logging.info(f"✅ Key analysis: measured={key_name_measured}, expected={key_name_expected}")
+                    else:
+                        key_name_measured = self._key_to_note(measured_key) if measured_key >= 0 else "?"
+                        logging.info(f"✅ Key detected: {key_name_measured}")
+
+                    return True, measured_key
+                except Exception as key_err:
+                    logging.warning(f"Key analysis after pitch shift failed: {key_err}, but pitch shift succeeded")
+                    return True, -1
             else:
                 logging.error(f"FFmpeg pitch shift failed: {result.stderr}")
-                return False
+                return False, -1
 
         except subprocess.TimeoutExpired:
             logging.error(f"Pitch shift timeout for {input_path}")
-            return False
+            return False, -1
         except Exception as e:
             logging.error(f"Pitch shift failed for {input_path}: {e}", exc_info=True)
-            return False
+            return False, -1
 
     @staticmethod
     def _key_to_note(key):
@@ -766,3 +844,85 @@ class MashupEngine:
         if proc.returncode != 0:
             detail = (stderr or "").strip() or "FFmpeg failed without an error message."
             raise RuntimeError(f"FFmpeg could not process stem:\n{detail[-500:]}")
+
+    def split_drums(self, drum_stem_path, output_dir):
+        """Split drum stem into kick, snare, hi-hat, and toms using frequency-based separation.
+
+        Returns dict: {'kick': path, 'snare': path, 'hihat': path, 'tom': path}
+        """
+        import os
+        import logging
+        from pathlib import Path
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            stem_name = Path(drum_stem_path).stem
+
+            outputs = {
+                'kick': str(Path(output_dir) / f"{stem_name}_kick.wav"),
+                'snare': str(Path(output_dir) / f"{stem_name}_snare.wav"),
+                'hihat': str(Path(output_dir) / f"{stem_name}_hihat.wav"),
+                'tom': str(Path(output_dir) / f"{stem_name}_tom.wav"),
+            }
+
+            # FFmpeg filter graph for drum separation by frequency
+            # Kick: 20-250 Hz (low bass)
+            # Tom: 200-2000 Hz (mid drums)
+            # Snare: 1000-8000 Hz (snare crack)
+            # Hi-hat: 5000-20000 Hz (high cymbals)
+
+            filter_graph = (
+                # Split into parallel chains
+                "[0:a]"
+                # Kick: Low-pass to 250 Hz, then high-pass to 20 Hz
+                "lowpass=f=250[kick_low]; "
+                "[kick_low]highpass=f=20[kick]; "
+
+                # Snare: Band-pass 1000-8000 Hz
+                "[0:a]bandpass=f=4000:width_type=o:width=2[snare]; "
+
+                # Hi-hat: High-pass 5000 Hz
+                "[0:a]highpass=f=5000[hihat]; "
+
+                # Tom: Band-pass 200-2000 Hz
+                "[0:a]bandpass=f=1000:width_type=o:width=1[tom]"
+            )
+
+            # Export each frequency band to separate file
+            for name, freq_range in [
+                ('kick', '20-250Hz'),
+                ('snare', '1000-8000Hz'),
+                ('hihat', '5000-20000Hz'),
+                ('tom', '200-2000Hz'),
+            ]:
+                if name == 'kick':
+                    filters = f"[0:a]lowpass=f=250,highpass=f=20"
+                elif name == 'snare':
+                    filters = f"[0:a]bandpass=f=4000:width_type=o:width=2"
+                elif name == 'hihat':
+                    filters = f"[0:a]highpass=f=5000"
+                elif name == 'tom':
+                    filters = f"[0:a]bandpass=f=1000:width_type=o:width=1"
+
+                cmd = [
+                    self.ffmpeg, "-i", str(drum_stem_path),
+                    "-af", filters,
+                    "-y", "-q:a", "9",
+                    outputs[name]
+                ]
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if result.returncode != 0:
+                    logging.error(f"Drum split ({name}) failed: {result.stderr}")
+                    raise RuntimeError(f"Could not split {name} from drums")
+
+                logging.info(f"✅ Split drum {name}: {outputs[name]}")
+
+            return outputs
+
+        except subprocess.TimeoutExpired:
+            logging.error(f"Drum split timeout for {drum_stem_path}")
+            raise RuntimeError("Drum split took too long")
+        except Exception as e:
+            logging.error(f"Drum split failed for {drum_stem_path}: {e}", exc_info=True)
+            raise

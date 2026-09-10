@@ -16,13 +16,21 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 ### Real-Time Mixing
 - **Dual-song mixer** — load two MP3s into independent slots with synchronized playback
 - **HTML5 audio synchronization** — first song's timeline controls both songs for seamless mixing
-- **Independent stem volumes** — control Vocals, Drums, Bass, and Other separately for each song (0-100% sliders)
+- **Independent stem volumes** — control 7 stems separately for each song (0-100% sliders):
+  - Vocals, Bass, Other (standard stems)
+  - Kick, Snare, Hi-Hat, Tom (auto-split drum components via frequency-based filtering)
 - **Crossfader** — blend between Song 1 and Song 2 in real-time
 - **Auto-loop playback** — automatically restart at track end during playback
+- **Real-time processing logs** — unified log window shows all operations with auto-scroll to latest entry
 
 ### Audio Analysis & Processing
 - **AI Stem Separation** — isolate vocals, drums, bass, and other instruments using Demucs
-- **Multi-Pass BPM Detection** — analyze multiple sections of each song using Librosa, take median for accuracy
+- **Automatic Drum Component Splitting** — further separate drum stem into kick, snare, hi-hat, and tom using frequency-based FFmpeg filtering:
+  - Kick: 20-250 Hz (low bass)
+  - Tom: 200-2000 Hz (mid-range drums)
+  - Snare: 1000-8000 Hz (high crack)
+  - Hi-Hat: 5000+ Hz (cymbals)
+- **Multi-Pass BPM Detection** — analyze multiple sections of each song using Librosa (5-pass strategy for small files), take median for accuracy
 - **Smart Key Detection** — identify song key using Librosa chroma analysis (primary) with Essentia fallback
 - **Beatmatching with Verification** — align Song 2 to Song 1 (or both to target BPM) with automatic multi-pass correction
   - Pass 1: FFmpeg tempo-stretching (stable baseline)
@@ -60,9 +68,11 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 ### 1. Upload & Analyze
 When you upload an MP3 file:
 1. **Stem Separation** — Demucs AI model isolates 4 tracks: Vocals, Drums, Bass, Other
-2. **BPM Detection** — Librosa analyzes 2-3 sections of the song, calculates median BPM
-3. **Key Detection** — Librosa chroma analysis identifies the song's harmonic key
-4. Results are displayed and ready for mixing
+2. **Automatic Drum Splitting** — Drums stem is further split into Kick, Snare, Hi-Hat, and Tom using frequency-based filtering (7 total stems)
+3. **Multi-Pass BPM Detection** — Librosa analyzes multiple sections with 5-pass strategy (samples middle for small files), calculates median BPM for accuracy
+4. **Key Detection** — Librosa chroma analysis identifies the song's harmonic key
+5. **Real-Time Logging** — unified log window shows all processing steps (uploading, analyzing, separating, splitting)
+6. Results are displayed and ready for mixing
 
 Both songs are processed in parallel (independent uploads).
 
@@ -73,35 +83,33 @@ Before mixing, you can:
 - **Click "Recommend"** — algorithm finds the best compromise key between both songs
 
 ### 3. Process & Beatmatch
-When you click **"Process BPM"** button:
-1. **Pass 1** — FFmpeg applies initial tempo-stretching to Song 2 (or both if target BPM set)
-2. **Verification** — Librosa re-analyzes output BPM
-3. **Convergence Check** — if output is within ±10 BPM of target, done; otherwise continue
-4. **Pass 2+** — Optional RubberBand processing for refinement (if available)
-5. **Final Verification** — measure output BPM and lock in processed stems
-6. Progress bar animates during processing, actual processing state updates when complete
+When you click **"Process All Changes"** button (BPM + Key):
+1. **Full Song Processing** — process the complete song (all stems together) for tempo and pitch
+2. **Beatmatching (if BPM changed):**
+   - Pass 1 — FFmpeg applies initial tempo-stretching
+   - Verification — Librosa re-analyzes output BPM
+   - Convergence Check — if output is within ±10 BPM of target, done; otherwise continue
+   - Pass 2+ — Optional RubberBand processing for refinement (if available)
+3. **Transposition (if Key changed):**
+   - Pitch-shift processed song to match target key using FFmpeg asetrate
+4. **Re-Separation** — Demucs re-separates the processed song into 7 stems (auto-split drums included)
+5. **Stem Copying** — All processed stems copied to server with auto-scroll logs showing progress
+6. **Real-Time Logging** — unified log window shows all steps: loading, beatmatching, transposing, separating, copying
+7. Progress bar animates during processing, actual processing state updates when complete
 
-The **"Process BPM" button is disabled** until you change the target BPM from the last processed value.
+The **"Process All Changes" button is enabled** only when BPM or Key has changed from last processed value.
 
-### 4. Transpose & Match Keys
-When you click **"Process Key"** button:
-1. **Pitch-shift all stems** to match target key using FFmpeg asetrate
-2. **Update metadata** with new key value
-3. Progress bar animates during processing
-
-The **"Process Key" button is disabled** until you change the target key from the last processed value.
-
-### 5. Mix in Real-Time
-After processing:
-- Adjust stem volumes for Song 1 and Song 2 independently
+### 4. Mix in Real-Time
+(Previously step 5) After processing:
+- Adjust 7 stem volumes independently for Song 1 and Song 2
 - Use crossfader to blend between songs
 - Play/Pause and scrub through timeline
 - Listen to beatmatched, transposed mix in real-time
 
-### 6. Download
+### 5. Download
 Download your results:
-- **Original Stems** — stems at auto-detected BPM/Key (before beatmatching)
-- **Processed Stems** — beatmatched + transposed stems with verified output BPM
+- **Original Stems** — 7 stems at auto-detected BPM/Key (before beatmatching)
+- **Processed Stems** — 7 stems beatmatched + transposed with verified output BPM
 - **Final Mix** — all stems combined with your volume settings and crossfader position
 
 All files are FLAC format with embedded metadata (TITLE, BPM, INITIALKEY).
@@ -124,12 +132,15 @@ All files are FLAC format with embedded metadata (TITLE, BPM, INITIALKEY).
 
 ### Backend (Flask)
 - **Flask** + Flask-CORS — REST API for audio processing
+- **Real-Time Processing Logs** — unified log system with streaming updates
 - **API Endpoints:**
-  - `POST /api/separate-stems` — upload file → stem separation + BPM/key detection
-  - `POST /api/process-stems` — beatmatch + transpose stems (via FFmpeg/RubberBand)
+  - `POST /api/separate-stems` — upload file → stem separation (Demucs) + auto drum splitting + BPM/key detection (7 stems total)
+  - `GET /api/process-status` — returns current processing progress (0-100%), current step, and real-time log messages
+  - `POST /api/process-stems` — process full song (beatmatch + transpose) then re-separate into stems (via FFmpeg/RubberBand)
   - `POST /api/render-final-mix` — mix all stems into final FLAC with metadata
   - `POST /api/download-stems-zip` — download stems as FLAC in ZIP
   - `GET /api/download-file/<filename>` — download single audio file
+  - `GET /api/audio/<path>` — serve individual audio files
 
 ### Audio Processing Core (Python)
 - **Demucs** — AI stem separation (isolates vocals, drums, bass, other)
@@ -334,8 +345,10 @@ pip install -r requirements.txt --no-build-isolation
 ## Basic Workflow
 
 1. **Upload Song 1** — drag-and-drop MP3 or click upload area
-   - Automatic stem separation (4 stems)
-   - BPM and key auto-detected
+   - Real-time log shows: uploading → analyzing → separating → splitting drums
+   - Automatic stem separation (4 stems from Demucs)
+   - Automatic drum splitting (4→7 stems with kick/snare/hihat/tom)
+   - BPM (5-pass detection) and key auto-detected
 2. **Upload Song 2** — same as Song 1
    - Parallel processing (doesn't wait for Song 1)
 3. **Review metadata** — check detected BPM/key for each song
@@ -343,17 +356,16 @@ pip install -r requirements.txt --no-build-isolation
    - Change target BPM (if auto-detection is wrong)
    - Change target key (from dropdown)
    - Click "Recommend" for best compromise key
-5. **Click "Process BPM"** — beatmatch both songs (animated progress bar)
+5. **Click "Process All Changes"** — beatmatch + transpose in one step (animated progress bar + live logs)
+   - Real-time log shows: loading → beatmatching → transposing → separating → copying stems
    - Wait for completion (progress bar → 100%)
-6. **Click "Process Key"** — transpose to target key (animated progress bar)
-   - Wait for completion (progress bar → 100%)
-7. **Mix in real-time:**
-   - Adjust stem volumes for each song
+6. **Mix in real-time:**
+   - Adjust 7 stem volumes independently for each song
    - Use crossfader to blend between songs
    - Play/Pause and scrub timeline
-8. **Download:**
-   - Original Stems (ZIP with 8 FLAC files at detected BPM/Key)
-   - Processed Stems (ZIP with 4 beatmatched+transposed FLAC files)
+7. **Download:**
+   - Original Stems (ZIP with 14 FLAC files: 7 stems × 2 songs at detected BPM/Key)
+   - Processed Stems (ZIP with 7 beatmatched+transposed FLAC files per song)
    - Final Mix (single FLAC file with all stems mixed at your volume settings)
 
 ---
@@ -389,18 +401,24 @@ pip install -r requirements.txt --no-build-isolation
 
 ## File Naming Examples
 
-### Original Stems (Auto-Detected)
+### Original Stems (Auto-Detected, 7 Stems with Auto-Split Drums)
 ```
 Part3-Venus-96-C-vocals.flac          # 96 BPM, Key C
-Part3-Venus-96-C-drums.flac
+Part3-Venus-96-C-kick.flac            # Auto-split drum components
+Part3-Venus-96-C-snare.flac
+Part3-Venus-96-C-hihat.flac
+Part3-Venus-96-C-tom.flac
 Part3-Venus-96-C-bass.flac
 Part3-Venus-96-C-other.flac
 ```
 
-### Processed Stems (Beatmatched, Measured Output)
+### Processed Stems (Beatmatched, Measured Output, 7 Stems)
 ```
 Part3-Venus-111.8-F-vocals.flac       # Actual measured output: 111.8 BPM, Key F
-Part3-Venus-111.8-F-drums.flac
+Part3-Venus-111.8-F-kick.flac         # All 7 stems after beatmatching + transposition
+Part3-Venus-111.8-F-snare.flac
+Part3-Venus-111.8-F-hihat.flac
+Part3-Venus-111.8-F-tom.flac
 Part3-Venus-111.8-F-bass.flac
 Part3-Venus-111.8-F-other.flac
 ```
@@ -409,6 +427,7 @@ Part3-Venus-111.8-F-other.flac
 ```
 Part3-Venus-112-manual-111.8-measured-F-vocals.flac
 # Target: 112 BPM, Measured output: 111.8 BPM, Key: F
+# (applies to all 7 stems)
 ```
 
 ---
@@ -501,5 +520,14 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-**Last Updated:** 2026-09-09  
-**Current Branch:** main (merged from feature/quality-improvements)
+**Last Updated:** 2026-09-10  
+**Current Branch:** main
+
+## Recent Improvements (2026-09-10)
+- ✅ Automatic drum component splitting (kick, snare, hi-hat, tom) with frequency-based FFmpeg filtering
+- ✅ Real-time processing logs with unified window display and auto-scroll to latest entry
+- ✅ 5-pass BPM detection strategy with middle sampling for small files (avoids intro sections)
+- ✅ Combined BPM & Key processing into single "Process All Changes" button
+- ✅ Backend fallback for drum splitting failure (duplicates drum stem if separation fails)
+- ✅ Full song processing approach (process full song first, then re-separate into stems)
+- ✅ Real-time log display during upload, analysis, beatmatching, transposition, and stem copying

@@ -30,17 +30,31 @@ export default function DualMixer() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [audioStats, setAudioStats] = useState({ file_count: 0, total_size_formatted: '0 MB' });
+  const [processingLogs, setProcessingLogs] = useState([]);
+  const logsEndRef = useRef(null);
 
-  // Audio refs for each song's stems
+  // Stem names now include split drums (drums → kick, snare, hihat, tom)
+  const stemNames = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other'];
+  const stemLabels = {
+    vocals: '🎤 Vocals',
+    kick: '🔊 Kick',
+    snare: '🥁 Snare',
+    hihat: '⚡ Hi-Hat',
+    tom: '🔔 Tom',
+    bass: '🎸 Bass',
+    other: '🎹 Other'
+  };
+
+  // Audio refs for each song's stems (with split drums)
   const audioRefsRef = useRef({
-    0: { vocals: useRef(null), drums: useRef(null), bass: useRef(null), other: useRef(null) },
-    1: { vocals: useRef(null), drums: useRef(null), bass: useRef(null), other: useRef(null) }
+    0: { vocals: useRef(null), kick: useRef(null), snare: useRef(null), hihat: useRef(null), tom: useRef(null), bass: useRef(null), other: useRef(null) },
+    1: { vocals: useRef(null), kick: useRef(null), snare: useRef(null), hihat: useRef(null), tom: useRef(null), bass: useRef(null), other: useRef(null) }
   });
 
-  // Volume states for each song
+  // Volume states for each song (with split drums)
   const [volumes, setVolumes] = useState({
-    0: { vocals: 1.0, drums: 1.0, bass: 1.0, other: 1.0 },
-    1: { vocals: 1.0, drums: 1.0, bass: 1.0, other: 1.0 }
+    0: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 },
+    1: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 }
   });
 
   // Crossfader: 0 = song1 only, 50 = both, 100 = song2 only
@@ -61,6 +75,32 @@ export default function DualMixer() {
   React.useEffect(() => {
     fetchStats();
   }, []);
+
+  // Poll for processing logs while loading
+  React.useEffect(() => {
+    if (!loading[0] && !loading[1]) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch('/api/process-status');
+        const data = await response.json();
+        if (data.logs && data.logs.length > 0) {
+          setProcessingLogs(data.logs);
+        }
+      } catch (err) {
+        console.error('Log fetch error:', err);
+      }
+    }, 300);
+
+    return () => clearInterval(interval);
+  }, [loading]);
+
+  // Auto-scroll logs to latest message
+  React.useEffect(() => {
+    if (logsEndRef.current) {
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [processingLogs]);
 
   // Helper: Generate filename with BPM labels
   const generateBpmLabel = (meta, isProcessed = false) => {
@@ -128,10 +168,14 @@ export default function DualMixer() {
       });
 
       // Set audio sources
+      console.log(`🎵 Song ${slot + 1} stems received:`, Object.keys(data.stems));
       Object.entries(data.stems).forEach(([stemName, url]) => {
         if (audioRefsRef.current[slot][stemName]?.current) {
           audioRefsRef.current[slot][stemName].current.src = url;
           audioRefsRef.current[slot][stemName].current.load();
+          console.log(`✅ Loaded ${stemName} for Song ${slot + 1}: ${url}`);
+        } else {
+          console.warn(`⚠️ No audio ref for ${stemName} on Song ${slot + 1}`);
         }
       });
 
@@ -151,8 +195,6 @@ export default function DualMixer() {
 
   // Play/pause both songs
   const togglePlayback = () => {
-    const stemNames = ['vocals', 'drums', 'bass', 'other'];
-
     if (playing) {
       // Stop all
       [0, 1].forEach(slot => {
@@ -172,6 +214,7 @@ export default function DualMixer() {
       const song2Volume = crossfadePercent; // 0 at 0%, 1 at 100%
 
       [0, 1].forEach(slot => {
+        let loadedCount = 0;
         stemNames.forEach(stem => {
           const audioEl = audioRefsRef.current[slot][stem]?.current;
           if (audioEl && audioEl.src) {
@@ -180,8 +223,12 @@ export default function DualMixer() {
             const stemVol = volumes[slot]?.[stem] ?? 1.0;
             audioEl.volume = masterVol * stemVol;
             audioEl.play().catch(e => console.error(`Play error (Song ${slot + 1} ${stem}):`, e));
+            loadedCount++;
+          } else {
+            console.warn(`⚠️ Song ${slot + 1} ${stem}: no src or element missing`);
           }
         });
+        console.log(`▶️ Playing Song ${slot + 1}: ${loadedCount}/${stemNames.length} stems loaded`);
       });
       setPlaying(true);
     }
@@ -209,19 +256,42 @@ export default function DualMixer() {
       const crossfadePercent = value / 100;
       const song1Volume = 1 - crossfadePercent;
       const song2Volume = crossfadePercent;
-      const stemNames = ['vocals', 'drums', 'bass', 'other'];
+      console.log(`🎚️ Crossfader: Song1=${song1Volume.toFixed(2)}, Song2=${song2Volume.toFixed(2)}`);
 
       [0, 1].forEach(slot => {
+        const masterVol = slot === 0 ? song1Volume : song2Volume;
+        console.log(`   Slot ${slot}: masterVol=${masterVol.toFixed(2)}`);
         stemNames.forEach(stem => {
           const audioEl = audioRefsRef.current[slot][stem]?.current;
-          if (audioEl) {
-            const masterVol = slot === 0 ? song1Volume : song2Volume;
+          if (audioEl && audioEl.src) {
             const stemVol = volumes[slot]?.[stem] ?? 1.0;
             audioEl.volume = masterVol * stemVol;
           }
         });
       });
     }
+  };
+
+  const handleSeek = (e) => {
+    if (duration === 0) return;
+
+    // Get click position relative to progress bar
+    const rect = e.currentTarget.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const percentage = clickX / rect.width;
+    const newTime = percentage * duration;
+
+    // Seek all audio elements
+    stemNames.forEach(stem => {
+      [0, 1].forEach(slot => {
+        const audioEl = audioRefsRef.current[slot][stem]?.current;
+        if (audioEl) {
+          audioEl.currentTime = newTime;
+        }
+      });
+    });
+
+    setCurrentTime(newTime);
   };
 
   // Track progress
@@ -239,7 +309,7 @@ export default function DualMixer() {
           // Auto-loop: restart playback
           setCurrentTime(0);
           [0, 1].forEach(slot => {
-            ['vocals', 'drums', 'bass', 'other'].forEach(stem => {
+            stemNames.forEach(stem => {
               if (audioRefsRef.current[slot][stem]?.current) {
                 audioRefsRef.current[slot][stem].current.currentTime = 0;
                 audioRefsRef.current[slot][stem].current.play().catch(() => {});
@@ -379,6 +449,7 @@ export default function DualMixer() {
           source_key: needsTranspose ? sourceKey : null,
           target_key: needsTranspose ? newTargetKey : null,
           timestamp: metadata[slot].timestamp,
+          filename: metadata[slot].filename,
           slot: slot
         })
       });
@@ -484,10 +555,18 @@ export default function DualMixer() {
     setIsProcessing(true);
     setProcessingProgress(0);
 
-    // Fake progress animation: 0 → 80% over time, rest after API response
-    const progressInterval = setInterval(() => {
-      setProcessingProgress(prev => Math.min(prev + Math.random() * 20, 80));
-    }, 600);
+    // Real progress tracking from API
+    const progressInterval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/process-status');
+        const data = await res.json();
+        if (data.progress) {
+          setProcessingProgress(data.progress);
+        }
+      } catch (e) {
+        // Silent - API might not have data yet
+      }
+    }, 500);
 
     try {
       // Process all loaded songs with both BPM and Key
@@ -685,14 +764,16 @@ export default function DualMixer() {
       )}
 
       {!stems[slot] ? (
-        <StemLoader
-          onStemsLoaded={(file) => handleStemsLoaded(file, slot)}
-          loading={loading[slot]}
-        />
+        <>
+          <StemLoader
+            onStemsLoaded={(file) => handleStemsLoaded(file, slot)}
+            loading={loading[slot]}
+          />
+        </>
       ) : (
         <div className="stem-controls">
           <h4>🎚️ Volumes</h4>
-          {['vocals', 'drums', 'bass', 'other'].map(stem => (
+          {stemNames.map(stem => (
             <div key={stem} className="volume-control">
               <label>{stem.toUpperCase()}</label>
               <input
@@ -714,7 +795,7 @@ export default function DualMixer() {
 
       {/* Hidden audio elements */}
       <div style={{ display: 'none' }}>
-        {['vocals', 'drums', 'bass', 'other'].map(stem => (
+        {stemNames.map(stem => (
           <audio
             key={stem}
             ref={audioRefsRef.current[slot][stem]}
@@ -742,6 +823,33 @@ export default function DualMixer() {
           {renderSongMixer(1)}
         </div>
 
+        {/* Unified Processing Log */}
+        {(loading[0] || loading[1] || isProcessing) && processingLogs.length > 0 && (
+          <div style={{
+            background: 'rgba(139, 92, 246, 0.1)',
+            border: '1px solid rgba(139, 92, 246, 0.3)',
+            borderRadius: '8px',
+            padding: '15px',
+            marginTop: '20px',
+            marginBottom: '20px',
+            maxHeight: '250px',
+            overflowY: 'auto',
+            fontFamily: 'monospace',
+            fontSize: '12px',
+            color: '#aaa'
+          }}>
+            <div style={{ color: '#8b5cf6', marginBottom: '10px', fontWeight: 'bold' }}>
+              📋 Processing Log
+            </div>
+            {processingLogs.map((log, i) => (
+              <div key={i} style={{ marginBottom: '3px', color: '#ddd' }}>
+                {log}
+              </div>
+            ))}
+            <div ref={logsEndRef} />
+          </div>
+        )}
+
         {/* Playback & Crossfader Controls */}
         {stems[0] && stems[1] ? (
           <div className="playback-section">
@@ -750,7 +858,11 @@ export default function DualMixer() {
                 {playing ? '⏸ PAUSE' : '▶ PLAY BOTH'}
               </button>
 
-              <div className="progress-bar">
+              <div
+                className="progress-bar"
+                onClick={(e) => handleSeek(e)}
+                style={{ cursor: 'pointer' }}
+              >
                 <div
                   className="progress-fill"
                   style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}
@@ -896,30 +1008,32 @@ export default function DualMixer() {
 
             {/* Processing Progress Bar */}
             {isProcessing && (
-              <div style={{
-                margin: '10px 0',
-                background: 'rgba(99, 102, 241, 0.1)',
-                border: '1px solid #6366f1',
-                borderRadius: '4px',
-                overflow: 'hidden',
-                height: '24px'
-              }}>
+              <>
                 <div style={{
-                  width: `${processingProgress}%`,
-                  height: '100%',
-                  background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
-                  transition: 'width 0.3s ease',
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  color: '#fff',
-                  fontSize: '12px',
-                  fontWeight: 'bold'
+                  margin: '10px 0',
+                  background: 'rgba(99, 102, 241, 0.1)',
+                  border: '1px solid #6366f1',
+                  borderRadius: '4px',
+                  overflow: 'hidden',
+                  height: '24px'
                 }}>
-                  {processingProgress < 100 && `${Math.round(processingProgress)}%`}
-                  {processingProgress === 100 && '✅ Complete'}
+                  <div style={{
+                    width: `${processingProgress}%`,
+                    height: '100%',
+                    background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                    transition: 'width 0.3s ease',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#fff',
+                    fontSize: '12px',
+                    fontWeight: 'bold'
+                  }}>
+                    {processingProgress < 100 && `${Math.round(processingProgress)}%`}
+                    {processingProgress === 100 && '✅ Complete'}
+                  </div>
                 </div>
-              </div>
+              </>
             )}
 
             <p style={{ margin: '10px 0 0 0', color: '#999', fontSize: '12px' }}>

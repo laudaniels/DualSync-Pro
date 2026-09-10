@@ -56,6 +56,10 @@ def separate_stems():
     try:
         import shutil
         import time
+        global _processing_state
+
+        # Clear logs for new upload
+        _processing_state['logs'] = []
 
         # Save uploaded file
         audio_dir = BASE_DIR / 'Audio'
@@ -63,19 +67,22 @@ def separate_stems():
 
         file_path = audio_dir / file.filename
         file.save(str(file_path))
-        logging.info(f"Processing stems for: {file_path}")
+        add_log_message(f"📥 Uploading: {file.filename}")
 
         # Separate stems using mashup_engine
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
-        # Get BPM and key (combined single-pass analysis)
-        logging.info("Analyzing BPM and Key...")
+        # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
+        add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...")
         bpm, beat_anchor, key = engine.analyze_track_and_key(str(file_path))
         key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
 
-        # Separate stems
-        logging.info("Separating stems...")
+        add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key")
+
+        # Separate stems from the ORIGINAL file (not processed)
+        # The user will request processing later if needed
+        add_log_message("🔊 Separating stems using Demucs AI...")
         stem_dict = engine.separate_stems([str(file_path)])[0]
 
         # Copy stems to a simple location for serving
@@ -88,18 +95,21 @@ def separate_stems():
         session_dir.mkdir(exist_ok=True)
 
         stems = {}
+        add_log_message("📦 Copying stems to server...")
         for stem_name, stem_path in stem_dict.items():
             if Path(stem_path).exists():
                 # Copy to serve directory
                 dest_path = session_dir / f"{stem_name}.wav"
                 shutil.copy2(stem_path, str(dest_path))
                 stems[stem_name] = f"/api/audio/{timestamp}/{stem_name}.wav"
-                logging.info(f"✅ Copied {stem_name} to {dest_path}")
+                add_log_message(f"  ✅ {stem_name.capitalize()}")
             else:
-                logging.error(f"❌ Stem file not found: {stem_path}")
+                add_log_message(f"  ⚠️ Stem not found: {stem_name}")
 
         if not stems:
             raise Exception("No stems were separated successfully")
+
+        add_log_message("✨ Stem separation complete!")
 
         return jsonify({
             'stems': stems,
@@ -163,151 +173,154 @@ def get_audio_stats():
 
 
 # ===== Processing =====
-_processing_state = {'slot': None, 'stem': None, 'status': None}
+_processing_state = {
+    'slot': None,
+    'status': None,
+    'progress': 0,  # 0-100
+    'current_step': '',  # Description of current step
+    'logs': [],  # Real-time log messages
+    'steps': [
+        '📥 Loading original file',
+        '🎵 Beatmatching to target BPM',
+        '🎼 Transposing to target key',
+        '🔊 Separating stems',
+        '🥁 Splitting drums (auto)',
+        '📦 Copying stems',
+        '✅ Complete'
+    ]
+}
+
+
+def add_log_message(message):
+    """Add a message to the processing log"""
+    global _processing_state
+    if len(_processing_state['logs']) > 50:  # Keep last 50 messages
+        _processing_state['logs'].pop(0)
+    _processing_state['logs'].append(message)
+    logging.info(message)
 
 
 @app.route('/api/process-stems', methods=['POST'])
 def process_stems():
-    """Combined beatmatch + transpose processing"""
+    """Process FULL SONG (BPM + Key), then separate into stems"""
     global _processing_state
     data = request.json
     try:
+        # Clear logs for new processing
+        _processing_state['logs'] = []
+
+        import shutil
+        from pathlib import Path
+
         source_bpm = data.get('source_bpm')
         target_bpm = data.get('target_bpm')
         source_key = data.get('source_key')
         target_key = data.get('target_key')
         timestamp = data.get('timestamp')
         slot = data.get('slot', 0)
+        filename = data.get('filename')
 
-        logging.info(f"Processing stems (slot {slot}): BPM {source_bpm}→{target_bpm}, Key {source_key}→{target_key}")
+        add_log_message(f"🎯 Processing: BPM {source_bpm}→{target_bpm}, Key {source_key}→{target_key}")
 
-        if not timestamp:
-            logging.error("Missing timestamp in request")
-            return jsonify({'error': 'Missing timestamp'}), 400
+        if not timestamp or not filename:
+            add_log_message(f"❌ Missing timestamp or filename")
+            return jsonify({'error': 'Missing timestamp or filename'}), 400
 
-        stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamp
-        if not stems_dir.exists():
-            logging.error(f"Stems directory not found: {stems_dir}")
-            return jsonify({'error': 'Stems directory not found'}), 400
+        # Find original file
+        audio_dir = BASE_DIR / 'Audio'
+        original_file = audio_dir / filename
+        if not original_file.exists():
+            add_log_message(f"❌ Original file not found")
+            return jsonify({'error': 'Original file not found'}), 400
 
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
+        # Update progress state
+        _processing_state['slot'] = slot
+        _processing_state['progress'] = 10
+        _processing_state['current_step'] = _processing_state['steps'][0]
+        add_log_message("📥 Loading original song...")
+
+        # Step 1: Process the FULL SONG first
+        processed_song = audio_dir / f"processed_{timestamp}_{Path(filename).stem}.wav"
+
+        measured_bpm = None
+        # Apply BPM beatmatch if needed
+        current_input = original_file
+        if source_bpm and target_bpm and float(source_bpm) != float(target_bpm):
+            _processing_state['progress'] = 20
+            _processing_state['current_step'] = _processing_state['steps'][1]
+            add_log_message(f"🎵 Beatmatching: {source_bpm}→{target_bpm} BPM...")
+            success, measured_bpm = engine.time_stretch_audio(str(current_input), str(processed_song), float(target_bpm), float(source_bpm))
+            if success:
+                current_input = processed_song
+                add_log_message(f"✅ Beatmatched to {measured_bpm:.1f} BPM")
+            else:
+                add_log_message(f"⚠️ Beatmatch failed, continuing with original")
+                measured_bpm = None
+
+        # Apply Key transpose if needed
+        _processing_state['progress'] = 30
+        _processing_state['current_step'] = _processing_state['steps'][2]
+        if source_key and target_key and source_key != target_key:
+            keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+            source_idx = keys.index(source_key) if source_key in keys else -1
+            target_idx = keys.index(target_key) if target_key in keys else -1
+
+            if source_idx >= 0 and target_idx >= 0:
+                semitones = target_idx - source_idx
+                if semitones > 6:
+                    semitones -= 12
+                if semitones < -6:
+                    semitones += 12
+
+                transposed_song = audio_dir / f"transposed_{timestamp}_{Path(filename).stem}.wav"
+                add_log_message(f"🎼 Transposing: {semitones} semitones ({source_key}→{target_key})...")
+                success, measured_key = engine.pitch_shift_audio(str(current_input), str(transposed_song), semitones, source_idx)
+                if success:
+                    current_input = transposed_song
+                    key_name = engine._key_to_note(measured_key) if measured_key >= 0 else "?"
+                    add_log_message(f"✅ Transposed to {key_name}")
+                else:
+                    add_log_message(f"⚠️ Transpose failed, continuing")
+
+        # Step 2: Now separate stems from the PROCESSED full song (includes auto drum splitting)
+        _processing_state['progress'] = 50
+        _processing_state['current_step'] = _processing_state['steps'][3]
+        add_log_message(f"🔊 Separating stems from processed song...")
+        stem_dict = engine.separate_stems([str(current_input)])[0]
+
+        # Copy processed stems to serve directory
+        stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamp
+        stems_dir.mkdir(parents=True, exist_ok=True)
+
         processed_stems = {}
 
-        for stem in ['vocals', 'drums', 'bass', 'other']:
-            # Update progress state
-            _processing_state = {'slot': slot, 'stem': stem, 'status': 'processing'}
-
-            stem_path = stems_dir / f"{stem}.wav"
-            if not stem_path.exists():
-                logging.warning(f"Stem not found: {stem_path}")
-                _processing_state = {'slot': slot, 'stem': stem, 'status': 'skipped'}
-                continue
-
-            logging.info(f"🔄 Processing {stem} (slot {slot})...")
-
-            # Use original or previously processed version
-            current_path = stem_path
-            output_path = stems_dir / f"{stem}_processed.wav"
-
-            try:
-                # Apply beatmatch if needed
-                if source_bpm and target_bpm and float(source_bpm) != float(target_bpm):
-                    tempo_ratio = float(target_bpm) / float(source_bpm)
-                    if 0.5 <= tempo_ratio <= 2.0:
-                        beatmatched_path = stems_dir / f"{stem}_beatmatched.wav"
-                        _processing_state['status'] = f'beatmatching {stem}...'
-                        logging.info(f"  🎵 Beatmatching {stem}: {source_bpm}→{target_bpm} BPM (ratio {tempo_ratio:.2f})")
-                        success, measured_bpm = engine.time_stretch_audio(str(current_path), str(beatmatched_path), float(target_bpm), float(source_bpm))
-
-                        # Verify beatmatching convergence (±10 BPM tolerance)
-                        # Accept if: success AND (measured_bpm within tolerance OR detection failed but file created)
-                        if success:
-                            if measured_bpm:
-                                bpm_error = abs(measured_bpm - float(target_bpm))
-                                if bpm_error <= 10.0:
-                                    current_path = beatmatched_path
-                                    logging.info(f"  ✅ Beatmatched {stem} to {measured_bpm:.1f} BPM (target: {target_bpm}, error: {bpm_error:.1f})")
-                                else:
-                                    logging.warning(f"  ⚠️  Beatmatched {stem} to {measured_bpm:.1f} BPM (error: {bpm_error:.1f} > 10 BPM, but accepting)")
-                                    current_path = beatmatched_path
-                            else:
-                                # BPM detection failed on output, but file exists - accept anyway
-                                logging.warning(f"  ⚠️  Beatmatched {stem} (output BPM detection failed, but file created - accepting)")
-                                current_path = beatmatched_path
-                        else:
-                            logging.error(f"  ❌ Beatmatch failed for {stem}: time_stretch_audio returned False")
-
-                # Apply transpose if needed
-                if source_key and target_key and source_key != target_key:
-                    keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-                    source_idx = keys.index(source_key) if source_key in keys else -1
-                    target_idx = keys.index(target_key) if target_key in keys else -1
-
-                    if source_idx >= 0 and target_idx >= 0:
-                        semitones = target_idx - source_idx
-                        if semitones > 6:
-                            semitones -= 12
-                        if semitones < -6:
-                            semitones += 12
-
-                        _processing_state['status'] = f'transposing {stem}...'
-                        logging.info(f"  🎼 Transposing {stem}: {semitones} semitones")
-                        if engine.pitch_shift_audio(str(current_path), str(output_path), semitones):
-                            processed_stems[stem] = f"/api/audio/{timestamp}/{stem}_processed.wav"
-                            _processing_state['status'] = f'{stem} ✅'
-                            logging.info(f"  ✅ Transposed {stem}")
-                        else:
-                            logging.error(f"  ❌ Transpose failed for {stem}")
-                            processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
-                            _processing_state['status'] = f'{stem} failed'
-                    else:
-                        logging.warning(f"  Invalid key indices: {source_key}→{target_key}")
-                        processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
-                        _processing_state['status'] = f'{stem} (no key change)'
-                else:
-                    # Only beatmatch, no transpose needed
-                    if current_path != stem_path:
-                        # Beatmatched file already written by time_stretch_audio
-                        processed_stems[stem] = f"/api/audio/{timestamp}/{stem}_beatmatched.wav"
-                        _processing_state['status'] = f'{stem} ✅'
-                        logging.info(f"✅ Beatmatched {stem} ready")
-                    else:
-                        processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
-                        _processing_state['status'] = f'{stem} (no change)'
-                        logging.info(f"No processing needed for {stem}")
-
-            except Exception as stem_error:
-                logging.warning(f"Error processing stem {stem}: {stem_error}, falling back to original")
-                # Fall back to original stem (don't fail entire process)
-                original_stem_path = stems_dir / f"{stem}.wav"
-                if original_stem_path.exists():
-                    processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
-                    _processing_state['status'] = f'{stem} (fallback)'
-                else:
-                    logging.error(f"Original stem also missing: {original_stem_path}")
-                    _processing_state['status'] = f'{stem} (missing)'
+        # Copy PROCESSED stems to serve directory (now includes kick, snare, hihat, tom)
+        _processing_state['progress'] = 70
+        _processing_state['current_step'] = _processing_state['steps'][5]
+        add_log_message("📦 Copying processed stems...")
+        for stem in stem_dict.keys():
+            stem_path = stem_dict.get(stem)
+            if stem_path and Path(stem_path).exists():
+                # Copy processed stem to serve directory
+                dest_path = stems_dir / f"{stem}.wav"
+                shutil.copy2(str(stem_path), str(dest_path))
+                processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
+                add_log_message(f"  ✅ {stem.capitalize()}")
+            else:
+                add_log_message(f"  ⚠️ {stem} not found")
 
         if not processed_stems:
-            logging.error("No stems were processed")
+            add_log_message("❌ No stems were processed")
+            _processing_state['progress'] = 0
+            _processing_state['status'] = 'error'
             return jsonify({'error': 'Processing failed'}), 500
 
-        # After processing, analyze the stems to get actual measured BPM for beatmatched stems
-        measured_bpm = None
-        if source_bpm and target_bpm and float(source_bpm) != float(target_bpm):
-            # Pick first processed stem to measure output BPM
-            for stem in ['vocals', 'drums', 'bass', 'other']:
-                processed_stem_path = stems_dir / f"{stem}_processed.wav"
-                if processed_stem_path.exists():
-                    try:
-                        measured_bpm, _ = engine.analyze_track(str(processed_stem_path))
-                        logging.info(f"Measured output BPM: {measured_bpm:.1f} (target: {target_bpm})")
-                        break
-                    except Exception as e:
-                        logging.warning(f"Could not measure BPM: {e}")
-
-        logging.info(f"✅ Processing complete. Processed {len(processed_stems)} stems")
+        _processing_state['progress'] = 100
+        _processing_state['current_step'] = _processing_state['steps'][6]
+        add_log_message(f"✨ Processing complete!")
         return jsonify({
             'status': 'success',
             'processed_stems': processed_stems,
@@ -317,7 +330,44 @@ def process_stems():
         })
     except Exception as e:
         logging.error(f"Process error: {e}", exc_info=True)
+        _processing_state['progress'] = 0
+        _processing_state['status'] = 'error'
         return jsonify({'error': f'Processing failed: {str(e)}'}), 500
+
+
+@app.route('/api/split-drums', methods=['POST'])
+def split_drums():
+    """Split drum stem into kick, snare, hi-hat, and toms"""
+    data = request.json
+    try:
+        from mashup_engine import MashupEngine
+        import shutil
+
+        drum_path = data.get('drum_path')
+        timestamp = data.get('timestamp')
+
+        if not drum_path or not Path(drum_path).exists():
+            return jsonify({'error': 'Drum stem file not found'}), 400
+
+        engine = MashupEngine()
+        audio_dir = BASE_DIR / 'Audio'
+        splits_dir = audio_dir / 'drums_split' / timestamp
+
+        logging.info(f"🥁 Splitting drums: {drum_path}")
+        drum_splits = engine.split_drums(drum_path, str(splits_dir))
+
+        logging.info(f"✅ Drum split complete: {list(drum_splits.keys())}")
+        return jsonify({
+            'status': 'success',
+            'splits': {
+                name: f'/api/audio/drums_split/{timestamp}/{Path(path).name}'
+                for name, path in drum_splits.items()
+            }
+        })
+
+    except Exception as e:
+        logging.error(f"Drum split error: {e}", exc_info=True)
+        return jsonify({'error': f'Drum split failed: {str(e)}'}), 500
 
 
 @app.route('/api/render-final-mix', methods=['POST'])
@@ -642,6 +692,13 @@ def cleanup_audio():
     except Exception as e:
         logging.error(f"Cleanup failed: {e}", exc_info=True)
         return jsonify({'error': f'Cleanup failed: {str(e)}'}), 500
+
+
+@app.route('/api/process-status', methods=['GET'])
+def process_status():
+    """Get current processing status and progress"""
+    global _processing_state
+    return jsonify(_processing_state)
 
 
 # ===== Health Check =====
