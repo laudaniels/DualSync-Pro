@@ -152,7 +152,7 @@ All files are FLAC format with embedded metadata (TITLE, BPM, INITIALKEY).
 
 ### File Structure
 ```
-stem-mashup-pro/
+DualSync-Pro/
 ├── frontend/                     # React app
 │   ├── src/
 │   │   ├── components/
@@ -184,8 +184,8 @@ stem-mashup-pro/
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/laudaniels/Stem-Mashup-Pro.git
-cd Stem-Mashup-Pro
+git clone https://github.com/laudaniels/DualSync-Pro.git
+cd DualSync-Pro
 ```
 
 ### Install Python Backend
