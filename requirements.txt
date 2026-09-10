@@ -1,0 +1,14 @@
+torch
+torchaudio
+demucs
+numpy<2
+librosa
+essentia
+flask
+flask-cors
+scipy
+soundfile
+mutagen
+
+# Note: Madmom removed (Python 3.12 incompatibility with pkg_resources)
+# Note: RubberBand is CLI tool, install via: apt-get/brew install rubberband-cli
