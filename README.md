@@ -20,9 +20,13 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
   - Vocals, Bass, Other (standard stems)
   - Kick, Snare, Hi-Hat, Tom (auto-split drum components via frequency-based filtering)
 - **Crossfader** — blend between Song 1 and Song 2 in real-time
-- **Beat Offset Control** — manually align Song 2's beat grid (0-8 beats ahead):
-  - Real-time delay applied via Web Audio API during playback
+- **Beat Offset Control with Magnetic Snap** — manually align Song 2's beat grid:
+  - Fine-tune offset with 0.1 beat precision (0, 0.1, 0.2... 8.0 beats)
+  - Slider snaps to whole beats automatically when you get close (~0.15 beat range)
+  - Brief visual feedback shows snap status and current fine-tune value
+  - Real-time audio delay via Web Audio API during playback
   - Visual offset indicator on waveform display
+  - Audible snap feedback when reaching beat boundaries
   - Helps align 4/4 bar measures between songs with same BPM
 - **Multi-Stem Waveform Visualization** — advanced beat alignment tool:
   - Select any combination of 7 stems to display (vocals, kick, snare, hi-hat, tom, bass, other)
@@ -118,14 +122,18 @@ The **"Process All Changes" button is enabled** only when BPM or Key has changed
 ### 4. Mix in Real-Time
 (Previously step 5) After processing:
 - **Advanced Beat Alignment:**
-  - Adjust beat offset slider (0-8 beats) to align Song 2's bar grid with Song 1
+  - **Magnetic Snap Beat Offset** — drag slider (0-8 beats, 0.1 beat increments):
+    - Fine-tune offset to ±0.1 beat precision for perfect alignment
+    - Slider automatically snaps to whole beats when within ~0.15 beat range
+    - Brief visual feedback (200ms) shows "Snapped" + fine-tune value while near beat
+    - Real-time audio delay applied during playback (Web Audio API)
+    - Audible feedback: hear the snapping as you find alignment
   - Watch Song 2 waveform shift visually as you adjust offset (shows actual alignment)
   - Select any of 7 stems to display in waveform (vocals, kick, snare, hi-hat, tom, bass, other)
   - Zoom waveform dynamically (3-30 seconds) for detail level you need
   - Compare both Song 1 and Song 2 waveforms side-by-side
   - Color-coded stems for easy identification
   - Pause to inspect waveforms without playhead movement
-  - Real-time delay applied during playback (Web Audio API)
 - **Volume Mixing:**
   - Adjust 7 stem volumes independently for Song 1 and Song 2
   - Use crossfader to blend between songs (0% Song 1 → 50% Both → 100% Song 2)

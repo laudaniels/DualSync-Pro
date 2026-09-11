@@ -40,8 +40,11 @@ export default function DualMixer() {
   const audioSourcesRef = useRef({});
   const delayNodeRef = useRef(null); // For Song 2 beat offset
   const [beatOffset, setBeatOffset] = useState(0); // 0-8 beats for Song 2
+  const [beatOffsetDisplay, setBeatOffsetDisplay] = useState(0); // Fine-tuned display value
+  const [isSnappedTobeat, setIsSnappedToBeat] = useState(false); // Visual feedback for snap
   const [kickWaveforms, setKickWaveforms] = useState(null); // Kick drum waveforms for display
   const [selectedStemsForWaveform, setSelectedStemsForWaveform] = useState(['kick']); // Which stems to display in waveform
+  const [waveformZoom, setWaveformZoom] = useState(10); // Waveform zoom level in seconds
 
   // Stem names now include split drums (drums → kick, snare, hihat, tom)
   const stemNames = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other'];
@@ -85,6 +88,40 @@ export default function DualMixer() {
   React.useEffect(() => {
     fetchStats();
   }, []);
+
+  // Magnetic snap behavior for beat offset
+  React.useEffect(() => {
+    // Check if within 0.1 of a whole beat
+    const nearestBeat = Math.round(beatOffsetDisplay);
+    const snapThreshold = 0.15;
+    const distanceToNearestBeat = Math.abs(beatOffsetDisplay - nearestBeat);
+
+    if (distanceToNearestBeat < snapThreshold && nearestBeat >= 0 && nearestBeat <= 8) {
+      // Snap to beat
+      setBeatOffset(nearestBeat);
+      setIsSnappedToBeat(true);
+
+      // Clear previous timeout
+      if (beatSnapTimeoutRef.current) {
+        clearTimeout(beatSnapTimeoutRef.current);
+      }
+
+      // Hold snap feedback for 200ms
+      beatSnapTimeoutRef.current = setTimeout(() => {
+        setIsSnappedToBeat(false);
+      }, 200);
+    } else {
+      // Not near a beat, just update beatOffset directly
+      setBeatOffset(parseFloat(beatOffsetDisplay.toFixed(1)));
+      setIsSnappedToBeat(false);
+    }
+
+    return () => {
+      if (beatSnapTimeoutRef.current) {
+        clearTimeout(beatSnapTimeoutRef.current);
+      }
+    };
+  }, [beatOffsetDisplay]);
 
   // Poll for processing logs while loading
   React.useEffect(() => {
@@ -1116,6 +1153,8 @@ export default function DualMixer() {
                 currentTime={currentTime}
                 beatOffset={beatOffset}
                 song2Bpm={metadata[1]?.bpm ? parseFloat(String(metadata[1].bpm).split('-')[0]) : 120}
+                zoomLevel={waveformZoom}
+                onZoomChange={setWaveformZoom}
               />
             )}
 
@@ -1141,30 +1180,54 @@ export default function DualMixer() {
               </div>
             </div>
 
-            {/* Beat Offset for Song 2 */}
+            {/* Beat Offset for Song 2 with Magnetic Snap */}
             <div className="crossfader-section" style={{ marginTop: '15px' }}>
-              <label>🎵 Beat Offset (Song 2)</label>
+              <label>🎵 Beat Offset (Song 2) — Fine-tune + Snap to Beats</label>
               <div className="crossfader-labels">
                 <span>Sync</span>
                 <span>Offset</span>
                 <span>+8 beats</span>
               </div>
-              <input
-                type="range"
-                min="0"
-                max="8"
-                step="1"
-                value={beatOffset}
-                onChange={(e) => setBeatOffset(parseInt(e.target.value))}
-                disabled={!stems[0] || !stems[1]}
-                className="crossfader-slider"
-                style={{
-                  opacity: (!stems[0] || !stems[1]) ? 0.5 : 1,
-                  cursor: (!stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
-                }}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  type="range"
+                  min="0"
+                  max="8"
+                  step="0.1"
+                  value={beatOffsetDisplay}
+                  onChange={(e) => setBeatOffsetDisplay(parseFloat(e.target.value))}
+                  disabled={!stems[0] || !stems[1]}
+                  className="crossfader-slider"
+                  style={{
+                    opacity: (!stems[0] || !stems[1]) ? 0.5 : 1,
+                    cursor: (!stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
+                  }}
+                />
+                {/* Beat marks container */}
+                <div style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  padding: '0 2px',
+                  pointerEvents: 'none',
+                  marginTop: '4px',
+                  fontSize: '11px',
+                  color: '#666'
+                }}>
+                  {[0, 1, 2, 3, 4, 5, 6, 7, 8].map(beat => (
+                    <span key={beat} style={{ textAlign: 'center', flex: 1 }}>
+                      {beat}
+                    </span>
+                  ))}
+                </div>
+              </div>
               <div className="crossfader-value">
-                {beatOffset === 0 ? 'No offset (sync)' : `+${beatOffset} beats`}
+                {isSnappedToBeat ? (
+                  `🎯 Snapped: +${beatOffset} beat${beatOffset !== 1 ? 's' : ''} (fine-tune: ${beatOffsetDisplay.toFixed(1)})`
+                ) : beatOffsetDisplay === 0 ? (
+                  '✓ Sync (no offset)'
+                ) : (
+                  `⚙️ Fine-tuning: +${beatOffsetDisplay.toFixed(1)} beats`
+                )}
               </div>
             </div>
 
