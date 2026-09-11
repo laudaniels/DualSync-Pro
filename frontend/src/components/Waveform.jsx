@@ -1,30 +1,31 @@
 import React, { useEffect, useRef, useState } from 'react';
 
-export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, zoomLevel = 10, onZoomChange }) {
+// Colors for each stem
+const stemColors = {
+  vocals: 'rgb(168, 85, 247)',    // purple
+  kick: 'rgb(99, 102, 241)',      // indigo
+  snare: 'rgb(236, 72, 153)',     // pink
+  hihat: 'rgb(249, 115, 22)',     // orange
+  tom: 'rgb(34, 197, 94)',        // green
+  bass: 'rgb(59, 130, 246)',      // blue
+  other: 'rgb(168, 162, 158)'     // gray
+};
+
+const stemLabels = {
+  vocals: '🎤 Vocals',
+  kick: '🔊 Kick',
+  snare: '🥁 Snare',
+  hihat: '⚡ Hi-Hat',
+  tom: '🔔 Tom',
+  bass: '🎸 Bass',
+  other: '🎹 Other'
+};
+
+export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, song1Bpm = 120, song1BeatAnchor = 0, zoomLevel = 10, onZoomChange }) {
   const canvasRef = useRef(null);
+  const lastSizeRef = useRef({ width: 0, height: 0 });
   const [loading, setLoading] = useState(true);
   const ZOOM_WINDOW = zoomLevel; // Dynamic zoom level
-
-  // Colors for each stem
-  const stemColors = {
-    vocals: 'rgb(168, 85, 247)',    // purple
-    kick: 'rgb(99, 102, 241)',      // indigo
-    snare: 'rgb(236, 72, 153)',     // pink
-    hihat: 'rgb(249, 115, 22)',     // orange
-    tom: 'rgb(34, 197, 94)',        // green
-    bass: 'rgb(59, 130, 246)',      // blue
-    other: 'rgb(168, 162, 158)'     // gray
-  };
-
-  const stemLabels = {
-    vocals: '🎤 Vocals',
-    kick: '🔊 Kick',
-    snare: '🥁 Snare',
-    hihat: '⚡ Hi-Hat',
-    tom: '🔔 Tom',
-    bass: '🎸 Bass',
-    other: '🎹 Other'
-  };
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -34,9 +35,16 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, zoo
     const width = canvas.offsetWidth;
     const height = canvas.offsetHeight;
 
-    canvas.width = width * window.devicePixelRatio;
-    canvas.height = height * window.devicePixelRatio;
-    ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+    // Resizing the backing store (and re-applying the DPR scale) resets the
+    // canvas's transform, so only do it when the CSS size actually changed --
+    // this redraw fires ~10x/sec from the playhead timer, and reallocating
+    // the backing store every time was heavy enough to stall the main thread.
+    if (lastSizeRef.current.width !== width || lastSizeRef.current.height !== height) {
+      canvas.width = width * window.devicePixelRatio;
+      canvas.height = height * window.devicePixelRatio;
+      ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+      lastSizeRef.current = { width, height };
+    }
 
     // Clear canvas
     ctx.fillStyle = 'rgba(15, 15, 30, 0.95)';
@@ -69,6 +77,25 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, zoo
 
     // Calculate pixel offset for Song 2 based on beat offset
     const song2PixelOffset = (delaySeconds / ZOOM_WINDOW) * width;
+
+    // Draw beat grid, aligned to Song 1's detected beat phase
+    const beatInterval = song1Bpm > 0 ? 60 / song1Bpm : 0;
+    if (beatInterval > 0) {
+      const firstBeat = song1BeatAnchor + Math.ceil((actualStart - song1BeatAnchor) / beatInterval) * beatInterval;
+      let beatIdx = Math.round((firstBeat - song1BeatAnchor) / beatInterval);
+
+      for (let beatTime = firstBeat; beatTime <= actualEnd; beatTime += beatInterval, beatIdx++) {
+        const x = ((beatTime - actualStart) / ZOOM_WINDOW) * width;
+        const isBar = beatIdx % 4 === 0; // Emphasize downbeats (assumes 4/4)
+
+        ctx.strokeStyle = isBar ? 'rgba(255, 255, 255, 0.18)' : 'rgba(255, 255, 255, 0.07)';
+        ctx.lineWidth = isBar ? 1.5 : 1;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, height);
+        ctx.stroke();
+      }
+    }
 
     // Draw each selected stem
     stemsToDisplay.forEach((stem, stemIdx) => {
@@ -105,7 +132,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, zoo
           if (x < 0 || x > width) continue;
 
           const amplitude = songData.data[sampleIdx] || 0;
-          const y = yPos + (amplitude * (rowHeight / 4));
+          const y = yPos + (amplitude * (rowHeight / 3));
 
           if (i === 0) {
             ctx.moveTo(x, y);
@@ -165,7 +192,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, zoo
     ctx.fillText(`${actualStart.toFixed(1)}s`, 5, height - 5);
     ctx.textAlign = 'right';
     ctx.fillText(`${actualEnd.toFixed(1)}s`, width - 5, height - 5);
-  }, [kicks, beatOffset, song2Bpm, currentTime]);
+  }, [kicks, beatOffset, song2Bpm, song1Bpm, song1BeatAnchor, currentTime, ZOOM_WINDOW]);
 
   return (
     <div style={{ marginBottom: '15px' }}>

@@ -59,8 +59,16 @@ def separate_stems():
         import time
         global _processing_state
 
-        # Clear logs for new upload
-        _processing_state['logs'] = []
+        # Both songs can upload/separate at once (threaded server), so only
+        # clear this slot's own previous log lines -- wiping the whole shared
+        # log here would erase the other song's still-relevant progress.
+        slot_raw = request.form.get('slot')
+        slot = int(slot_raw) if slot_raw not in (None, '') else None
+        if slot is not None:
+            prefix = f"[Song {slot + 1}]"
+            _processing_state['logs'] = [m for m in _processing_state['logs'] if not m.startswith(prefix)]
+        else:
+            _processing_state['logs'] = []
 
         # Save uploaded file
         audio_dir = BASE_DIR / 'Audio'
@@ -68,22 +76,22 @@ def separate_stems():
 
         file_path = audio_dir / file.filename
         file.save(str(file_path))
-        add_log_message(f"📥 Uploading: {file.filename}")
+        add_log_message(f"📥 Uploading: {file.filename}", slot)
 
         # Separate stems using mashup_engine
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
         # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
-        add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...")
+        add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...", slot)
         bpm, beat_anchor, key = engine.analyze_track_and_key(str(file_path))
         key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
 
-        add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key")
+        add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
 
         # Separate stems from the ORIGINAL file (not processed)
         # The user will request processing later if needed
-        add_log_message("🔊 Separating stems using Demucs AI...")
+        add_log_message("🔊 Separating stems using Demucs AI...", slot)
         stem_dict = engine.separate_stems([str(file_path)])[0]
 
         # Copy stems to a simple location for serving
@@ -96,25 +104,26 @@ def separate_stems():
         session_dir.mkdir(exist_ok=True)
 
         stems = {}
-        add_log_message("📦 Copying stems to server...")
+        add_log_message("📦 Copying stems to server...", slot)
         for stem_name, stem_path in stem_dict.items():
             if Path(stem_path).exists():
                 # Copy to serve directory
                 dest_path = session_dir / f"{stem_name}.wav"
                 shutil.copy2(stem_path, str(dest_path))
                 stems[stem_name] = f"/api/audio/{timestamp}/{stem_name}.wav"
-                add_log_message(f"  ✅ {stem_name.capitalize()}")
+                add_log_message(f"  ✅ {stem_name.capitalize()}", slot)
             else:
-                add_log_message(f"  ⚠️ Stem not found: {stem_name}")
+                add_log_message(f"  ⚠️ Stem not found: {stem_name}", slot)
 
         if not stems:
             raise Exception("No stems were separated successfully")
 
-        add_log_message("✨ Stem separation complete!")
+        add_log_message("✨ Stem separation complete!", slot)
 
         return jsonify({
             'stems': stems,
             'bpm': round(bpm, 1),
+            'beat_anchor': beat_anchor,
             'key': key_name,
             'filename': file.filename,
             'timestamp': timestamp
@@ -174,12 +183,16 @@ def get_audio_stats():
 
 
 # ===== Processing =====
+# Both songs can be processed at once (threaded server), so status/progress
+# live per-slot -- a single shared 'progress'/'status' would let one song's
+# updates clobber the other's while both are in flight.
+def _new_slot_state():
+    return {'status': None, 'progress': 0, 'current_step': ''}
+
+
 _processing_state = {
-    'slot': None,
-    'status': None,
-    'progress': 0,  # 0-100
-    'current_step': '',  # Description of current step
-    'logs': [],  # Real-time log messages
+    'slots': {0: _new_slot_state(), 1: _new_slot_state()},
+    'logs': [],  # Real-time log messages, tagged "[Song N] ..."
     'steps': [
         '📥 Loading original file',
         '🎵 Beatmatching to target BPM',
@@ -192,13 +205,25 @@ _processing_state = {
 }
 
 
-def add_log_message(message):
-    """Add a message to the processing log"""
+def add_log_message(message, slot=None):
+    """Add a message to the processing log, tagged by which song slot it's for.
+
+    Both songs can be uploading/processing at once, so untagged messages would
+    be ambiguous once merged into the single shared log list the frontend polls.
+    """
     global _processing_state
+    tagged = f"[Song {slot + 1}] {message}" if slot is not None else message
     if len(_processing_state['logs']) > 50:  # Keep last 50 messages
         _processing_state['logs'].pop(0)
-    _processing_state['logs'].append(message)
-    logging.info(message)
+    _processing_state['logs'].append(tagged)
+    logging.info(tagged)
+
+
+def _set_slot_state(slot, **fields):
+    """Update this slot's own progress/status without touching the other slot's."""
+    global _processing_state
+    _processing_state['slots'].setdefault(slot, _new_slot_state())
+    _processing_state['slots'][slot].update(fields)
 
 
 @app.route('/api/process-stems', methods=['POST'])
@@ -206,42 +231,42 @@ def process_stems():
     """Process FULL SONG (BPM + Key), then separate into stems"""
     global _processing_state
     data = request.json
+    slot = (data or {}).get('slot', 0)
     try:
-        # Clear logs for new processing
-        _processing_state['logs'] = []
-
-        import shutil
-        from pathlib import Path
-
         source_bpm = data.get('source_bpm')
         target_bpm = data.get('target_bpm')
         source_key = data.get('source_key')
         target_key = data.get('target_key')
         timestamp = data.get('timestamp')
-        slot = data.get('slot', 0)
         filename = data.get('filename')
 
-        add_log_message(f"🎯 Processing: BPM {source_bpm}→{target_bpm}, Key {source_key}→{target_key}")
+        # Both songs can process at once -- only clear this slot's own
+        # previous log lines, not the other song's.
+        prefix = f"[Song {slot + 1}]"
+        _processing_state['logs'] = [m for m in _processing_state['logs'] if not m.startswith(prefix)]
+
+        import shutil
+        from pathlib import Path
+
+        add_log_message(f"🎯 Processing: BPM {source_bpm}→{target_bpm}, Key {source_key}→{target_key}", slot)
 
         if not timestamp or not filename:
-            add_log_message(f"❌ Missing timestamp or filename")
+            add_log_message(f"❌ Missing timestamp or filename", slot)
             return jsonify({'error': 'Missing timestamp or filename'}), 400
 
         # Find original file
         audio_dir = BASE_DIR / 'Audio'
         original_file = audio_dir / filename
         if not original_file.exists():
-            add_log_message(f"❌ Original file not found")
+            add_log_message(f"❌ Original file not found", slot)
             return jsonify({'error': 'Original file not found'}), 400
 
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
         # Update progress state
-        _processing_state['slot'] = slot
-        _processing_state['progress'] = 10
-        _processing_state['current_step'] = _processing_state['steps'][0]
-        add_log_message("📥 Loading original song...")
+        _set_slot_state(slot, status='processing', progress=10, current_step=_processing_state['steps'][0])
+        add_log_message("📥 Loading original song...", slot)
 
         # Step 1: Process the FULL SONG first
         processed_song = audio_dir / f"processed_{timestamp}_{Path(filename).stem}.wav"
@@ -250,20 +275,18 @@ def process_stems():
         # Apply BPM beatmatch if needed
         current_input = original_file
         if source_bpm and target_bpm and float(source_bpm) != float(target_bpm):
-            _processing_state['progress'] = 20
-            _processing_state['current_step'] = _processing_state['steps'][1]
-            add_log_message(f"🎵 Beatmatching: {source_bpm}→{target_bpm} BPM...")
+            _set_slot_state(slot, progress=20, current_step=_processing_state['steps'][1])
+            add_log_message(f"🎵 Beatmatching: {source_bpm}→{target_bpm} BPM...", slot)
             success, measured_bpm = engine.time_stretch_audio(str(current_input), str(processed_song), float(target_bpm), float(source_bpm))
             if success:
                 current_input = processed_song
-                add_log_message(f"✅ Beatmatched to {measured_bpm:.1f} BPM")
+                add_log_message(f"✅ Beatmatched to {measured_bpm:.1f} BPM", slot)
             else:
-                add_log_message(f"⚠️ Beatmatch failed, continuing with original")
+                add_log_message(f"⚠️ Beatmatch failed, continuing with original", slot)
                 measured_bpm = None
 
         # Apply Key transpose if needed
-        _processing_state['progress'] = 30
-        _processing_state['current_step'] = _processing_state['steps'][2]
+        _set_slot_state(slot, progress=30, current_step=_processing_state['steps'][2])
         if source_key and target_key and source_key != target_key:
             keys = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
             source_idx = keys.index(source_key) if source_key in keys else -1
@@ -277,19 +300,18 @@ def process_stems():
                     semitones += 12
 
                 transposed_song = audio_dir / f"transposed_{timestamp}_{Path(filename).stem}.wav"
-                add_log_message(f"🎼 Transposing: {semitones} semitones ({source_key}→{target_key})...")
+                add_log_message(f"🎼 Transposing: {semitones} semitones ({source_key}→{target_key})...", slot)
                 success, measured_key = engine.pitch_shift_audio(str(current_input), str(transposed_song), semitones, source_idx)
                 if success:
                     current_input = transposed_song
                     key_name = engine._key_to_note(measured_key) if measured_key >= 0 else "?"
-                    add_log_message(f"✅ Transposed to {key_name}")
+                    add_log_message(f"✅ Transposed to {key_name}", slot)
                 else:
-                    add_log_message(f"⚠️ Transpose failed, continuing")
+                    add_log_message(f"⚠️ Transpose failed, continuing", slot)
 
         # Step 2: Now separate stems from the PROCESSED full song (includes auto drum splitting)
-        _processing_state['progress'] = 50
-        _processing_state['current_step'] = _processing_state['steps'][3]
-        add_log_message(f"🔊 Separating stems from processed song...")
+        _set_slot_state(slot, progress=50, current_step=_processing_state['steps'][3])
+        add_log_message(f"🔊 Separating stems from processed song...", slot)
         stem_dict = engine.separate_stems([str(current_input)])[0]
 
         # Copy processed stems to serve directory
@@ -299,9 +321,8 @@ def process_stems():
         processed_stems = {}
 
         # Copy PROCESSED stems to serve directory (now includes kick, snare, hihat, tom)
-        _processing_state['progress'] = 70
-        _processing_state['current_step'] = _processing_state['steps'][5]
-        add_log_message("📦 Copying processed stems...")
+        _set_slot_state(slot, progress=70, current_step=_processing_state['steps'][5])
+        add_log_message("📦 Copying processed stems...", slot)
         for stem in stem_dict.keys():
             stem_path = stem_dict.get(stem)
             if stem_path and Path(stem_path).exists():
@@ -309,19 +330,17 @@ def process_stems():
                 dest_path = stems_dir / f"{stem}.wav"
                 shutil.copy2(str(stem_path), str(dest_path))
                 processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
-                add_log_message(f"  ✅ {stem.capitalize()}")
+                add_log_message(f"  ✅ {stem.capitalize()}", slot)
             else:
-                add_log_message(f"  ⚠️ {stem} not found")
+                add_log_message(f"  ⚠️ {stem} not found", slot)
 
         if not processed_stems:
-            add_log_message("❌ No stems were processed")
-            _processing_state['progress'] = 0
-            _processing_state['status'] = 'error'
+            add_log_message("❌ No stems were processed", slot)
+            _set_slot_state(slot, progress=0, status='error')
             return jsonify({'error': 'Processing failed'}), 500
 
-        _processing_state['progress'] = 100
-        _processing_state['current_step'] = _processing_state['steps'][6]
-        add_log_message(f"✨ Processing complete!")
+        _set_slot_state(slot, progress=100, current_step=_processing_state['steps'][6], status='success')
+        add_log_message(f"✨ Processing complete!", slot)
         return jsonify({
             'status': 'success',
             'processed_stems': processed_stems,
@@ -331,8 +350,7 @@ def process_stems():
         })
     except Exception as e:
         logging.error(f"Process error: {e}", exc_info=True)
-        _processing_state['progress'] = 0
-        _processing_state['status'] = 'error'
+        _set_slot_state(slot, progress=0, status='error')
         return jsonify({'error': f'Processing failed: {str(e)}'}), 500
 
 
@@ -567,7 +585,7 @@ def download_stems_zip():
 
                 # Add original stems as FLAC
                 if include_original:
-                    for stem in ['vocals', 'drums', 'bass', 'other']:
+                    for stem in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
                         stem_file = stems_dir / f"{stem}.wav"
                         if stem_file.exists():
                             # Convert WAV to FLAC with tags
@@ -608,7 +626,7 @@ def download_stems_zip():
 
                 # Add processed stems as FLAC
                 if include_processed:
-                    for stem in ['vocals', 'drums', 'bass', 'other']:
+                    for stem in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
                         stem_file = stems_dir / f"{stem}_processed.wav"
                         if not stem_file.exists():
                             stem_file = stems_dir / f"{stem}.wav"
@@ -737,4 +755,4 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+    app.run(host='127.0.0.1', port=5000, debug=True, threaded=True)

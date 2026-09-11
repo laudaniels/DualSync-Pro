@@ -116,8 +116,49 @@ class MashupEngine:
                 del stems['drums']
                 stems.update(drum_components)
 
+            self._conform_stem_lengths(stems)
             results.append(stems)
         return results
+
+    def _get_duration(self, path):
+        """Return a media file's duration in seconds via ffprobe."""
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=30
+        )
+        return float(result.stdout.strip())
+
+    def _conform_stem_lengths(self, stems, tolerance=0.02):
+        """Pad every stem with silence so they all share the same (longest) duration.
+
+        Demucs' 4-stem output is sample-accurate, but split_drums() runs a
+        different ffmpeg filter chain per drum component (lowpass/highpass vs
+        bandpass), and each filter's group delay shifts its output length by
+        a few milliseconds. Left uneven, the shortest stem hits its native
+        end before the others, so it drops out mid-playback until the
+        frontend's shared-playhead loop resets everything back to zero.
+        """
+        import logging
+
+        durations = {name: self._get_duration(path) for name, path in stems.items()}
+        target = max(durations.values())
+
+        for name, path in stems.items():
+            if target - durations[name] <= tolerance:
+                continue
+            padded_path = str(Path(path).with_suffix('')) + '_padded.wav'
+            cmd = [
+                self.ffmpeg, "-y", "-i", str(path),
+                "-af", "apad", "-t", f"{target:.3f}",
+                padded_path
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                logging.warning(f"Could not pad {name} to {target:.3f}s: {result.stderr.strip()[-300:]}")
+                continue
+            shutil.move(padded_path, path)
+            logging.info(f"🩹 Padded {name}: {durations[name]:.3f}s → {target:.3f}s")
 
     def analyze_track(self, song_path):
         """Estimate a track's tempo (BPM) and a reference beat position.

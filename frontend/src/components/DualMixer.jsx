@@ -1,6 +1,7 @@
-import React, { useState, useRef, useEffect } from 'react';
-import StemLoader from './StemLoader';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import Waveform from './Waveform';
+import SongMixer from './SongMixer';
+import { stemNames, stemLabels } from './stemConstants';
 import '../styles/DualMixer.css';
 
 export default function DualMixer() {
@@ -9,6 +10,7 @@ export default function DualMixer() {
   const [loading, setLoading] = useState([false, false]);
   const [error, setError] = useState('');
   const [playing, setPlaying] = useState(false);
+  const playingRef = useRef(false); // Mirrors `playing` for reads inside native audio event handlers (closures over state go stale there)
   const [editingBpm, setEditingBpm] = useState([false, false]);
   const [editingKey, setEditingKey] = useState([false, false]);
   const [overrideBpm, setOverrideBpm] = useState([null, null]);
@@ -33,30 +35,19 @@ export default function DualMixer() {
   const [audioStats, setAudioStats] = useState({ file_count: 0, total_size_formatted: '0 MB' });
   const [processingLogs, setProcessingLogs] = useState([]);
   const logsEndRef = useRef(null);
+  const currentProcessingSlotRef = useRef(0); // Which slot handleProcessAllChanges is currently on
 
-  // Web Audio API for waveform visualization and beat offset
+  // Web Audio API: only Song 2 is routed through this, for the beat-offset delay
   const audioContextRef = useRef(null);
-  const analyserRef = useRef(null);
   const audioSourcesRef = useRef({});
   const delayNodeRef = useRef(null); // For Song 2 beat offset
+  const beatSnapTimeoutRef = useRef(null); // Debounce for magnetic snap visual feedback
   const [beatOffset, setBeatOffset] = useState(0); // 0-8 beats for Song 2
   const [beatOffsetDisplay, setBeatOffsetDisplay] = useState(0); // Fine-tuned display value
-  const [isSnappedTobeat, setIsSnappedToBeat] = useState(false); // Visual feedback for snap
+  const [isSnappedToBeat, setIsSnappedToBeat] = useState(false); // Visual feedback for snap
   const [kickWaveforms, setKickWaveforms] = useState(null); // Kick drum waveforms for display
   const [selectedStemsForWaveform, setSelectedStemsForWaveform] = useState(['kick']); // Which stems to display in waveform
   const [waveformZoom, setWaveformZoom] = useState(10); // Waveform zoom level in seconds
-
-  // Stem names now include split drums (drums → kick, snare, hihat, tom)
-  const stemNames = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other'];
-  const stemLabels = {
-    vocals: '🎤 Vocals',
-    kick: '🔊 Kick',
-    snare: '🥁 Snare',
-    hihat: '⚡ Hi-Hat',
-    tom: '🔔 Tom',
-    bass: '🎸 Bass',
-    other: '🎹 Other'
-  };
 
   // Audio refs for each song's stems (with split drums)
   const audioRefsRef = useRef({
@@ -74,7 +65,7 @@ export default function DualMixer() {
   const [crossfader, setCrossfader] = useState(50);
 
   // Fetch audio stats
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
       const response = await fetch('/api/audio-stats');
       const data = await response.json();
@@ -82,12 +73,12 @@ export default function DualMixer() {
     } catch (err) {
       console.error('Stats fetch error:', err);
     }
-  };
+  }, []);
 
   // Fetch stats on component mount
   React.useEffect(() => {
     fetchStats();
-  }, []);
+  }, [fetchStats]);
 
   // Magnetic snap behavior for beat offset
   React.useEffect(() => {
@@ -173,22 +164,27 @@ export default function DualMixer() {
   };
 
   // Handle stem upload for a song slot
-  const handleStemsLoaded = async (file, slot) => {
-    const newLoading = [...loading];
-    newLoading[slot] = true;
-    setLoading(newLoading);
+  const handleStemsLoaded = useCallback(async (file, slot) => {
+    setLoading(prev => {
+      const updated = [...prev];
+      updated[slot] = true;
+      return updated;
+    });
     setError('');
 
     // Show filename immediately while processing
-    const newMetadata = [...metadata];
-    newMetadata[slot] = { filename: file.name };
-    setMetadata(newMetadata);
+    setMetadata(prev => {
+      const updated = [...prev];
+      updated[slot] = { filename: file.name };
+      return updated;
+    });
 
     console.log(`📥 Song ${slot + 1} upload started`);
 
     try {
       const formData = new FormData();
       formData.append('file', file);
+      formData.append('slot', slot);
 
       console.log(`🔄 Uploading Song ${slot + 1} for stem separation...`);
       const response = await fetch('/api/separate-stems', {
@@ -238,11 +234,31 @@ export default function DualMixer() {
         return updated;
       });
     }
-  };
+  }, [fetchStats]);
 
   // Play/pause both songs
-  const togglePlayback = () => {
+  // Resolves once an element has enough buffered data to play through
+  // smoothly (HAVE_FUTURE_DATA), or after a timeout so one slow-loading stem
+  // can't block the rest from ever starting.
+  const waitUntilReady = (audioEl) => new Promise(resolve => {
+    if (audioEl.readyState >= 3) { resolve(); return; }
+    const cleanup = () => {
+      audioEl.removeEventListener('canplay', onReady);
+      clearTimeout(timer);
+    };
+    const onReady = () => { cleanup(); resolve(); };
+    audioEl.addEventListener('canplay', onReady, { once: true });
+    const timer = setTimeout(() => { cleanup(); resolve(); }, 3000);
+  });
+
+  const togglePlayback = async () => {
     if (playing) {
+      // Set this BEFORE pausing -- each .pause() call below fires a native
+      // 'pause' event synchronously, and the auto-recovery handler on each
+      // <audio> element checks this ref to tell an intentional pause apart
+      // from a stem stalling out on its own.
+      playingRef.current = false;
+
       // Pause and maintain position for resume
       [0, 1].forEach(slot => {
         stemNames.forEach(stem => {
@@ -254,34 +270,61 @@ export default function DualMixer() {
       });
       setPlaying(false);
     } else {
-      // Play all loaded stems
-      const crossfadePercent = crossfader / 100;
-      const song1Volume = 1 - crossfadePercent; // 1 at 0%, 0 at 100%
-      const song2Volume = crossfadePercent; // 0 at 0%, 1 at 100%
+      playingRef.current = true;
+      setPlaying(true); // Optimistic -- flips the button to PAUSE immediately, the wait below is normally sub-frame
 
+      // Web Audio is only needed for Song 2 (the beat-offset delay node) --
+      // create/resume it here, inside the click handler, so it always runs
+      // in the same user-gesture call stack instead of racing a separate
+      // "first click anywhere" listener.
+      const audioContext = initAudioContext();
+      if (audioContext?.state === 'suspended') {
+        audioContext.resume();
+      }
+      connectSong2Sources();
+
+      // Wait for every stem to be sufficiently buffered before playing ANY of
+      // them -- otherwise whichever stems happen to be less-buffered at this
+      // exact instant start audibly later than the rest instead of together.
+      const elementsToPlay = [];
       [0, 1].forEach(slot => {
-        let loadedCount = 0;
         stemNames.forEach(stem => {
           const audioEl = audioRefsRef.current[slot][stem]?.current;
           if (audioEl && audioEl.src) {
-            // Apply crossfader
-            const masterVol = slot === 0 ? song1Volume : song2Volume;
-            const stemVol = volumes[slot]?.[stem] ?? 1.0;
-            audioEl.volume = masterVol * stemVol;
-            audioEl.play().catch(e => console.error(`Play error (Song ${slot + 1} ${stem}):`, e));
-            loadedCount++;
+            elementsToPlay.push({ slot, stem, audioEl });
           } else {
             console.warn(`⚠️ Song ${slot + 1} ${stem}: no src or element missing`);
           }
         });
-        console.log(`▶️ Playing Song ${slot + 1}: ${loadedCount}/${stemNames.length} stems loaded`);
       });
-      setPlaying(true);
+      await Promise.all(elementsToPlay.map(({ audioEl }) => waitUntilReady(audioEl)));
+
+      // Play all loaded stems
+      const crossfadePercent = crossfader / 100;
+      const song1Volume = 1 - crossfadePercent; // 1 at 0%, 0 at 100%
+      const song2Volume = crossfadePercent; // 0 at 0%, 1 at 100%
+      const loadedCount = { 0: 0, 1: 0 };
+
+      elementsToPlay.forEach(({ slot, stem, audioEl }) => {
+        const masterVol = slot === 0 ? song1Volume : song2Volume;
+        const stemVol = volumes[slot]?.[stem] ?? 1.0;
+        audioEl.volume = masterVol * stemVol;
+        audioEl.playbackRate = 1.0; // Clear any leftover drift-correction nudge from a previous session
+        // AbortError here just means pause() was called before this play()
+        // promise settled -- expected whenever the user pauses quickly, not
+        // a real failure.
+        audioEl.play().catch(e => {
+          if (e.name !== 'AbortError') console.error(`Play error (Song ${slot + 1} ${stem}):`, e);
+        });
+        loadedCount[slot]++;
+      });
+      console.log(`▶️ Playing Song 1: ${loadedCount[0]}/${stemNames.length} stems loaded`);
+      console.log(`▶️ Playing Song 2: ${loadedCount[1]}/${stemNames.length} stems loaded`);
     }
   };
 
   // Update volume
-  const handleVolumeChange = (slot, stem, value) => {
+  const handleVolumeChange = useCallback((slot, stem, value) => {
     setVolumes(prev => ({
       ...prev,
       [slot]: { ...prev[slot], [stem]: value }
@@ -292,7 +335,7 @@ export default function DualMixer() {
       const masterVol = slot === 0 ? (1 - crossfadePercent) : crossfadePercent;
       audioRefsRef.current[slot][stem].current.volume = masterVol * value;
     }
-  };
+  }, [playing, crossfader]);
 
   // Update crossfader
   const handleCrossfaderChange = (value) => {
@@ -358,113 +401,108 @@ export default function DualMixer() {
             stemNames.forEach(stem => {
               if (audioRefsRef.current[slot][stem]?.current) {
                 audioRefsRef.current[slot][stem].current.currentTime = 0;
+                audioRefsRef.current[slot][stem].current.playbackRate = 1.0;
                 audioRefsRef.current[slot][stem].current.play().catch(() => {});
               }
             });
           });
         }
       }
-    }, 100);
+    }, 250);
 
     return () => clearInterval(interval);
   }, [playing]);
 
-  // Initialize audio context and analyser (run once on mount)
+  // Keep each song's 7 stems phase-locked to each other in real time. A stem
+  // can hit a network 'waiting' stall the others don't, and once that
+  // happens its currentTime permanently lags behind -- nothing used to pull
+  // it back until the next full loop reset. This runs independently of
+  // React state (straight DOM reads/writes on the audio refs) so it can
+  // tick fast without triggering re-renders.
   useEffect(() => {
-    const initAudioContext = () => {
+    if (!playing) return;
+
+    const HARD_SNAP_THRESHOLD = 0.1;  // seconds of drift -- audible, snap immediately
+    const NUDGE_THRESHOLD = 0.03;     // seconds of drift -- correct gently instead
+    const NUDGE_RATE = 0.05;          // +/-5% playback speed while nudging
+
+    const syncSlot = (slot) => {
+      const activeEls = stemNames
+        .map(stem => audioRefsRef.current[slot]?.[stem]?.current)
+        .filter(el => el && el.src && !el.paused && !el.seeking);
+
+      if (activeEls.length < 2) return;
+
+      // Nothing can get ahead of real time -- only fall behind via a stall --
+      // so the furthest-progressed stem is the one to trust, whichever it is.
+      const referenceTime = Math.max(...activeEls.map(el => el.currentTime));
+
+      activeEls.forEach(el => {
+        const drift = referenceTime - el.currentTime; // >= 0
+        if (drift > HARD_SNAP_THRESHOLD) {
+          el.currentTime = referenceTime;
+          el.playbackRate = 1.0;
+        } else if (drift > NUDGE_THRESHOLD) {
+          el.playbackRate = 1 + NUDGE_RATE;
+        } else if (el.playbackRate !== 1.0) {
+          el.playbackRate = 1.0;
+        }
+      });
+    };
+
+    const syncInterval = setInterval(() => {
+      syncSlot(0);
+      syncSlot(1);
+    }, 100);
+
+    return () => clearInterval(syncInterval);
+  }, [playing]);
+
+  // Create (or reuse) the shared AudioContext + Song 2 delay node. Idempotent,
+  // and safe to call from inside a click handler -- creating/resuming an
+  // AudioContext must happen within a user-gesture call stack, so this is
+  // called directly from togglePlayback() rather than a mount-time effect
+  // racing against whenever `stems` last changed.
+  const initAudioContext = () => {
+    if (!audioContextRef.current) {
       try {
-        if (audioContextRef.current) return; // Already initialized
-
-        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-        console.log('🎵 Audio context created:', audioContextRef.current.state);
-
-        analyserRef.current = audioContextRef.current.createAnalyser();
-        analyserRef.current.fftSize = 512;
-        analyserRef.current.smoothingTimeConstant = 0.8;
-
-        // Create and connect gain node
-        const gainNode = audioContextRef.current.createGain();
-        gainNode.gain.value = 1.0;
-        analyserRef.current.connect(gainNode);
-        gainNode.connect(audioContextRef.current.destination);
-
-        console.log('🎵 Analyser initialized');
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        audioContextRef.current = ctx;
+        delayNodeRef.current = ctx.createDelay(8); // Max 8 seconds
+        delayNodeRef.current.connect(ctx.destination);
+        console.log('🎵 Audio context created:', ctx.state);
       } catch (e) {
         console.error('Audio context init failed:', e);
       }
-    };
-
-    // Initialize on first user interaction
-    const handleUserInteraction = () => {
-      initAudioContext();
-      document.removeEventListener('click', handleUserInteraction);
-      document.removeEventListener('keypress', handleUserInteraction);
-    };
-
-    document.addEventListener('click', handleUserInteraction);
-    document.addEventListener('keypress', handleUserInteraction);
-
-    return () => {
-      document.removeEventListener('click', handleUserInteraction);
-      document.removeEventListener('keypress', handleUserInteraction);
-    };
-  }, []);
-
-  // Connect audio elements to analyser when they're available
-  useEffect(() => {
-    if (!audioContextRef.current || !analyserRef.current) return;
-
-    const audioContext = audioContextRef.current;
-
-    // Create delay node for Song 2 beat offset
-    if (!delayNodeRef.current) {
-      delayNodeRef.current = audioContext.createDelay(8); // Max 8 seconds
-      delayNodeRef.current.connect(audioContext.destination);
     }
+    return audioContextRef.current;
+  };
 
-    const connectSources = () => {
-      let connected = false;
+  // Route Song 2's stems through the delay node so the beat-offset slider can
+  // shift them in time. Song 1 plays natively (see togglePlayback) -- it
+  // never needs Web Audio, so only 7 of the 14 stem elements are ever
+  // captured into the graph, halving the surface area for a stray
+  // createMediaElementSource/connect() failure to silence a stem.
+  const connectSong2Sources = () => {
+    const audioContext = audioContextRef.current;
+    if (!audioContext || !delayNodeRef.current) return;
 
-      for (let slot = 0; slot < 2; slot++) {
-        for (let stem of stemNames) {
-          const audioEl = audioRefsRef.current[slot]?.[stem]?.current;
-          const key = `${slot}-${stem}`;
+    for (let stem of stemNames) {
+      const audioEl = audioRefsRef.current[1]?.[stem]?.current;
+      const key = `1-${stem}`;
 
-          if (audioEl?.src && !audioSourcesRef.current[key]) {
-            try {
-              if (audioContext.state === 'suspended') {
-                audioContext.resume();
-              }
-
-              const source = audioContext.createMediaElementAudioSource(audioEl);
-
-              // Route Song 2 through delay node, Song 1 directly to destination
-              if (slot === 1) {
-                // Song 2: route through delay → destination
-                source.connect(delayNodeRef.current);
-                source.connect(analyserRef.current);
-              } else {
-                // Song 1: route directly to destination
-                source.connect(analyserRef.current);
-                source.connect(audioContext.destination);
-              }
-
-              audioSourcesRef.current[key] = source;
-              connected = true;
-            } catch (e) {
-              // Source already connected or other error
-            }
-          }
+      if (audioEl?.src && !audioSourcesRef.current[key]) {
+        try {
+          const source = audioContext.createMediaElementSource(audioEl);
+          source.connect(delayNodeRef.current);
+          audioSourcesRef.current[key] = source;
+          console.log(`🎵 Song 2 ${stem} connected to beat-offset delay`);
+        } catch (e) {
+          console.error(`Could not connect Song 2 ${stem} to the beat-offset graph:`, e);
         }
       }
-
-      if (connected) {
-        console.log('🎵 Audio sources connected (Song 2 routed through delay for beat offset)');
-      }
-    };
-
-    connectSources();
-  }, [stems]);
+    }
+  };
 
   // Update beat offset delay in real-time
   useEffect(() => {
@@ -499,11 +537,8 @@ export default function DualMixer() {
 
     const loadStemWaveforms = async () => {
       try {
-        if (!audioContextRef.current) {
-          audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
-        }
-
-        const context = audioContextRef.current;
+        const context = initAudioContext();
+        if (!context) return;
         const waveformData = { stems: {}, duration: 0 };
 
         // Load waveforms for selected stems, both songs
@@ -606,17 +641,29 @@ export default function DualMixer() {
     return diff;
   };
 
-  const handleBpmOverride = (slot, value) => {
-    const newOverride = [...overrideBpm];
-    newOverride[slot] = value ? parseFloat(value) : null;
-    setOverrideBpm(newOverride);
-  };
+  const handleBpmOverride = useCallback((slot, value) => {
+    setOverrideBpm(prev => {
+      const updated = [...prev];
+      updated[slot] = value ? parseFloat(value) : null;
+      return updated;
+    });
+  }, []);
 
-  const handleKeyOverride = (slot, value) => {
-    const newOverride = [...overrideKey];
-    newOverride[slot] = value || null;
-    setOverrideKey(newOverride);
-  };
+  const handleKeyOverride = useCallback((slot, value) => {
+    setOverrideKey(prev => {
+      const updated = [...prev];
+      updated[slot] = value || null;
+      return updated;
+    });
+  }, []);
+
+  const toggleEditingBpm = useCallback((slot, editing) => {
+    setEditingBpm(prev => { const updated = [...prev]; updated[slot] = editing; return updated; });
+  }, []);
+
+  const toggleEditingKey = useCallback((slot, editing) => {
+    setEditingKey(prev => { const updated = [...prev]; updated[slot] = editing; return updated; });
+  }, []);
 
   // Combined processing for beatmatch + transpose
   const processStems = async (slot, newTargetBpm, newTargetKey) => {
@@ -648,16 +695,15 @@ export default function DualMixer() {
       return n;
     });
 
-    // Start polling for status updates
+    // Start polling for status updates (per-slot, so it can't be clobbered
+    // by the other song processing at the same time)
     const statusPoller = setInterval(async () => {
       try {
         const statusRes = await fetch('/api/process-status');
         const status = await statusRes.json();
-        // DISABLED: Global /api/process-status causes race conditions with dual slots
-        // if (status.slot === slot && status.status) { ... }
-        // Just show processing state, rely on API response for final status
-        if (status.slot !== undefined) {
-          console.log(`⏳ API processing slot ${status.slot}: ${status.status}`);
+        const slotState = status.slots?.[slot];
+        if (slotState) {
+          console.log(`⏳ Song ${slot + 1} processing: ${slotState.current_step} (${slotState.progress}%)`);
         }
       } catch (err) {
         // Silently ignore polling errors
@@ -780,13 +826,23 @@ export default function DualMixer() {
     setIsProcessing(true);
     setProcessingProgress(0);
 
-    // Real progress tracking from API
+    // Songs are processed one at a time below, and the backend tracks each
+    // one's 0-100% independently -- so map that onto one continuous bar
+    // spanning all songs being processed (0-50/50-100 for two, 0-100 for
+    // one) instead of restarting at 0% for every song.
+    const slotsToProcess = [0, 1].filter(slot => stems[slot]);
+    const totalSlots = slotsToProcess.length || 1;
+    let completedSlots = 0;
+    currentProcessingSlotRef.current = slotsToProcess[0] ?? 0;
+
     const progressInterval = setInterval(async () => {
       try {
         const res = await fetch('/api/process-status');
         const data = await res.json();
-        if (data.progress) {
-          setProcessingProgress(data.progress);
+        const slotState = data.slots?.[currentProcessingSlotRef.current];
+        if (slotState?.progress != null) {
+          const combined = ((completedSlots * 100) + slotState.progress) / totalSlots;
+          setProcessingProgress(combined);
         }
       } catch (e) {
         // Silent - API might not have data yet
@@ -795,10 +851,10 @@ export default function DualMixer() {
 
     try {
       // Process all loaded songs with both BPM and Key
-      for (let slot = 0; slot < 2; slot++) {
-        if (stems[slot]) {
-          await processStems(slot, targetBpm, targetKey);
-        }
+      for (const slot of slotsToProcess) {
+        currentProcessingSlotRef.current = slot;
+        await processStems(slot, targetBpm, targetKey);
+        completedSlots++;
       }
       // Complete progress
       setProcessingProgress(100);
@@ -827,6 +883,33 @@ export default function DualMixer() {
     }
   };
 
+  // Shared download handler for the stems/mix export buttons -- tracks which
+  // one is in flight (so all three can be disabled while it runs) and surfaces
+  // backend errors instead of silently doing nothing.
+  const [downloadingKey, setDownloadingKey] = useState(null); // 'original' | 'processed' | 'final' | null
+
+  const handleDownload = async (key, endpoint, body) => {
+    setDownloadingKey(key);
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (res.ok && data.file) {
+        window.location.href = data.file;
+      } else {
+        throw new Error(data.error || `Server error: ${res.status}`);
+      }
+    } catch (err) {
+      console.error(`Download error (${key}):`, err);
+      alert(`❌ Download failed: ${err.message}`);
+    } finally {
+      setDownloadingKey(null);
+    }
+  };
+
   // Cleanup all audio files
   const handleCleanup = async () => {
     if (!confirm('🗑️ Delete all generated audio files? This cannot be undone.')) return;
@@ -841,6 +924,7 @@ export default function DualMixer() {
         setStems([null, null]);
         setMetadata([null, null]);
         setLoading([false, false]);
+        playingRef.current = false;
         setPlaying(false);
         setCurrentTime(0);
         setDuration(0);
@@ -855,184 +939,15 @@ export default function DualMixer() {
     }
   };
 
-  // Render mixer for one song
-  const renderSongMixer = (slot) => {
-    const songName = metadata[slot]?.filename?.replace(/\.[^/.]+$/, '') || `Song ${slot + 1}`;
-
-    return (
-    <div className="song-mixer">
-      <h3>{songName}</h3>
-
-      {metadata[slot] && (
-        <div className="metadata">
-          <p><strong>{metadata[slot].filename}</strong></p>
-          {stems[slot] && (
-          <div style={{ marginTop: '10px', display: 'flex', gap: '20px', fontSize: '13px' }}>
-            {/* BPM Override */}
-            <div style={{ flex: 1 }}>
-              <label style={{ color: '#999', fontSize: '11px' }}>BPM</label>
-              {editingBpm[slot] ? (
-                <div style={{ display: 'flex', gap: '5px', marginTop: '5px' }}>
-                  <input
-                    type="number"
-                    value={overrideBpm[slot] !== null ? overrideBpm[slot] : metadata[slot].bpm}
-                    onChange={(e) => handleBpmOverride(slot, e.target.value)}
-                    style={{
-                      flex: 1,
-                      background: 'rgba(99, 102, 241, 0.2)',
-                      border: '1px solid #6366f1',
-                      color: '#fff',
-                      padding: '4px 8px',
-                      borderRadius: '4px',
-                      fontSize: '12px'
-                    }}
-                  />
-                  <button
-                    onClick={() => setEditingBpm(prev => { const n = [...prev]; n[slot] = false; return n; })}
-                    style={{
-                      background: '#6366f1',
-                      color: '#fff',
-                      border: 'none',
-                      padding: '4px 8px',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      fontSize: '11px'
-                    }}
-                  >
-                    ✓
-                  </button>
-                </div>
-              ) : (
-                <div style={{ display: 'flex', gap: '5px', marginTop: '5px', alignItems: 'center' }}>
-                  <span style={{ color: overrideBpm[slot] !== null ? '#8b5cf6' : '#ccc' }}>
-                    {getEffectiveBpm(slot)} {overrideBpm[slot] !== null ? '(custom)' : '(detected)'}
-                  </span>
-                  <button
-                    onClick={() => setEditingBpm(prev => { const n = [...prev]; n[slot] = true; return n; })}
-                    style={{
-                      background: 'transparent',
-                      color: '#6366f1',
-                      border: '1px solid #6366f1',
-                      padding: '2px 6px',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      fontSize: '10px'
-                    }}
-                  >
-                    ✎
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Key Override */}
-            <div style={{ flex: 1 }}>
-              <label style={{ color: '#999', fontSize: '11px' }}>KEY</label>
-              {editingKey[slot] ? (
-                <div style={{ display: 'flex', gap: '5px', marginTop: '5px' }}>
-                  <select
-                    value={overrideKey[slot] !== null ? overrideKey[slot] : metadata[slot].key}
-                    onChange={(e) => handleKeyOverride(slot, e.target.value)}
-                    style={{
-                      flex: 1,
-                      background: 'rgba(99, 102, 241, 0.2)',
-                      border: '1px solid #6366f1',
-                      color: '#fff',
-                      padding: '4px 8px',
-                      borderRadius: '4px',
-                      fontSize: '12px'
-                    }}
-                  >
-                    <option value="">Clear override</option>
-                    {KEYS.map(k => <option key={k} value={k}>{k}</option>)}
-                  </select>
-                  <button
-                    onClick={() => setEditingKey(prev => { const n = [...prev]; n[slot] = false; return n; })}
-                    style={{
-                      background: '#6366f1',
-                      color: '#fff',
-                      border: 'none',
-                      padding: '4px 8px',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      fontSize: '11px'
-                    }}
-                  >
-                    ✓
-                  </button>
-                </div>
-              ) : (
-                <div style={{ display: 'flex', gap: '5px', marginTop: '5px', alignItems: 'center' }}>
-                  <span style={{ color: overrideKey[slot] !== null ? '#8b5cf6' : '#ccc' }}>
-                    {getEffectiveKey(slot)} {overrideKey[slot] !== null ? '(custom)' : '(detected)'}
-                  </span>
-                  <button
-                    onClick={() => setEditingKey(prev => { const n = [...prev]; n[slot] = true; return n; })}
-                    style={{
-                      background: 'transparent',
-                      color: '#6366f1',
-                      border: '1px solid #6366f1',
-                      padding: '2px 6px',
-                      borderRadius: '4px',
-                      cursor: 'pointer',
-                      fontSize: '10px'
-                    }}
-                  >
-                    ✎
-                  </button>
-                </div>
-              )}
-            </div>
-          </div>
-          )}
-        </div>
-      )}
-
-      {!stems[slot] ? (
-        <>
-          <StemLoader
-            onStemsLoaded={(file) => handleStemsLoaded(file, slot)}
-            loading={loading[slot]}
-          />
-        </>
-      ) : (
-        <div className="stem-controls">
-          <h4>🎚️ Volumes</h4>
-          {stemNames.map(stem => (
-            <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <label style={{ minWidth: '80px' }}>{stemLabels[stem]}</label>
-              <input
-                type="range"
-                min="0"
-                max="1"
-                step="0.01"
-                value={volumes[slot]?.[stem] ?? 1.0}
-                onChange={(e) => handleVolumeChange(slot, stem, parseFloat(e.target.value))}
-                className="slider"
-                style={{ flex: 1 }}
-              />
-              <span className="volume-value" style={{ minWidth: '40px', textAlign: 'right' }}>
-                {Math.round((volumes[slot]?.[stem] ?? 1.0) * 100)}%
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* Hidden audio elements */}
-      <div style={{ display: 'none' }}>
-        {stemNames.map(stem => (
-          <audio
-            key={stem}
-            ref={audioRefsRef.current[slot][stem]}
-            crossOrigin="anonymous"
-            onError={(e) => console.error(`Song ${slot + 1} ${stem} error:`, e)}
-          />
-        ))}
-      </div>
-    </div>
+  // Diagnostic logging for stem dropouts -- 'waiting' (buffer underrun) and
+  // 'stalled' (network not delivering data) fire with no error and no visual
+  // change, so without this a stem going silent mid-playback leaves no trace.
+  const logStemEvent = useCallback((slot, stem, eventName, target) => {
+    console.warn(
+      `🩺 [${new Date().toISOString().slice(11, 23)}] Song ${slot + 1} ${stem}: ${eventName}`,
+      { currentTime: target.currentTime.toFixed(2), readyState: target.readyState, networkState: target.networkState, paused: target.paused }
     );
-  };
+  }, []);
 
   return (
     <div className="dual-mixer">
@@ -1045,8 +960,31 @@ export default function DualMixer() {
       <div className="mixer-container">
         {/* Two song mixers side by side */}
         <div className="songs-row">
-          {renderSongMixer(0)}
-          {renderSongMixer(1)}
+          {[0, 1].map(slot => (
+            <SongMixer
+              key={slot}
+              slot={slot}
+              metadata={metadata[slot]}
+              hasStems={!!stems[slot]}
+              loading={loading[slot]}
+              editingBpm={editingBpm[slot]}
+              editingKey={editingKey[slot]}
+              overrideBpm={overrideBpm[slot]}
+              overrideKey={overrideKey[slot]}
+              effectiveBpm={getEffectiveBpm(slot)}
+              effectiveKey={getEffectiveKey(slot)}
+              volumes={volumes[slot]}
+              audioRefs={audioRefsRef.current[slot]}
+              playingRef={playingRef}
+              logStemEvent={logStemEvent}
+              onBpmOverride={handleBpmOverride}
+              onKeyOverride={handleKeyOverride}
+              onToggleEditingBpm={toggleEditingBpm}
+              onToggleEditingKey={toggleEditingKey}
+              onStemsLoaded={handleStemsLoaded}
+              onVolumeChange={handleVolumeChange}
+            />
+          ))}
         </div>
 
         {/* Waveform Stem Selector - Center Section */}
@@ -1153,6 +1091,8 @@ export default function DualMixer() {
                 currentTime={currentTime}
                 beatOffset={beatOffset}
                 song2Bpm={metadata[1]?.bpm ? parseFloat(String(metadata[1].bpm).split('-')[0]) : 120}
+                song1Bpm={metadata[0]?.bpm ? parseFloat(String(metadata[0].bpm).split('-')[0]) : 120}
+                song1BeatAnchor={metadata[0]?.beat_anchor ?? 0}
                 zoomLevel={waveformZoom}
                 onZoomChange={setWaveformZoom}
               />
@@ -1203,22 +1143,6 @@ export default function DualMixer() {
                     cursor: (!stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
                   }}
                 />
-                {/* Beat marks container */}
-                <div style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  padding: '0 2px',
-                  pointerEvents: 'none',
-                  marginTop: '4px',
-                  fontSize: '11px',
-                  color: '#666'
-                }}>
-                  {[0, 1, 2, 3, 4, 5, 6, 7, 8].map(beat => (
-                    <span key={beat} style={{ textAlign: 'center', flex: 1 }}>
-                      {beat}
-                    </span>
-                  ))}
-                </div>
               </div>
               <div className="crossfader-value">
                 {isSnappedToBeat ? (
@@ -1393,7 +1317,7 @@ export default function DualMixer() {
                   {[0, 1].map(slot => {
                     if (!stems[slot] || !beatmatchStatus[slot]) return null;
                     const status = beatmatchStatus[slot];
-                    const statusEmoji = status === 'beatmatching' ? '⏳' : status === 'done' ? '✅' : '❌';
+                    const statusEmoji = status === 'processing' ? '⏳' : status === 'done' ? '✅' : '❌';
                     const sourceBpm = getEffectiveBpm(slot);
                     const sourceKey = getEffectiveKey(slot);
                     const targetBpmForSlot = targetBpm || (slot === 1 ? getEffectiveBpm(0) : null);
@@ -1403,7 +1327,7 @@ export default function DualMixer() {
                       <div key={slot} style={{ color: '#aaa' }}>
                         <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong>
                         <br />
-                        {sourceBpm} → {targetBpmForSlot} BPM {sourceKey && targetKeyForSlot && `| ${sourceKey} → ${targetKeyForSlot}`} <span style={{ marginLeft: '8px' }}>{statusEmoji} {status === 'beatmatching' ? 'Beatmatching...' : status === 'done' ? 'Ready' : 'Failed'}</span>
+                        {sourceBpm} → {targetBpmForSlot} BPM {sourceKey && targetKeyForSlot && `| ${sourceKey} → ${targetKeyForSlot}`} <span style={{ marginLeft: '8px' }}>{statusEmoji} {status === 'processing' ? 'Processing...' : status === 'done' ? 'Ready' : 'Failed'}</span>
                       </div>
                     );
                   })}
@@ -1481,7 +1405,7 @@ export default function DualMixer() {
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
               {/* Download Original Stems */}
               <button
-                onClick={async () => {
+                onClick={() => {
                   const timestamps = metadata.map(m => m?.timestamp).filter(Boolean);
                   if (!timestamps.length) {
                     alert('No stems to download');
@@ -1493,39 +1417,33 @@ export default function DualMixer() {
                     key: m.key
                   } : null);
 
-                  const res = await fetch('/api/download-stems-zip', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      timestamps,
-                      metadata: metadataList,
-                      include_original: true,
-                      include_processed: false
-                    })
+                  handleDownload('original', '/api/download-stems-zip', {
+                    timestamps,
+                    metadata: metadataList,
+                    include_original: true,
+                    include_processed: false
                   });
-                  const data = await res.json();
-                  if (data.file) {
-                    window.location.href = data.file;
-                  }
                 }}
+                disabled={downloadingKey !== null}
                 style={{
                   background: 'rgba(99, 102, 241, 0.2)',
                   color: '#a78bfa',
                   border: '1px solid #6366f1',
                   padding: '10px 16px',
                   borderRadius: '6px',
-                  cursor: 'pointer',
+                  cursor: downloadingKey !== null ? 'not-allowed' : 'pointer',
+                  opacity: downloadingKey !== null ? 0.5 : 1,
                   fontSize: '12px',
                   fontWeight: 'bold'
                 }}
               >
-                📦 Original Stems
+                {downloadingKey === 'original' ? '⏳ Preparing ZIP...' : '📦 Original Stems'}
               </button>
 
               {/* Download Processed Stems */}
               {(transposedStems[0] || transposedStems[1] || beatmatchedStems[0] || beatmatchedStems[1]) && (
                 <button
-                  onClick={async () => {
+                  onClick={() => {
                     const timestamps = metadata.map(m => m?.timestamp).filter(Boolean);
                     if (!timestamps.length) {
                       alert('No stems to download');
@@ -1537,39 +1455,33 @@ export default function DualMixer() {
                       key: targetKey || m.key
                     } : null);
 
-                    const res = await fetch('/api/download-stems-zip', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        timestamps,
-                        metadata: metadataList,
-                        include_original: false,
-                        include_processed: true
-                      })
+                    handleDownload('processed', '/api/download-stems-zip', {
+                      timestamps,
+                      metadata: metadataList,
+                      include_original: false,
+                      include_processed: true
                     });
-                    const data = await res.json();
-                    if (data.file) {
-                      window.location.href = data.file;
-                    }
                   }}
+                  disabled={downloadingKey !== null}
                   style={{
                     background: 'rgba(139, 92, 246, 0.2)',
                     color: '#c4b5fd',
                     border: '1px solid #8b5cf6',
                     padding: '10px 16px',
                     borderRadius: '6px',
-                    cursor: 'pointer',
+                    cursor: downloadingKey !== null ? 'not-allowed' : 'pointer',
+                    opacity: downloadingKey !== null ? 0.5 : 1,
                     fontSize: '12px',
                     fontWeight: 'bold'
                   }}
                 >
-                  📦 Processed Stems
+                  {downloadingKey === 'processed' ? '⏳ Preparing ZIP...' : '📦 Processed Stems'}
                 </button>
               )}
 
               {/* Download Final Mix */}
               <button
-                onClick={async () => {
+                onClick={() => {
                   const timestamps = metadata.map(m => m?.timestamp).filter(Boolean);
                   if (!timestamps.length) {
                     alert('No stems to mix');
@@ -1581,37 +1493,29 @@ export default function DualMixer() {
                     key: targetKey || m.key
                   } : null);
 
-                  const res = await fetch('/api/render-final-mix', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      timestamps,
-                      metadata: metadataList,
-                      volumes,
-                      crossfader,
-                      beat_offsets: [0, beatOffset],
-                      target_bpm: targetBpm
-                    })
+                  handleDownload('final', '/api/render-final-mix', {
+                    timestamps,
+                    metadata: metadataList,
+                    volumes,
+                    crossfader,
+                    beat_offsets: [0, beatOffset],
+                    target_bpm: targetBpm
                   });
-                  const data = await res.json();
-                  if (data.file) {
-                    window.location.href = data.file;
-                  } else {
-                    alert('Render failed: ' + data.error);
-                  }
                 }}
+                disabled={downloadingKey !== null}
                 style={{
                   background: 'rgba(34, 197, 94, 0.2)',
                   color: '#86efac',
                   border: '1px solid #22c55e',
                   padding: '10px 16px',
                   borderRadius: '6px',
-                  cursor: 'pointer',
+                  cursor: downloadingKey !== null ? 'not-allowed' : 'pointer',
+                  opacity: downloadingKey !== null ? 0.5 : 1,
                   fontSize: '12px',
                   fontWeight: 'bold'
                 }}
               >
-                🎵 Final Mix (FLAC)
+                {downloadingKey === 'final' ? '⏳ Rendering...' : '🎵 Final Mix (FLAC)'}
               </button>
             </div>
             <p style={{ margin: '12px 0 0 0', color: '#999', fontSize: '12px' }}>
