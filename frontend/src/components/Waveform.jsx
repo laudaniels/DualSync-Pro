@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
 
-export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
+export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, zoomLevel = 10, onZoomChange }) {
   const canvasRef = useRef(null);
   const [loading, setLoading] = useState(true);
-  const ZOOM_WINDOW = 10; // 10 seconds visible at a time
+  const ZOOM_WINDOW = zoomLevel; // Dynamic zoom level
 
   // Colors for each stem
   const stemColors = {
@@ -180,9 +180,36 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
           display: 'block'
         }}
       />
+
+      {/* Zoom Slider */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: '12px',
+        marginTop: '10px',
+        padding: '10px',
+        background: 'rgba(99, 102, 241, 0.05)',
+        borderRadius: '6px',
+        border: '1px solid rgba(99, 102, 241, 0.15)'
+      }}>
+        <label style={{ fontSize: '12px', color: '#999', minWidth: '50px' }}>🔍 Zoom:</label>
+        <input
+          type="range"
+          min="3"
+          max="30"
+          step="1"
+          value={zoomLevel}
+          onChange={(e) => onZoomChange(parseInt(e.target.value))}
+          style={{ flex: 1, cursor: 'pointer' }}
+        />
+        <span style={{ fontSize: '12px', color: '#aaa', minWidth: '50px', textAlign: 'right' }}>
+          {zoomLevel}s
+        </span>
+      </div>
+
       {loading && (
         <div style={{ fontSize: '11px', color: '#666', marginTop: '5px', textAlign: 'center' }}>
-          🎯 Selected stem waveforms (10s zoom window)
+          🎯 Selected stem waveforms ({zoomLevel}s zoom window)
         </div>
       )}
     </div>
