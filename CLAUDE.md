@@ -9,7 +9,7 @@ The web interface is the primary application. The desktop version is no longer m
 
 ## Core Files
 
-- **`api.py`** — Flask backend API (active)
+- **`server.py`** — Flask backend API (active)
 - **`frontend/`** — React web interface (active)
 - **`mashup_engine.py`** — Core audio processing engine (shared)
 - **`archive/app_gui.py`** — Old Tkinter desktop app (frozen, archived)
@@ -17,14 +17,14 @@ The web interface is the primary application. The desktop version is no longer m
 ## Running the App
 
 ```bash
-python3 api.py
+python3 server.py
 ```
 
 Opens at `http://localhost:5000` (requires venv with dependencies installed).
 
 ## Architecture
 
-### `api.py`
+### `server.py`
 - Flask backend serving React frontend from `frontend/dist`
 - REST API endpoints for audio processing:
   - `/api/separate-stems` — stem separation

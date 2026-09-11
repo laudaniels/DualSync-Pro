@@ -182,7 +182,7 @@ DualSync-Pro/
 │   │   └── App.jsx
 │   ├── vite.config.js
 │   └── package.json
-├── api.py                        # Flask REST API endpoints
+├── server.py                        # Flask REST API endpoints
 ├── mashup_engine.py              # Audio processing core
 ├── requirements.txt              # Python dependencies
 └── Audio/                        # Generated stems/mixes (git-ignored)
@@ -273,7 +273,7 @@ ffmpeg -version
 
 ```bash
 source .venv/bin/activate    # or .venv\Scripts\activate on Windows
-python3 api.py
+python3 server.py
 ```
 
 Output:
@@ -320,7 +320,7 @@ cd ..
 ```
 
 **Restart both servers** (Stop with Ctrl+C and run again):
-- Flask: `python3 api.py`
+- Flask: `python3 server.py`
 - React: `npm run dev` (from `frontend/` directory)
 
 ---
@@ -345,7 +345,7 @@ ffmpeg -version
 If not found, install it (see System Dependencies above).
 
 ### Port Already in Use
-- **Flask (5000):** Edit `api.py`, change `port=5000` to another port
+- **Flask (5000):** Edit `server.py`, change `port=5000` to another port
 - **React (5173):** Vite uses first available port, or edit `frontend/vite.config.js`
 
 ### "Can't enter BPM" or Input Frozen
