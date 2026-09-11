@@ -24,13 +24,18 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
   - Real-time delay applied via Web Audio API during playback
   - Visual offset indicator on waveform display
   - Helps align 4/4 bar measures between songs with same BPM
-- **Kick Waveform Visualization** — visual beat alignment tool:
-  - Side-by-side kick drum waveforms (Song 1 blue, Song 2 green)
-  - 15-second zoom window around playhead for precise detail
+- **Multi-Stem Waveform Visualization** — advanced beat alignment tool:
+  - Select any combination of 7 stems to display (vocals, kick, snare, hi-hat, tom, bass, other)
+  - Color-coded waveforms for each stem (purple, indigo, pink, orange, green, blue, gray)
+  - Display both Song 1 and Song 2 simultaneously for each stem
+  - Stem selection checkboxes (paused-only to prevent accidental changes)
+  - Centered controls between song mixers for easy access
+  - Dynamic zoom slider (3-30 seconds) for variable detail levels
+  - Song 2 waveform shifts visually with beat offset for perfect alignment preview
   - Red playhead indicator showing current position
-  - Yellow offset line showing beat delay applied
-  - Beat grid overlay for tempo reference
+  - 10-second default zoom window for balanced detail and context
   - Visible during both playback and pause for precise alignment
+  - Real-time updates as you adjust beat offset and zoom level
 - **Auto-loop playback** — automatically restart at track end during playback
 - **Real-time processing logs** — unified log window shows all operations with auto-scroll to latest entry
 
@@ -112,19 +117,23 @@ The **"Process All Changes" button is enabled** only when BPM or Key has changed
 
 ### 4. Mix in Real-Time
 (Previously step 5) After processing:
-- **Beat Alignment:**
+- **Advanced Beat Alignment:**
   - Adjust beat offset slider (0-8 beats) to align Song 2's bar grid with Song 1
-  - See real-time kick waveforms with visual offset indicator
+  - Watch Song 2 waveform shift visually as you adjust offset (shows actual alignment)
+  - Select any of 7 stems to display in waveform (vocals, kick, snare, hi-hat, tom, bass, other)
+  - Zoom waveform dynamically (3-30 seconds) for detail level you need
+  - Compare both Song 1 and Song 2 waveforms side-by-side
+  - Color-coded stems for easy identification
   - Pause to inspect waveforms without playhead movement
   - Real-time delay applied during playback (Web Audio API)
 - **Volume Mixing:**
   - Adjust 7 stem volumes independently for Song 1 and Song 2
   - Use crossfader to blend between songs (0% Song 1 → 50% Both → 100% Song 2)
 - **Playback Control:**
-  - Play/Pause and scrub through timeline
+  - Play/Pause and scrub through timeline (resumes from paused position)
   - Auto-loop at track end
-  - Waveform shows kick drums in 15-second zoom window
-- **Listen:** Hear the beatmatched, transposed, beat-aligned mix in real-time
+  - Auto-scroll with 10-second default waveform window
+- **Listen:** Hear the beatmatched, transposed, beat-aligned mix in real-time with visual confirmation
 
 ### 5. Download
 Download your results:
