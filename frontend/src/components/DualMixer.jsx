@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import StemLoader from './StemLoader';
+import Waveform from './Waveform';
 import '../styles/DualMixer.css';
 
 export default function DualMixer() {
@@ -24,7 +25,7 @@ export default function DualMixer() {
   const [isTransposing, setIsTransposing] = useState(false);
   const [lastProcessedBpm, setLastProcessedBpm] = useState(null); // Track last processed BPM
   const [lastProcessedKey, setLastProcessedKey] = useState(null); // Track last processed Key
-  const isLocked = isProcessing || isTransposing; // Disable all controls during processing
+  const isLocked = isProcessing || isTransposing || playing; // Disable controls during processing or playback
   const bpmChanged = targetBpm !== lastProcessedBpm; // BPM changed since last process
   const keyChanged = targetKey !== lastProcessedKey; // Key changed since last process
   const [currentTime, setCurrentTime] = useState(0);
@@ -32,6 +33,14 @@ export default function DualMixer() {
   const [audioStats, setAudioStats] = useState({ file_count: 0, total_size_formatted: '0 MB' });
   const [processingLogs, setProcessingLogs] = useState([]);
   const logsEndRef = useRef(null);
+
+  // Web Audio API for waveform visualization and beat offset
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const audioSourcesRef = useRef({});
+  const delayNodeRef = useRef(null); // For Song 2 beat offset
+  const [beatOffset, setBeatOffset] = useState(0); // 0-8 beats for Song 2
+  const [kickWaveforms, setKickWaveforms] = useState(null); // Kick drum waveforms for display
 
   // Stem names now include split drums (drums → kick, snare, hihat, tom)
   const stemNames = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other'];
@@ -322,6 +331,182 @@ export default function DualMixer() {
 
     return () => clearInterval(interval);
   }, [playing]);
+
+  // Initialize audio context and analyser (run once on mount)
+  useEffect(() => {
+    const initAudioContext = () => {
+      try {
+        if (audioContextRef.current) return; // Already initialized
+
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        console.log('🎵 Audio context created:', audioContextRef.current.state);
+
+        analyserRef.current = audioContextRef.current.createAnalyser();
+        analyserRef.current.fftSize = 512;
+        analyserRef.current.smoothingTimeConstant = 0.8;
+
+        // Create and connect gain node
+        const gainNode = audioContextRef.current.createGain();
+        gainNode.gain.value = 1.0;
+        analyserRef.current.connect(gainNode);
+        gainNode.connect(audioContextRef.current.destination);
+
+        console.log('🎵 Analyser initialized');
+      } catch (e) {
+        console.error('Audio context init failed:', e);
+      }
+    };
+
+    // Initialize on first user interaction
+    const handleUserInteraction = () => {
+      initAudioContext();
+      document.removeEventListener('click', handleUserInteraction);
+      document.removeEventListener('keypress', handleUserInteraction);
+    };
+
+    document.addEventListener('click', handleUserInteraction);
+    document.addEventListener('keypress', handleUserInteraction);
+
+    return () => {
+      document.removeEventListener('click', handleUserInteraction);
+      document.removeEventListener('keypress', handleUserInteraction);
+    };
+  }, []);
+
+  // Connect audio elements to analyser when they're available
+  useEffect(() => {
+    if (!audioContextRef.current || !analyserRef.current) return;
+
+    const audioContext = audioContextRef.current;
+
+    // Create delay node for Song 2 beat offset
+    if (!delayNodeRef.current) {
+      delayNodeRef.current = audioContext.createDelay(8); // Max 8 seconds
+      delayNodeRef.current.connect(audioContext.destination);
+    }
+
+    const connectSources = () => {
+      let connected = false;
+
+      for (let slot = 0; slot < 2; slot++) {
+        for (let stem of stemNames) {
+          const audioEl = audioRefsRef.current[slot]?.[stem]?.current;
+          const key = `${slot}-${stem}`;
+
+          if (audioEl?.src && !audioSourcesRef.current[key]) {
+            try {
+              if (audioContext.state === 'suspended') {
+                audioContext.resume();
+              }
+
+              const source = audioContext.createMediaElementAudioSource(audioEl);
+
+              // Route Song 2 through delay node, Song 1 directly to destination
+              if (slot === 1) {
+                // Song 2: route through delay → destination
+                source.connect(delayNodeRef.current);
+                source.connect(analyserRef.current);
+              } else {
+                // Song 1: route directly to destination
+                source.connect(analyserRef.current);
+                source.connect(audioContext.destination);
+              }
+
+              audioSourcesRef.current[key] = source;
+              connected = true;
+            } catch (e) {
+              // Source already connected or other error
+            }
+          }
+        }
+      }
+
+      if (connected) {
+        console.log('🎵 Audio sources connected (Song 2 routed through delay for beat offset)');
+      }
+    };
+
+    connectSources();
+  }, [stems]);
+
+  // Update beat offset delay in real-time
+  useEffect(() => {
+    if (!audioContextRef.current || !delayNodeRef.current) return;
+
+    // Get Song 2's BPM from metadata
+    const song2BpmStr = metadata[1]?.bpm ? String(metadata[1].bpm) : '120';
+    const song2Bpm = parseFloat(song2BpmStr.split('-')[0]) || 120;
+
+    // Calculate delay in seconds: (beats / BPM) * 60
+    const delaySeconds = beatOffset > 0 ? (beatOffset / song2Bpm) * 60 : 0;
+
+    try {
+      // Update delay time with smooth ramping
+      delayNodeRef.current.delayTime.setValueAtTime(
+        Math.max(0, Math.min(delaySeconds, 8)), // Clamp between 0-8 seconds
+        audioContextRef.current.currentTime
+      );
+
+      if (beatOffset > 0) {
+        console.log(`⏱️ Beat offset: ${beatOffset} beats @ ${song2Bpm} BPM = ${delaySeconds.toFixed(3)}s`);
+      }
+    } catch (e) {
+      console.warn('Could not update delay time:', e);
+    }
+  }, [beatOffset, metadata]);
+
+  // Load kick waveforms for visualization
+  useEffect(() => {
+    if (!metadata[0] && !metadata[1]) return;
+
+    const loadKickWaveforms = async () => {
+      try {
+        if (!audioContextRef.current) {
+          audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        const context = audioContextRef.current;
+        const kickData = { data1: null, data2: null, duration: 0 };
+
+        // Load kick waveforms for both songs
+        for (let slot = 0; slot < 2; slot++) {
+          if (!metadata[slot]?.timestamp) continue;
+
+          const kickUrl = `/api/audio/${metadata[slot].timestamp}/kick.wav`;
+
+          try {
+            const response = await fetch(kickUrl);
+            const arrayBuffer = await response.arrayBuffer();
+            const audioBuffer = await context.decodeAudioData(arrayBuffer);
+
+            const rawData = audioBuffer.getChannelData(0);
+            const samples = Math.min(rawData.length, 2048); // Limit samples for display
+            const waveformData = new Float32Array(samples);
+
+            for (let i = 0; i < samples; i++) {
+              waveformData[i] = rawData[Math.floor((i / samples) * rawData.length)];
+            }
+
+            if (slot === 0) kickData.data1 = waveformData;
+            if (slot === 1) kickData.data2 = waveformData;
+
+            kickData.duration = Math.max(kickData.duration, audioBuffer.duration);
+            console.log(`✅ Loaded kick waveform for Song ${slot + 1}`);
+          } catch (e) {
+            console.warn(`Could not load kick for Song ${slot + 1}:`, e.message);
+          }
+        }
+
+        if (kickData.data1 && kickData.data2) {
+          setKickWaveforms(kickData);
+        }
+      } catch (e) {
+        console.warn('Waveform loading failed:', e);
+      }
+    };
+
+    loadKickWaveforms();
+  }, [metadata]);
 
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60);
@@ -854,7 +1039,15 @@ export default function DualMixer() {
         {stems[0] && stems[1] ? (
           <div className="playback-section">
             <div className="playback-controls">
-              <button onClick={togglePlayback} className="play-btn">
+              <button
+                onClick={togglePlayback}
+                className="play-btn"
+                disabled={isProcessing || isTransposing}
+                style={{
+                  opacity: (isProcessing || isTransposing) ? 0.5 : 1,
+                  cursor: (isProcessing || isTransposing) ? 'not-allowed' : 'pointer'
+                }}
+              >
                 {playing ? '⏸ PAUSE' : '▶ PLAY BOTH'}
               </button>
 
@@ -873,6 +1066,16 @@ export default function DualMixer() {
                 {formatTime(currentTime)} / {formatTime(duration)}
               </span>
             </div>
+
+            {/* Kick Waveform Visualization for Beat Alignment */}
+            {kickWaveforms && (
+              <Waveform
+                kicks={kickWaveforms}
+                currentTime={currentTime}
+                beatOffset={beatOffset}
+                song2Bpm={metadata[1]?.bpm ? parseFloat(String(metadata[1].bpm).split('-')[0]) : 120}
+              />
+            )}
 
             {/* Crossfader */}
             <div className="crossfader-section">
@@ -896,7 +1099,34 @@ export default function DualMixer() {
               </div>
             </div>
 
-            {/* Stems Version Info - Directly under Crossfader */}
+            {/* Beat Offset for Song 2 */}
+            <div className="crossfader-section" style={{ marginTop: '15px' }}>
+              <label>🎵 Beat Offset (Song 2)</label>
+              <div className="crossfader-labels">
+                <span>Sync</span>
+                <span>Offset</span>
+                <span>+8 beats</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="8"
+                step="1"
+                value={beatOffset}
+                onChange={(e) => setBeatOffset(parseInt(e.target.value))}
+                disabled={!stems[0] || !stems[1]}
+                className="crossfader-slider"
+                style={{
+                  opacity: (!stems[0] || !stems[1]) ? 0.5 : 1,
+                  cursor: (!stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
+                }}
+              />
+              <div className="crossfader-value">
+                {beatOffset === 0 ? 'No offset (sync)' : `+${beatOffset} beats`}
+              </div>
+            </div>
+
+            {/* Stems Version Info - Directly under Controls */}
             {(stems[0] || stems[1]) && (
               <div style={{
                 background: 'rgba(100, 116, 139, 0.2)',
@@ -1253,7 +1483,9 @@ export default function DualMixer() {
                       timestamps,
                       metadata: metadataList,
                       volumes,
-                      crossfader
+                      crossfader,
+                      beat_offsets: [0, beatOffset],
+                      target_bpm: targetBpm
                     })
                   });
                   const data = await res.json();

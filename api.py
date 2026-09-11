@@ -6,6 +6,7 @@ import logging
 import time
 
 logging.basicConfig(level=logging.DEBUG)
+logging.getLogger('numba').setLevel(logging.WARNING)
 
 app = Flask(__name__, static_folder='frontend/dist', static_url_path='')
 CORS(app)
@@ -372,18 +373,19 @@ def split_drums():
 
 @app.route('/api/render-final-mix', methods=['POST'])
 def render_final_mix():
-    """Render final mixed FLAC from stems with current volumes and metadata"""
+    """Render final mixed FLAC from stems with beatmatching, volumes, and beat offset"""
     data = request.json
     try:
-        import subprocess
-        import tempfile
         from pathlib import Path
         from mutagen.flac import FLAC
+        from mashup_engine import MashupEngine
 
         timestamps = data.get('timestamps')  # [timestamp_slot0, timestamp_slot1]
         volumes = data.get('volumes')  # {0: {stem: vol}, 1: {stem: vol}}
-        crossfader = data.get('crossfader', 50) / 100.0
-        metadata_list = data.get('metadata', [None, None])  # [{filename, bpm, key}, ...]
+        crossfader = data.get('crossfader', 50)
+        metadata_list = data.get('metadata', [None, None])
+        beat_offsets = data.get('beat_offsets', [0, 0])  # beats to offset Song 2
+        target_bpm = data.get('target_bpm')  # for beatmatching
 
         if not timestamps or not volumes:
             return jsonify({'error': 'Missing parameters'}), 400
@@ -395,104 +397,130 @@ def render_final_mix():
                 meta = m
                 break
 
-        bpm = meta.get('bpm', '?') if meta else '?'
+        bpm_label = meta.get('bpm', '?') if meta else '?'
         key = meta.get('key', '?') if meta else '?'
         song_names = [m.get('filename', f'Song_{i+1}') if m else f'Song_{i+1}' for i, m in enumerate(metadata_list)]
         mix_name = '-'.join([Path(n).stem for n in song_names if n]) or 'mashup'
 
-        # Create output file with descriptive name
+        # Create output directory
         output_dir = BASE_DIR / 'Audio' / 'renders'
         output_dir.mkdir(exist_ok=True)
-        # Intermediate WAV for FFmpeg, then convert to FLAC
         temp_wav = output_dir / f"temp_mix_{int(time.time() * 1000)}.wav"
-        final_flac = output_dir / f"{mix_name}-{bpm}-{key}-mix.flac"
+        final_flac = output_dir / f"{mix_name}-{bpm_label}-{key}-mix.flac"
 
-        # Build FFmpeg command to mix stems
-        inputs = []
-        filters = []
-        input_idx = 0
+        # Collect stem files and metadata for engine.render()
+        engine = MashupEngine()
+        stems_list = [None, None]
+        bpms = [None, None]
+        beat_anchors = [None, None]
 
         for slot in range(2):
             if not timestamps[slot]:
                 continue
 
             stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamps[slot]
-            slot_volume = (1 - crossfader) if slot == 0 else crossfader
 
-            for stem in ['vocals', 'drums', 'bass', 'other']:
-                # Try processed version first, then original
-                stem_file = stems_dir / f"{stem}_processed.wav"
-                if not stem_file.exists():
-                    stem_file = stems_dir / f"{stem}.wav"
-
+            # Get stem files (7-stem structure: vocals, kick, snare, hihat, tom, bass, other)
+            stems = {}
+            for stem_name in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
+                stem_file = stems_dir / f"{stem_name}.wav"
                 if stem_file.exists():
-                    inputs.append('-i')
-                    inputs.append(str(stem_file))
+                    stems[stem_name] = str(stem_file)
 
-                    stem_volume = volumes.get(slot, {}).get(stem, 1.0)
-                    master_volume = slot_volume * stem_volume
+            if stems:
+                stems_list[slot] = stems
 
-                    filters.append(f"[{input_idx}]volume={master_volume}[s{input_idx}]")
-                    input_idx += 1
-
-        if input_idx == 0:
-            return jsonify({'error': 'No stems found'}), 400
-
-        # Concat all volumes
-        concat_str = ''.join([f'[s{i}]' for i in range(input_idx)])
-        filter_complex = ';'.join(filters) + f';{concat_str}amix=inputs={input_idx}[out]'
-
-        # Render as WAV first
-        cmd_wav = ['ffmpeg', '-y'] + inputs + [
-            '-filter_complex', filter_complex,
-            '-map', '[out]',
-            '-acodec', 'pcm_s16le',
-            str(temp_wav)
-        ]
-
-        logging.info(f"Rendering mix with {input_idx} stems...")
-        result = subprocess.run(cmd_wav, capture_output=True, text=True, timeout=300)
-
-        if result.returncode != 0 or not temp_wav.exists():
-            logging.error(f"FFmpeg error: {result.stderr}")
-            return jsonify({'error': 'Rendering failed'}), 500
-
-        # Convert WAV to FLAC
-        cmd_flac = ['ffmpeg', '-i', str(temp_wav), '-c:a', 'flac', '-y', str(final_flac)]
-        result = subprocess.run(cmd_flac, capture_output=True, text=True, timeout=300)
-
-        if result.returncode == 0 and final_flac.exists():
-            # Add FLAC tags
-            try:
-                audio = FLAC(str(final_flac))
-                audio['TITLE'] = f'{mix_name} Mix'
-                # Extract numeric BPM from various formats (e.g., "115", "115.5", "115-manual-115-measured")
-                bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
+            # Extract BPM from metadata
+            if metadata_list[slot]:
+                bpm_str = str(metadata_list[slot].get('bpm', ''))
+                # Parse BPM: can be "115", "115.5", "115-manual-115-measured"
                 try:
-                    audio['BPM'] = str(int(float(bpm_str)))
+                    bpms[slot] = float(bpm_str.split('-')[0])
                 except (ValueError, IndexError):
-                    audio['BPM'] = str(bpm)
-                audio['INITIALKEY'] = str(key)
-                audio['ARTIST'] = 'DualSync Pro'
-                audio['COMMENT'] = 'Mixed with DualSync Pro'
-                audio.save()
-                logging.info(f"✅ Tagged FLAC: {final_flac.name} (BPM: {audio['BPM'][0] if 'BPM' in audio else '?'}, Key: {key})")
-            except Exception as tag_err:
-                logging.error(f"FLAC tagging failed: {tag_err}")
+                    bpms[slot] = None
 
-            # Cleanup temp WAV
-            temp_wav.unlink(missing_ok=True)
+                # Try to get beat anchor from metadata if available
+                # For now, we'll detect it during render
+                beat_anchors[slot] = None
 
-            logging.info(f"✅ Mix rendered: {final_flac}")
-            return jsonify({
-                'status': 'success',
-                'file': f'/api/download-file/{final_flac.name}',
-                'size_mb': round(final_flac.stat().st_size / (1024 * 1024), 2)
-            })
-        else:
-            logging.error(f"FLAC conversion failed: {result.stderr}")
-            temp_wav.unlink(missing_ok=True)
-            return jsonify({'error': 'FLAC conversion failed'}), 500
+        # Build params for engine.render()
+        params = {
+            'songs': stems_list,
+            'stems': [s if s else {} for s in stems_list],
+            'bpms': bpms,
+            'beat_anchors': beat_anchors,
+            'beat_offsets': beat_offsets,
+            'target_bpm': target_bpm if target_bpm else None,
+            'beatmatch': bool(target_bpm),  # Only beatmatch if target BPM is set
+            'sliders': {
+                's0_pitch_shift': 0.0,
+                's0_speed': 1.0,
+                's1_pitch_shift': 0.0,
+                's1_speed': 1.0
+            },
+            'crossfader': crossfader / 100.0
+        }
+
+        # Convert stem volumes to engine format
+        for slot in range(2):
+            if volumes.get(slot):
+                for stem_name, vol in volumes[slot].items():
+                    params[f's{slot}_{stem_name}_volume'] = vol
+
+        logging.info(f"Rendering mix: beatmatch={params['beatmatch']}, beat_offsets={beat_offsets}, target_bpm={target_bpm}")
+
+        # Render using engine (applies beatmatching and beat offset)
+        try:
+            engine.render(params, preview=False)
+            output_file = BASE_DIR / 'final_remix.mp3'
+
+            if output_file.exists():
+                # Convert MP3 to FLAC
+                import subprocess
+                result = subprocess.run(
+                    ['ffmpeg', '-y', '-i', str(output_file), '-c:a', 'flac', str(final_flac)],
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+
+                if result.returncode == 0 and final_flac.exists():
+                    # Add FLAC tags
+                    try:
+                        audio = FLAC(str(final_flac))
+                        audio['TITLE'] = f'{mix_name} Mix'
+                        bpm_str = str(bpm_label).split('-')[0] if isinstance(bpm_label, str) else str(bpm_label)
+                        try:
+                            audio['BPM'] = str(int(float(bpm_str)))
+                        except (ValueError, IndexError):
+                            audio['BPM'] = str(bpm_label)
+                        audio['INITIALKEY'] = str(key)
+                        audio['ARTIST'] = 'DualSync Pro'
+                        audio['COMMENT'] = f'Mixed with beatmatch (offset: {beat_offsets[1]} beats)'
+                        audio.save()
+                        logging.info(f"✅ Tagged FLAC: {final_flac.name} (BPM: {audio['BPM'][0]}, Key: {key})")
+                    except Exception as tag_err:
+                        logging.error(f"FLAC tagging failed: {tag_err}")
+
+                    # Cleanup
+                    output_file.unlink(missing_ok=True)
+
+                    logging.info(f"✅ Mix rendered with beatmatching: {final_flac}")
+                    return jsonify({
+                        'status': 'success',
+                        'file': f'/api/download-file/{final_flac.name}',
+                        'size_mb': round(final_flac.stat().st_size / (1024 * 1024), 2)
+                    })
+                else:
+                    logging.error(f"FLAC conversion failed: {result.stderr}")
+                    output_file.unlink(missing_ok=True)
+                    return jsonify({'error': 'FLAC conversion failed'}), 500
+            else:
+                return jsonify({'error': 'Render output not found'}), 500
+
+        except Exception as render_err:
+            logging.error(f"Engine render failed: {render_err}", exc_info=True)
+            return jsonify({'error': f'Render failed: {str(render_err)}'}), 500
 
     except Exception as e:
         logging.error(f"Render error: {e}", exc_info=True)

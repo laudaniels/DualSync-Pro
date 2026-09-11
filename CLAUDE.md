@@ -2,38 +2,47 @@
 
 ## Project Status
 
-**Active Development:** Gradio web interface only  
+**Active Development:** Flask API + React web interface  
 **Frozen:** Desktop app (Tkinter) as of v1.0 — see `archive/app_gui.py`
 
-All future development focuses on the Gradio web interface (`gradio_app.py`). The desktop version is no longer maintained.
+The web interface is the primary application. The desktop version is no longer maintained.
 
 ## Core Files
 
-- **`gradio_app.py`** — Main Gradio web interface (active)
+- **`api.py`** — Flask backend API (active)
+- **`frontend/`** — React web interface (active)
 - **`mashup_engine.py`** — Core audio processing engine (shared)
 - **`archive/app_gui.py`** — Old Tkinter desktop app (frozen, archived)
 
 ## Running the App
 
 ```bash
-python3 gradio_app.py
+python3 api.py
 ```
 
-Opens at `http://localhost:7860` (requires venv with dependencies installed).
+Opens at `http://localhost:5000` (requires venv with dependencies installed).
 
 ## Architecture
 
+### `api.py`
+- Flask backend serving React frontend from `frontend/dist`
+- REST API endpoints for audio processing:
+  - `/api/separate-stems` — stem separation
+  - `/api/process-status` — real-time processing status
+  - `/api/render` — render mixed audio
+- CORS enabled for frontend communication
+
 ### `mashup_engine.py`
+- Core audio processing engine called by API
 - Handles BPM detection, stem separation, audio rendering
 - FFmpeg-based mixing and effects
 - Demucs for AI stem isolation
+- Background thread processing for long-running tasks
 
-### `gradio_app.py`
-- `StudioState` — manages all mixer state (songs, stems, BPMs, sliders, presets)
-- Blocks-based Gradio UI with three main sections:
-  - **Load & Analyze** — song loading, BPM detection, stem separation
-  - **Per-Song Controls** — stem volumes, pitch, reverb, speed, EQ
-  - **Mixing** — crossfader, target BPM, beatmatch, presets, rendering
+### `frontend/`
+- React-based web interface
+- Components for mixer controls, stem management, real-time logs
+- Communicates with Flask API via REST endpoints
 
 ## Development Notes
 
