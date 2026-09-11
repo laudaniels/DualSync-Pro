@@ -206,17 +206,16 @@ export default function DualMixer() {
   // Play/pause both songs
   const togglePlayback = () => {
     if (playing) {
-      // Stop all
+      // Pause and maintain position for resume
       [0, 1].forEach(slot => {
         stemNames.forEach(stem => {
           if (audioRefsRef.current[slot][stem]?.current) {
             audioRefsRef.current[slot][stem].current.pause();
-            audioRefsRef.current[slot][stem].current.currentTime = 0;
+            // Keep currentTime so it resumes from same position
           }
         });
       });
       setPlaying(false);
-      setCurrentTime(0);
     } else {
       // Play all loaded stems
       const crossfadePercent = crossfader / 100;
@@ -961,24 +960,9 @@ export default function DualMixer() {
         </>
       ) : (
         <div className="stem-controls">
-          <h4>🎚️ Volumes {slot === 0 ? '(☑ = display waveform)' : ''}</h4>
+          <h4>🎚️ Volumes</h4>
           {stemNames.map(stem => (
             <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              {slot === 0 && (
-                <input
-                  type="checkbox"
-                  checked={selectedStemsForWaveform.includes(stem)}
-                  onChange={(e) => {
-                    if (e.target.checked) {
-                      setSelectedStemsForWaveform([...selectedStemsForWaveform, stem]);
-                    } else {
-                      setSelectedStemsForWaveform(selectedStemsForWaveform.filter(s => s !== stem));
-                    }
-                  }}
-                  title="Display this stem in waveform"
-                  style={{ cursor: 'pointer', width: '16px', height: '16px' }}
-                />
-              )}
               <label style={{ minWidth: '80px' }}>{stemLabels[stem]}</label>
               <input
                 type="range"
@@ -1027,6 +1011,44 @@ export default function DualMixer() {
           {renderSongMixer(0)}
           {renderSongMixer(1)}
         </div>
+
+        {/* Waveform Stem Selector - Center Section */}
+        {stems[0] && stems[1] && (
+          <div style={{
+            background: 'rgba(99, 102, 241, 0.08)',
+            border: '1px solid rgba(99, 102, 241, 0.2)',
+            borderRadius: '8px',
+            padding: '15px',
+            marginTop: '20px',
+            marginBottom: '20px',
+            textAlign: 'center'
+          }}>
+            <div style={{ fontSize: '13px', fontWeight: 'bold', color: '#ccc', marginBottom: '12px' }}>
+              📊 Select Stems for Waveform Display {playing ? '(paused to enable)' : '(☑ paused only)'}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '15px', justifyContent: 'center' }}>
+              {stemNames.map(stem => (
+                <label key={stem} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: playing ? 'not-allowed' : 'pointer', opacity: playing ? 0.5 : 1 }}>
+                  <input
+                    type="checkbox"
+                    checked={selectedStemsForWaveform.includes(stem)}
+                    onChange={(e) => {
+                      if (e.target.checked) {
+                        setSelectedStemsForWaveform([...selectedStemsForWaveform, stem]);
+                      } else {
+                        setSelectedStemsForWaveform(selectedStemsForWaveform.filter(s => s !== stem));
+                      }
+                    }}
+                    disabled={playing}
+                    title={playing ? 'Pause to enable' : `Display ${stem} in waveform`}
+                    style={{ cursor: playing ? 'not-allowed' : 'pointer', width: '16px', height: '16px' }}
+                  />
+                  <span style={{ fontSize: '12px' }}>{stemLabels[stem]}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Unified Processing Log */}
         {(loading[0] || loading[1] || isProcessing) && processingLogs.length > 0 && (
