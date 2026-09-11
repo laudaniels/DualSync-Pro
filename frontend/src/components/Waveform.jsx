@@ -3,7 +3,7 @@ import React, { useEffect, useRef, useState } from 'react';
 export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
   const canvasRef = useRef(null);
   const [loading, setLoading] = useState(true);
-  const ZOOM_WINDOW = 15; // 15 seconds visible at a time
+  const ZOOM_WINDOW = 10; // 10 seconds visible at a time
 
   // Colors for each stem
   const stemColors = {
@@ -64,8 +64,11 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
     const actualStart = Math.min(windowStart, totalDuration - ZOOM_WINDOW);
     const actualEnd = actualStart + ZOOM_WINDOW;
 
-    // Calculate beat offset delay
+    // Calculate beat offset delay in seconds
     const delaySeconds = beatOffset > 0 ? (beatOffset / song2Bpm) * 60 : 0;
+
+    // Calculate pixel offset for Song 2 based on beat offset
+    const song2PixelOffset = (delaySeconds / ZOOM_WINDOW) * width;
 
     // Draw each selected stem
     stemsToDisplay.forEach((stem, stemIdx) => {
@@ -75,8 +78,8 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
 
       // Draw both Song 1 and Song 2 for this stem
       [
-        { data: stemData.data1, offset: 0, label: `${stemLabels[stem]} (Song 1)` },
-        { data: stemData.data2, offset: rowHeight / 2, label: `Song 2` }
+        { data: stemData.data1, offset: 0, label: `${stemLabels[stem]} (Song 1)`, xShift: 0 },
+        { data: stemData.data2, offset: rowHeight / 2, label: `Song 2`, xShift: song2PixelOffset }
       ].forEach((songData, songIdx) => {
         if (!songData.data) return;
 
@@ -96,7 +99,11 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
           const sampleIdx = startSample + i;
           if (sampleIdx >= songData.data.length) break;
 
-          const x = i * pixelsPerSample;
+          const x = songData.xShift + (i * pixelsPerSample);
+
+          // Skip drawing if x is outside canvas for Song 2 shift
+          if (x < 0 || x > width) continue;
+
           const amplitude = songData.data[sampleIdx] || 0;
           const y = yPos + (amplitude * (rowHeight / 4));
 
@@ -175,7 +182,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
       />
       {loading && (
         <div style={{ fontSize: '11px', color: '#666', marginTop: '5px', textAlign: 'center' }}>
-          🎯 Selected stem waveforms (15s zoom window)
+          🎯 Selected stem waveforms (10s zoom window)
         </div>
       )}
     </div>
