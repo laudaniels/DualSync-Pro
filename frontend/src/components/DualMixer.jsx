@@ -41,6 +41,7 @@ export default function DualMixer() {
   const delayNodeRef = useRef(null); // For Song 2 beat offset
   const [beatOffset, setBeatOffset] = useState(0); // 0-8 beats for Song 2
   const [kickWaveforms, setKickWaveforms] = useState(null); // Kick drum waveforms for display
+  const [selectedStemsForWaveform, setSelectedStemsForWaveform] = useState(['kick']); // Which stems to display in waveform
 
   // Stem names now include split drums (drums → kick, snare, hihat, tom)
   const stemNames = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other'];
@@ -455,58 +456,61 @@ export default function DualMixer() {
     }
   }, [beatOffset, metadata]);
 
-  // Load kick waveforms for visualization
+  // Load waveforms for selected stems
   useEffect(() => {
     if (!metadata[0] && !metadata[1]) return;
+    if (!selectedStemsForWaveform.length) return;
 
-    const loadKickWaveforms = async () => {
+    const loadStemWaveforms = async () => {
       try {
         if (!audioContextRef.current) {
           audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
         }
 
         const context = audioContextRef.current;
-        const kickData = { data1: null, data2: null, duration: 0 };
+        const waveformData = { stems: {}, duration: 0 };
 
-        // Load kick waveforms for both songs
-        for (let slot = 0; slot < 2; slot++) {
-          if (!metadata[slot]?.timestamp) continue;
+        // Load waveforms for selected stems, both songs
+        for (let stem of selectedStemsForWaveform) {
+          waveformData.stems[stem] = { data1: null, data2: null };
 
-          const kickUrl = `/api/audio/${metadata[slot].timestamp}/kick.wav`;
+          for (let slot = 0; slot < 2; slot++) {
+            if (!metadata[slot]?.timestamp) continue;
 
-          try {
-            const response = await fetch(kickUrl);
-            const arrayBuffer = await response.arrayBuffer();
-            const audioBuffer = await context.decodeAudioData(arrayBuffer);
+            const stemUrl = `/api/audio/${metadata[slot].timestamp}/${stem}.wav`;
 
-            const rawData = audioBuffer.getChannelData(0);
-            const samples = Math.min(rawData.length, 2048); // Limit samples for display
-            const waveformData = new Float32Array(samples);
+            try {
+              const response = await fetch(stemUrl);
+              const arrayBuffer = await response.arrayBuffer();
+              const audioBuffer = await context.decodeAudioData(arrayBuffer);
 
-            for (let i = 0; i < samples; i++) {
-              waveformData[i] = rawData[Math.floor((i / samples) * rawData.length)];
+              const rawData = audioBuffer.getChannelData(0);
+              const samples = Math.min(rawData.length, 2048); // Limit samples for display
+              const stemData = new Float32Array(samples);
+
+              for (let i = 0; i < samples; i++) {
+                stemData[i] = rawData[Math.floor((i / samples) * rawData.length)];
+              }
+
+              waveformData.stems[stem][`data${slot + 1}`] = stemData;
+              waveformData.duration = Math.max(waveformData.duration, audioBuffer.duration);
+              console.log(`✅ Loaded ${stem} waveform for Song ${slot + 1}`);
+            } catch (e) {
+              console.warn(`Could not load ${stem} for Song ${slot + 1}:`, e.message);
             }
-
-            if (slot === 0) kickData.data1 = waveformData;
-            if (slot === 1) kickData.data2 = waveformData;
-
-            kickData.duration = Math.max(kickData.duration, audioBuffer.duration);
-            console.log(`✅ Loaded kick waveform for Song ${slot + 1}`);
-          } catch (e) {
-            console.warn(`Could not load kick for Song ${slot + 1}:`, e.message);
           }
         }
 
-        if (kickData.data1 && kickData.data2) {
-          setKickWaveforms(kickData);
+        if (Object.keys(waveformData.stems).length > 0) {
+          setKickWaveforms(waveformData);
         }
       } catch (e) {
         console.warn('Waveform loading failed:', e);
       }
     };
 
-    loadKickWaveforms();
-  }, [metadata]);
+    loadStemWaveforms();
+  }, [metadata, selectedStemsForWaveform]);
 
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60);
@@ -957,10 +961,25 @@ export default function DualMixer() {
         </>
       ) : (
         <div className="stem-controls">
-          <h4>🎚️ Volumes</h4>
+          <h4>🎚️ Volumes {slot === 0 ? '(☑ = display waveform)' : ''}</h4>
           {stemNames.map(stem => (
-            <div key={stem} className="volume-control">
-              <label>{stem.toUpperCase()}</label>
+            <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              {slot === 0 && (
+                <input
+                  type="checkbox"
+                  checked={selectedStemsForWaveform.includes(stem)}
+                  onChange={(e) => {
+                    if (e.target.checked) {
+                      setSelectedStemsForWaveform([...selectedStemsForWaveform, stem]);
+                    } else {
+                      setSelectedStemsForWaveform(selectedStemsForWaveform.filter(s => s !== stem));
+                    }
+                  }}
+                  title="Display this stem in waveform"
+                  style={{ cursor: 'pointer', width: '16px', height: '16px' }}
+                />
+              )}
+              <label style={{ minWidth: '80px' }}>{stemLabels[stem]}</label>
               <input
                 type="range"
                 min="0"
@@ -969,8 +988,9 @@ export default function DualMixer() {
                 value={volumes[slot]?.[stem] ?? 1.0}
                 onChange={(e) => handleVolumeChange(slot, stem, parseFloat(e.target.value))}
                 className="slider"
+                style={{ flex: 1 }}
               />
-              <span className="volume-value">
+              <span className="volume-value" style={{ minWidth: '40px', textAlign: 'right' }}>
                 {Math.round((volumes[slot]?.[stem] ?? 1.0) * 100)}%
               </span>
             </div>

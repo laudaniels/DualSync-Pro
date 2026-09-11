@@ -5,6 +5,27 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
   const [loading, setLoading] = useState(true);
   const ZOOM_WINDOW = 15; // 15 seconds visible at a time
 
+  // Colors for each stem
+  const stemColors = {
+    vocals: 'rgb(168, 85, 247)',    // purple
+    kick: 'rgb(99, 102, 241)',      // indigo
+    snare: 'rgb(236, 72, 153)',     // pink
+    hihat: 'rgb(249, 115, 22)',     // orange
+    tom: 'rgb(34, 197, 94)',        // green
+    bass: 'rgb(59, 130, 246)',      // blue
+    other: 'rgb(168, 162, 158)'     // gray
+  };
+
+  const stemLabels = {
+    vocals: '🎤 Vocals',
+    kick: '🔊 Kick',
+    snare: '🥁 Snare',
+    hihat: '⚡ Hi-Hat',
+    tom: '🔔 Tom',
+    bass: '🎸 Bass',
+    other: '🎹 Other'
+  };
+
   useEffect(() => {
     if (!canvasRef.current) return;
 
@@ -21,76 +42,89 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
     ctx.fillStyle = 'rgba(15, 15, 30, 0.95)';
     ctx.fillRect(0, 0, width, height);
 
-    if (!kicks || !kicks.data1 || !kicks.data2) {
+    if (!kicks || !kicks.stems || !Object.keys(kicks.stems).length) {
       ctx.fillStyle = '#666';
       ctx.font = '12px monospace';
       ctx.textAlign = 'center';
-      ctx.fillText('Loading kick waveforms...', width / 2, height / 2);
+      ctx.fillText('Select stems to display', width / 2, height / 2);
       return;
     }
 
     setLoading(false);
+
+    const stemsToDisplay = Object.keys(kicks.stems);
+    const stemsPerSlot = 2; // Song 1 and Song 2 for each stem
+    const rowHeight = height / stemsToDisplay.length;
 
     // Calculate zoom window around currentTime
     const windowStart = Math.max(0, currentTime - ZOOM_WINDOW / 2);
     const windowEnd = windowStart + ZOOM_WINDOW;
     const totalDuration = kicks.duration || 10;
 
-    // Clamp window to available data
     const actualStart = Math.min(windowStart, totalDuration - ZOOM_WINDOW);
     const actualEnd = actualStart + ZOOM_WINDOW;
 
-    // Calculate sample indices for zoom window
-    const totalSamples = kicks.data1.length;
-    const startSample = Math.floor((actualStart / totalDuration) * totalSamples);
-    const endSample = Math.floor((actualEnd / totalDuration) * totalSamples);
-    const visibleSamples = endSample - startSample;
-
-    // Calculate beat offset delay in seconds
+    // Calculate beat offset delay
     const delaySeconds = beatOffset > 0 ? (beatOffset / song2Bpm) * 60 : 0;
 
-    // Draw kick waveform
-    const drawKickWaveform = (data, yOffset, color, label) => {
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
+    // Draw each selected stem
+    stemsToDisplay.forEach((stem, stemIdx) => {
+      const yOffset = (stemIdx + 0.5) * rowHeight;
+      const stemData = kicks.stems[stem];
+      const color = stemColors[stem];
 
-      const pixelsPerSample = width / visibleSamples;
-      for (let i = 0; i < visibleSamples; i++) {
-        const sampleIdx = startSample + i;
-        if (sampleIdx >= data.length) break;
+      // Draw both Song 1 and Song 2 for this stem
+      [
+        { data: stemData.data1, offset: 0, label: `${stemLabels[stem]} (Song 1)` },
+        { data: stemData.data2, offset: rowHeight / 2, label: `Song 2` }
+      ].forEach((songData, songIdx) => {
+        if (!songData.data) return;
 
-        const x = i * pixelsPerSample;
-        const amplitude = data[sampleIdx] || 0;
-        const y = yOffset + (amplitude * (height / 3.5));
+        const yPos = yOffset + (songIdx - 0.5) * (rowHeight / 3);
+        const totalSamples = songData.data.length;
+        const startSample = Math.floor((actualStart / totalDuration) * totalSamples);
+        const endSample = Math.floor((actualEnd / totalDuration) * totalSamples);
+        const visibleSamples = endSample - startSample;
 
-        if (i === 0) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.2;
+        ctx.globalAlpha = songIdx === 0 ? 1 : 0.6; // Song 2 slightly faded
+        ctx.beginPath();
+
+        const pixelsPerSample = width / visibleSamples;
+        for (let i = 0; i < visibleSamples; i++) {
+          const sampleIdx = startSample + i;
+          if (sampleIdx >= songData.data.length) break;
+
+          const x = i * pixelsPerSample;
+          const amplitude = songData.data[sampleIdx] || 0;
+          const y = yPos + (amplitude * (rowHeight / 4));
+
+          if (i === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
         }
-      }
-      ctx.stroke();
+        ctx.stroke();
+        ctx.globalAlpha = 1;
 
-      // Draw label
+        // Draw center line
+        ctx.strokeStyle = 'rgba(99, 102, 241, 0.1)';
+        ctx.beginPath();
+        ctx.moveTo(0, yPos);
+        ctx.lineTo(width, yPos);
+        ctx.stroke();
+      });
+
+      // Draw stem label
       ctx.fillStyle = color;
-      ctx.font = 'bold 11px monospace';
+      ctx.font = 'bold 10px monospace';
       ctx.textAlign = 'left';
-      ctx.fillText(label, 10, yOffset - 5);
+      ctx.fillText(stemLabels[stem], 5, yOffset - rowHeight / 4);
+    });
 
-      // Draw center line
-      ctx.strokeStyle = 'rgba(99, 102, 241, 0.1)';
-      ctx.beginPath();
-      ctx.moveTo(0, yOffset);
-      ctx.lineTo(width, yOffset);
-      ctx.stroke();
-    };
-
-    // Draw both kicks
-    drawKickWaveform(kicks.data1, height / 4, 'rgb(99, 102, 241)', '🔊 Song 1 Kick');
-    drawKickWaveform(kicks.data2, (3 * height) / 4, 'rgb(34, 197, 94)', '🔊 Song 2 Kick');
-
-    // Draw playhead (current time)
+    // Draw playhead
     const playheadPercent = (currentTime - actualStart) / ZOOM_WINDOW;
     if (playheadPercent >= 0 && playheadPercent <= 1) {
       const playheadX = playheadPercent * width;
@@ -100,12 +134,6 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
       ctx.moveTo(playheadX, 0);
       ctx.lineTo(playheadX, height);
       ctx.stroke();
-
-      // Playhead label
-      ctx.fillStyle = 'rgba(255, 87, 87, 0.8)';
-      ctx.font = '10px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('▶', playheadX, 15);
     }
 
     // Draw beat offset indicator
@@ -120,26 +148,16 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
         ctx.lineTo(offsetX, height);
         ctx.stroke();
         ctx.setLineDash([]);
-
-        ctx.fillStyle = 'rgba(255, 193, 7, 0.7)';
-        ctx.font = '9px monospace';
-        ctx.textAlign = 'center';
-        ctx.fillText(`+${beatOffset}b`, offsetX, 30);
       }
     }
 
     // Draw time labels
     ctx.fillStyle = '#999';
-    ctx.font = '10px monospace';
+    ctx.font = '9px monospace';
     ctx.textAlign = 'left';
     ctx.fillText(`${actualStart.toFixed(1)}s`, 5, height - 5);
     ctx.textAlign = 'right';
     ctx.fillText(`${actualEnd.toFixed(1)}s`, width - 5, height - 5);
-
-    // Draw center time
-    ctx.textAlign = 'center';
-    const centerTime = actualStart + ZOOM_WINDOW / 2;
-    ctx.fillText(`${centerTime.toFixed(1)}s`, width / 2, height - 5);
   }, [kicks, beatOffset, song2Bpm, currentTime]);
 
   return (
@@ -157,7 +175,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm }) {
       />
       {loading && (
         <div style={{ fontSize: '11px', color: '#666', marginTop: '5px', textAlign: 'center' }}>
-          🎯 Kick waveforms zoomed to 15s window
+          🎯 Selected stem waveforms (15s zoom window)
         </div>
       )}
     </div>
