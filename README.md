@@ -62,10 +62,10 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
   - Original stems: `songname-[detected-bpm]-[key]-[stem].flac`
   - Processed stems: `songname-[measured-bpm]-[key]-[stem].flac`
   - Manual BPM override: `songname-[target]-manual-[measured]-[key]-[stem].flac`
-- **9 downloadable files** (all as FLAC with verified output BPM):
-  - Original Song 1 stems (4 stems)
-  - Original Song 2 stems (4 stems)
-  - Beatmatched + transposed stems (4 stems with verified output BPM)
+- **22 downloadable files** (all as FLAC with verified output BPM):
+  - Original Song 1 stems (7 stems: vocals, kick, snare, hi-hat, tom, bass, other)
+  - Original Song 2 stems (7 stems: vocals, kick, snare, hi-hat, tom, bass, other)
+  - Beatmatched + transposed stems (7 stems with verified output BPM)
   - Final mix (all stems combined with volume settings + crossfader)
 - **ZIP archives** — organized downloads with accurate naming
 
