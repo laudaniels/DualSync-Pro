@@ -5,11 +5,9 @@ import { stemNames, stemLabels } from './stemConstants';
 const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 // Split out of DualMixer so it can be memoized: the parent re-renders every
-// 250ms while playing (to drive the progress bar/waveform), but nothing in
+// 100ms while playing (to drive the progress bar/waveform), but nothing in
 // here depends on currentTime -- without this split, that tick was forcing a
-// full reconcile of volume sliders, upload UI, and 14 hidden <audio> elements
-// per song, heavy enough to stall the main thread and starve all the audio
-// elements' buffers at once.
+// full reconcile of the volume sliders/upload UI every tick for no reason.
 function SongMixer({
   slot,
   metadata,
@@ -22,14 +20,15 @@ function SongMixer({
   effectiveBpm,
   effectiveKey,
   volumes,
-  audioRefs,
-  playingRef,
-  logStemEvent,
+  audioReady,
+  pendingSong,
+  processingStage,
   onBpmOverride,
   onKeyOverride,
   onToggleEditingBpm,
   onToggleEditingKey,
-  onStemsLoaded,
+  onFileDropped,
+  onChooseMode,
   onVolumeChange
 }) {
   const songName = metadata?.filename?.replace(/\.[^/.]+$/, '') || `Song ${slot + 1}`;
@@ -164,13 +163,73 @@ function SongMixer({
       )}
 
       {!hasStems ? (
-        <StemLoader
-          onStemsLoaded={(file) => onStemsLoaded(file, slot)}
-          loading={loading}
-        />
+        pendingSong ? (
+          <div className="stem-loader" style={{
+            border: '6px solid #7c3aed',
+            borderRadius: '16px',
+            padding: '50px 40px',
+            textAlign: 'center',
+            background: 'rgba(124, 58, 237, 0.45)',
+            width: '100%',
+            minHeight: '350px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxSizing: 'border-box',
+            gap: '16px'
+          }}>
+            {loading ? (
+              <div className="loader">
+                <div className="spinner"></div>
+                <p>{processingStage === 'align' ? 'Aligning beatgrid...' : 'Separating stems... (this may take a minute)'}</p>
+              </div>
+            ) : (
+              <>
+                <p><strong>How should this song be processed?</strong></p>
+                <button
+                  onClick={() => onChooseMode(slot, 'as_is')}
+                  style={{
+                    background: '#6366f1',
+                    color: '#fff',
+                    border: 'none',
+                    padding: '14px 24px',
+                    borderRadius: '8px',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    width: '80%'
+                  }}
+                >
+                  1️⃣ Process as is
+                </button>
+                <button
+                  onClick={() => onChooseMode(slot, 'align')}
+                  style={{
+                    background: 'transparent',
+                    color: '#6366f1',
+                    border: '2px solid #6366f1',
+                    padding: '14px 24px',
+                    borderRadius: '8px',
+                    cursor: 'pointer',
+                    fontSize: '14px',
+                    width: '80%'
+                  }}
+                >
+                  2️⃣ Align beatgrid first
+                </button>
+              </>
+            )}
+          </div>
+        ) : (
+          <StemLoader
+            onStemsLoaded={(file) => onFileDropped(file, slot)}
+            loading={loading}
+            loadingLabel="Converting to WAV..."
+          />
+        )
       ) : (
         <div className="stem-controls">
-          <h4>🎚️ Volumes</h4>
+          <h4>🎚️ Volumes {!audioReady && <span style={{ fontWeight: 'normal', fontSize: '11px', color: '#999' }}>(⏳ preparing audio...)</span>}</h4>
           {stemNames.map(stem => (
             <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <label style={{ minWidth: '80px' }}>{stemLabels[stem]}</label>
@@ -191,36 +250,6 @@ function SongMixer({
           ))}
         </div>
       )}
-
-      {/* Hidden audio elements */}
-      <div style={{ display: 'none' }}>
-        {stemNames.map(stem => (
-          <audio
-            key={stem}
-            ref={audioRefs[stem]}
-            crossOrigin="anonymous"
-            loop
-            onError={(e) => console.error(`Song ${slot + 1} ${stem} error:`, e)}
-            onStalled={(e) => logStemEvent(slot, stem, 'stalled (browser can\'t fetch more data)', e.target)}
-            onWaiting={(e) => logStemEvent(slot, stem, 'waiting (buffer underrun, audio goes silent here)', e.target)}
-            onSuspend={(e) => logStemEvent(slot, stem, 'suspend (browser paused loading)', e.target)}
-            onPause={(e) => {
-              // A stem can stall out and pause itself (network hiccup, decode
-              // stutter, buffer underrun) with no error event at all -- that's
-              // the "some stems drop and only come back after pause/play"
-              // symptom. If we still believe playback should be running,
-              // resume this one stem immediately instead of making the user
-              // manually pause/play everything to notice and fix it.
-              if (playingRef.current && !e.target.ended) {
-                logStemEvent(slot, stem, 'unexpected pause -- auto-resuming', e.target);
-                e.target.play().catch(err => {
-                  if (err.name !== 'AbortError') console.error(`Auto-resume failed (Song ${slot + 1} ${stem}):`, err);
-                });
-              }
-            }}
-          />
-        ))}
-      </div>
     </div>
   );
 }

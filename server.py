@@ -44,9 +44,12 @@ def serve_files(filepath):
 
 
 # ===== API Routes =====
-@app.route('/api/separate-stems', methods=['POST'])
-def separate_stems():
-    """Separate audio into stems"""
+@app.route('/api/upload-audio', methods=['POST'])
+def upload_audio():
+    """Step 1: save the upload and convert it to WAV. Returns a reference the
+    frontend holds onto while the user picks 'process as is' vs 'beat
+    alignment' -- the heavier analyze/align/separate work happens in
+    /api/process-song, once that choice is made."""
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
 
@@ -55,13 +58,13 @@ def separate_stems():
         return jsonify({'error': 'Empty filename'}), 400
 
     try:
-        import shutil
+        import subprocess
         import time
         global _processing_state
 
-        # Both songs can upload/separate at once (threaded server), so only
-        # clear this slot's own previous log lines -- wiping the whole shared
-        # log here would erase the other song's still-relevant progress.
+        # Both songs can upload at once (threaded server), so only clear this
+        # slot's own previous log lines -- wiping the whole shared log here
+        # would erase the other song's still-relevant progress.
         slot_raw = request.form.get('slot')
         slot = int(slot_raw) if slot_raw not in (None, '') else None
         if slot is not None:
@@ -70,17 +73,73 @@ def separate_stems():
         else:
             _processing_state['logs'] = []
 
-        # Save uploaded file
         audio_dir = BASE_DIR / 'Audio'
         audio_dir.mkdir(exist_ok=True)
 
-        file_path = audio_dir / file.filename
-        file.save(str(file_path))
+        original_path = audio_dir / file.filename
+        file.save(str(original_path))
         add_log_message(f"📥 Uploading: {file.filename}", slot)
 
-        # Separate stems using mashup_engine
+        # Convert to WAV (timestamp-prefixed so slot 0/1 uploading files with
+        # the same name never collide, and so re-uploading the same filename
+        # doesn't clobber a file the other song might still be using).
+        add_log_message("🔄 Converting to WAV...", slot)
+        wav_filename = f"{int(time.time() * 1000)}_{Path(file.filename).stem}.wav"
+        wav_path = audio_dir / wav_filename
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(original_path), "-ar", "44100", str(wav_path)],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"WAV conversion failed: {result.stderr[-500:]}")
+
+        add_log_message("✅ Ready -- choose how to process this song", slot)
+
+        return jsonify({
+            'wav_filename': wav_filename,
+            'filename': file.filename
+        })
+    except Exception as e:
+        logging.error(f"Upload/conversion failed: {e}", exc_info=True)
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
+
+@app.route('/api/process-song', methods=['POST'])
+def process_song():
+    """Step 2: the user has chosen 'as_is' or 'align' for the WAV produced
+    by /api/upload-audio -- run that (optional) beatgrid alignment, then BPM
+    and key detection, then Demucs stem separation."""
+    data = request.json or {}
+    wav_filename = data.get('wav_filename')
+    filename = data.get('filename', wav_filename)
+    slot = data.get('slot')
+    mode = data.get('mode', 'as_is')
+
+    if not wav_filename:
+        return jsonify({'error': 'Missing wav_filename'}), 400
+
+    try:
+        import shutil
+        import time
+
+        audio_dir = BASE_DIR / 'Audio'
+        file_path = audio_dir / wav_filename
+        if not file_path.exists():
+            return jsonify({'error': f'Uploaded WAV not found: {wav_filename}'}), 400
+
         from mashup_engine import MashupEngine
         engine = MashupEngine()
+
+        if mode == 'align':
+            add_log_message("🎯 Aligning beatgrid (correcting tempo drift)...", slot)
+            try:
+                aligned_path = audio_dir / f"aligned_{file_path.stem}.wav"
+                _, orig_bpm, _orig_anchor = engine.align_beatgrid(str(file_path), str(aligned_path))
+                file_path = aligned_path
+                add_log_message(f"✅ Beatgrid aligned (was {orig_bpm:.1f} BPM with drift)", slot)
+            except Exception as e:
+                logging.error(f"Beatgrid alignment failed: {e}", exc_info=True)
+                add_log_message(f"⚠️ Beatgrid alignment failed, continuing without it: {e}", slot)
 
         # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
         add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...", slot)
@@ -89,8 +148,6 @@ def separate_stems():
 
         add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
 
-        # Separate stems from the ORIGINAL file (not processed)
-        # The user will request processing later if needed
         add_log_message("🔊 Separating stems using Demucs AI...", slot)
         stem_dict = engine.separate_stems([str(file_path)])[0]
 
@@ -125,7 +182,7 @@ def separate_stems():
             'bpm': round(bpm, 1),
             'beat_anchor': beat_anchor,
             'key': key_name,
-            'filename': file.filename,
+            'filename': filename,
             'timestamp': timestamp
         })
     except Exception as e:
@@ -139,17 +196,16 @@ def serve_audio(filepath):
     audio_dir = BASE_DIR / 'Audio' / 'stems'
     file_path = audio_dir / filepath
 
-    logging.info(f"[Audio] Requested: {filepath}")
-    logging.info(f"[Audio] Looking in: {audio_dir}")
-    logging.info(f"[Audio] Full path: {file_path}")
-    logging.info(f"[Audio] Exists: {file_path.exists()}")
+    # This route is on the hot path for up to 14 concurrent streaming <audio>
+    # elements, each issuing many range requests over the course of playback.
+    # Logging on every request here (this used to be 4-6 log lines each,
+    # including a duplicate exists() stat) contends for Python's logging lock
+    # under that concurrency and was contributing to stems randomly stalling.
+    if not file_path.exists():
+        logging.error(f"Audio file not found: {file_path}")
+        return jsonify({'error': 'File not found'}), 404
 
-    if file_path.exists():
-        logging.info(f"✅ Serving: {filepath}")
-        return send_from_directory(str(audio_dir), filepath, mimetype='audio/wav')
-
-    logging.error(f"❌ Not found: {file_path}")
-    return jsonify({'error': 'File not found'}), 404
+    return send_from_directory(str(audio_dir), filepath, mimetype='audio/wav')
 
 
 # ===== Audio Stats =====
@@ -755,4 +811,11 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True, threaded=True)
+    # Werkzeug's built-in dev server (app.run) is documented as unfit for
+    # production and, in practice here, would leave roughly half of the 14
+    # concurrent streaming <audio> connections (7 stems x 2 songs) hung at
+    # HAVE_METADATA forever -- never serviced, regardless of threaded=True.
+    # Waitress is a real WSGI server with a proper connection/thread pool and
+    # is pure-Python (works the same on Windows/Mac/Linux, no extra deps).
+    from waitress import serve
+    serve(app, host='127.0.0.1', port=5000, threads=32)

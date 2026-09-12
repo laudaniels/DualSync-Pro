@@ -160,42 +160,52 @@ class MashupEngine:
             shutil.move(padded_path, path)
             logging.info(f"🩹 Padded {name}: {durations[name]:.3f}s → {target:.3f}s")
 
+    def _detect_beats_essentia(self, song_path, min_bpm=40, max_bpm=208):
+        """Detect BPM and every individual beat position using Essentia's
+        RhythmExtractor2013 (combines multiple beat-tracking algorithms;
+        madmom would have been the neural-net alternative here, but it
+        doesn't even install in this project's environment -- see
+        requirements.txt).
+
+        Returns (bpm, beat_anchor, ticks) where `ticks` is every detected
+        beat timestamp in seconds (needed for per-beat beatgrid alignment,
+        not just the single average BPM analyze_track() used to return).
+        Raises on failure -- callers fall back to Librosa.
+        """
+        import logging
+        from essentia.standard import MonoLoader, RhythmExtractor2013
+
+        loader = MonoLoader(filename=str(song_path))
+        audio = loader()
+
+        rhythm = RhythmExtractor2013(method='multifeature', minTempo=int(min_bpm), maxTempo=int(max_bpm))
+        bpm, ticks, confidence, _estimates, _bpm_intervals = rhythm(audio)
+
+        if len(ticks) < 2:
+            raise RuntimeError("Essentia detected fewer than 2 beats")
+
+        beat_anchor = float(ticks[0])
+        logging.info(f"✅ Essentia BPM: {bpm:.1f}, beat anchor: {beat_anchor:.2f}s, "
+                     f"beats: {len(ticks)}, confidence: {confidence:.2f}")
+        return float(bpm), beat_anchor, list(ticks)
+
     def analyze_track(self, song_path):
         """Estimate a track's tempo (BPM) and a reference beat position.
 
-        Uses Madmom neural network for improved accuracy (±0.5 BPM vs ±2-3 BPM).
-        Falls back to Librosa if Madmom unavailable.
+        Uses Essentia's RhythmExtractor2013 for improved accuracy over a
+        single-pass Librosa estimate. Falls back to Librosa if Essentia
+        is unavailable or fails on this file.
 
         Multi-pass: samples 3 sections of track and returns median BPM for robustness.
         """
         import logging
         import numpy as np
 
-        # Try Madmom first (better accuracy)
         try:
-            from madmom.features.beats import RNNBeatProcessor, BeatTrackingProcessor
-
-            logging.info(f"Using Madmom for BPM detection: {song_path}")
-            processor = RNNBeatProcessor()
-            beat_detector = BeatTrackingProcessor()
-
-            # Process audio
-            activations = processor(str(song_path))
-            beats = beat_detector(activations)
-
-            if len(beats) > 0:
-                # Calculate BPM from beat intervals
-                beat_intervals = np.diff(beats[:min(100, len(beats))])
-                tempo = 60.0 / np.median(beat_intervals) if np.median(beat_intervals) > 0 else 120.0
-                beat_anchor = float(beats[0])
-
-                logging.info(f"✅ Madmom BPM: {tempo:.1f}, beat anchor: {beat_anchor:.2f}s")
-                return tempo, beat_anchor
-            else:
-                logging.warning("Madmom: No beats detected, falling back to Librosa")
-
+            bpm, beat_anchor, _ticks = self._detect_beats_essentia(song_path)
+            return bpm, beat_anchor
         except Exception as e:
-            logging.warning(f"Madmom BPM detection failed: {e}, falling back to Librosa")
+            logging.warning(f"Essentia BPM detection failed: {e}, falling back to Librosa")
 
         # Fallback to Librosa (multi-pass for robustness)
         import librosa
@@ -269,25 +279,15 @@ class MashupEngine:
             logging.error(f"Failed to load audio: {e}")
             return 120.0, 0.0, -1
 
-        # BPM detection using Madmom first (better accuracy)
+        # BPM detection using Essentia first (better accuracy than a single
+        # Librosa pass; madmom would have been the neural-net alternative
+        # here but doesn't even install in this project's environment)
         bpm = None
         beat_anchor = None
         try:
-            from madmom.features.beats import RNNBeatProcessor, BeatTrackingProcessor
-
-            logging.info("Using Madmom for BPM detection")
-            processor = RNNBeatProcessor()
-            beat_detector = BeatTrackingProcessor()
-            activations = processor(str(song_path))
-            beats = beat_detector(activations)
-
-            if len(beats) > 0:
-                beat_intervals = np.diff(beats[:min(100, len(beats))])
-                bpm = 60.0 / np.median(beat_intervals) if np.median(beat_intervals) > 0 else 120.0
-                beat_anchor = float(beats[0])
-                logging.info(f"✅ Madmom BPM: {bpm:.1f}, beat anchor: {beat_anchor:.2f}s")
+            bpm, beat_anchor, _ticks = self._detect_beats_essentia(song_path)
         except Exception as e:
-            logging.warning(f"Madmom failed: {e}, using Librosa")
+            logging.warning(f"Essentia failed: {e}, using Librosa")
 
         # Fallback to Librosa if Madmom failed or unavailable (5-pass strategy)
         if bpm is None:
@@ -436,6 +436,116 @@ class MashupEngine:
         if diff > 6:
             diff -= 12
         return diff
+
+    def align_beatgrid(self, input_path, output_path, target_bpm=None):
+        """Warp a track so every detected beat lands on a perfectly steady
+        tempo grid, correcting drift (vinyl rips, live-tracked recordings)
+        that a single constant-ratio stretch can't fix. Unlike
+        time_stretch_audio (one ratio for the whole file), this maps each
+        beat individually via rubberband's --timemap, so the correction
+        follows the track's own wobble instead of assuming a constant tempo
+        throughout. Essentia (RhythmExtractor2013) supplies the per-beat
+        positions -- it has no warping capability of its own, only rubberband
+        can actually perform the time-variant stretch.
+
+        target_bpm: if None, aligns to the track's own detected average BPM
+        (removes wobble, keeps the same overall tempo). Pass a specific BPM
+        to align and retarget tempo in one pass.
+
+        Returns (output_path, bpm, beat_anchor) -- bpm/beat_anchor are from
+        the ORIGINAL (pre-alignment) analysis, for the caller to log/store.
+
+        Raises RuntimeError if rubberband isn't installed, or if fewer than
+        2 beats were detected (nothing to align to).
+        """
+        import logging
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+        import soundfile as sf
+
+        if shutil.which("rubberband") is None:
+            raise RuntimeError(
+                "Beatgrid alignment needs the 'rubberband' command-line tool.\n"
+                "Install it with: apt-get install rubberband-cli (Linux) or "
+                "brew install rubberband (macOS)."
+            )
+
+        os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # rubberband needs WAV in/out. Detect beats on THIS SAME decoded
+            # WAV (not the original compressed file) -- MP3 decoders disagree
+            # slightly on encoder-delay/priming samples at the start of the
+            # file, so beat times measured on the raw MP3 can be offset by
+            # tens of milliseconds from sample positions in an independently
+            # ffmpeg-decoded copy, corrupting the whole timemap.
+            wav_in = tmpdir / "in.wav"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(input_path), "-ar", "44100", str(wav_in)],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Could not convert input to WAV: {result.stderr[-500:]}")
+
+            bpm, beat_anchor, ticks = self._detect_beats_essentia(str(wav_in))
+            if target_bpm is None:
+                target_bpm = bpm
+
+            info = sf.info(str(wav_in))
+            sr = info.samplerate
+            total_frames = info.frames
+
+            ideal_interval = 60.0 / target_bpm
+            first_beat = float(ticks[0])
+
+            # Timemap: (source_frame, target_frame) pairs -- anchor the file
+            # start, snap each beat to its ideal grid position, then hold the
+            # tail (after the last beat) at a constant offset so it isn't cut.
+            timemap = [(0, 0)]
+            for i, t in enumerate(ticks):
+                src = int(float(t) * sr)
+                tgt = int((first_beat + i * ideal_interval) * sr)
+                timemap.append((src, tgt))
+
+            last_src = int(float(ticks[-1]) * sr)
+            last_tgt = int((first_beat + (len(ticks) - 1) * ideal_interval) * sr)
+            tail_frames = total_frames - last_src
+            total_output_frames = last_tgt + tail_frames
+            timemap.append((total_frames, total_output_frames))
+
+            time_ratio = total_output_frames / total_frames if total_frames > 0 else 1.0
+
+            map_path = tmpdir / "timemap.txt"
+            with open(map_path, "w") as f:
+                for src, tgt in timemap:
+                    f.write(f"{src} {tgt}\n")
+
+            wav_out = tmpdir / "out.wav"
+            result = subprocess.run(
+                ["rubberband", "--timemap", str(map_path), "-t", f"{time_ratio:.10f}",
+                 str(wav_in), str(wav_out)],
+                capture_output=True, text=True, timeout=600
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"RubberBand beatgrid warp failed: {result.stderr[-500:]}")
+
+            # Encode to the requested output path/format (the rest of the
+            # pipeline feeds a plain WAV into Demucs)
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(wav_out), str(output_path)],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"Could not finalize aligned output: {result.stderr[-500:]}")
+
+        logging.info(f"🎯 Beatgrid aligned: {len(ticks)} beats -> {target_bpm:.1f} BPM steady grid "
+                     f"(time ratio {time_ratio:.4f})")
+        return str(output_path), bpm, beat_anchor
 
     def time_stretch_audio(self, input_path, output_path, target_bpm, source_bpm=None):
         """Time-stretch audio to exact target BPM with multi-pass verification.

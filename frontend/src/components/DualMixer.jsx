@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import Waveform from './Waveform';
 import SongMixer from './SongMixer';
 import { stemNames, stemLabels } from './stemConstants';
+import { DualStemPlayer } from '../audio/DualStemPlayer';
 import '../styles/DualMixer.css';
 
 export default function DualMixer() {
@@ -10,7 +11,11 @@ export default function DualMixer() {
   const [loading, setLoading] = useState([false, false]);
   const [error, setError] = useState('');
   const [playing, setPlaying] = useState(false);
-  const playingRef = useRef(false); // Mirrors `playing` for reads inside native audio event handlers (closures over state go stale there)
+  const [audioReady, setAudioReady] = useState([false, false]); // All 7 stems fetched+decoded for that slot
+  const [pendingSong, setPendingSong] = useState([null, null]); // { wavFilename, filename } after upload+convert, awaiting the as_is/align choice
+  const [processingStage, setProcessingStage] = useState([null, null]); // 'converting' | 'separating' | null -- purely cosmetic, for the loading label
+  const playerRef = useRef(null);
+  if (playerRef.current === null) playerRef.current = new DualStemPlayer();
   const [editingBpm, setEditingBpm] = useState([false, false]);
   const [editingKey, setEditingKey] = useState([false, false]);
   const [overrideBpm, setOverrideBpm] = useState([null, null]);
@@ -37,10 +42,6 @@ export default function DualMixer() {
   const logsEndRef = useRef(null);
   const currentProcessingSlotRef = useRef(0); // Which slot handleProcessAllChanges is currently on
 
-  // Web Audio API: only Song 2 is routed through this, for the beat-offset delay
-  const audioContextRef = useRef(null);
-  const audioSourcesRef = useRef({});
-  const delayNodeRef = useRef(null); // For Song 2 beat offset
   const beatSnapTimeoutRef = useRef(null); // Debounce for magnetic snap visual feedback
   const [beatOffset, setBeatOffset] = useState(0); // 0-8 beats for Song 2
   const [beatOffsetDisplay, setBeatOffsetDisplay] = useState(0); // Fine-tuned display value
@@ -48,12 +49,6 @@ export default function DualMixer() {
   const [kickWaveforms, setKickWaveforms] = useState(null); // Kick drum waveforms for display
   const [selectedStemsForWaveform, setSelectedStemsForWaveform] = useState(['kick']); // Which stems to display in waveform
   const [waveformZoom, setWaveformZoom] = useState(10); // Waveform zoom level in seconds
-
-  // Audio refs for each song's stems (with split drums)
-  const audioRefsRef = useRef({
-    0: { vocals: useRef(null), kick: useRef(null), snare: useRef(null), hihat: useRef(null), tom: useRef(null), bass: useRef(null), other: useRef(null) },
-    1: { vocals: useRef(null), kick: useRef(null), snare: useRef(null), hihat: useRef(null), tom: useRef(null), bass: useRef(null), other: useRef(null) }
-  });
 
   // Volume states for each song (with split drums)
   const [volumes, setVolumes] = useState({
@@ -163,21 +158,16 @@ export default function DualMixer() {
     return meta.bpm || '?';
   };
 
-  // Handle stem upload for a song slot
-  const handleStemsLoaded = useCallback(async (file, slot) => {
-    setLoading(prev => {
-      const updated = [...prev];
-      updated[slot] = true;
-      return updated;
-    });
+  // Step 1: a file was dropped/selected for a slot. Upload it and convert to
+  // WAV; the actual analyze/align/separate work waits for the user's
+  // as-is/align choice (see handleChooseMode).
+  const handleFileDropped = useCallback(async (file, slot) => {
+    setLoading(prev => { const updated = [...prev]; updated[slot] = true; return updated; });
     setError('');
+    setProcessingStage(prev => { const updated = [...prev]; updated[slot] = 'converting'; return updated; });
 
-    // Show filename immediately while processing
-    setMetadata(prev => {
-      const updated = [...prev];
-      updated[slot] = { filename: file.name };
-      return updated;
-    });
+    // Show filename immediately while converting
+    setMetadata(prev => { const updated = [...prev]; updated[slot] = { filename: file.name }; return updated; });
 
     console.log(`📥 Song ${slot + 1} upload started`);
 
@@ -186,10 +176,57 @@ export default function DualMixer() {
       formData.append('file', file);
       formData.append('slot', slot);
 
-      console.log(`🔄 Uploading Song ${slot + 1} for stem separation...`);
-      const response = await fetch('/api/separate-stems', {
+      console.log(`🔄 Uploading + converting Song ${slot + 1} to WAV...`);
+      const response = await fetch('/api/upload-audio', {
         method: 'POST',
         body: formData
+      });
+
+      if (!response.ok) throw new Error(`Server error: ${response.status}`);
+
+      const data = await response.json();
+      console.log(`✅ Song ${slot + 1} ready for processing choice:`, data);
+
+      setPendingSong(prev => {
+        const updated = [...prev];
+        updated[slot] = { wavFilename: data.wav_filename, filename: data.filename };
+        return updated;
+      });
+    } catch (err) {
+      console.error(`❌ Error:`, err);
+      setError(`Error uploading Song ${slot + 1}: ${err.message}`);
+    } finally {
+      setLoading(prevLoading => {
+        const updated = [...prevLoading];
+        updated[slot] = false;
+        return updated;
+      });
+      setProcessingStage(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
+    }
+  }, []);
+
+  // Step 2: the user picked 'as_is' or 'align' for the converted WAV -- run
+  // the (optional) beatgrid alignment, BPM/key analysis, and stem separation.
+  const handleChooseMode = useCallback(async (slot, mode) => {
+    const pending = pendingSong[slot];
+    if (!pending) return;
+
+    setLoading(prev => { const updated = [...prev]; updated[slot] = true; return updated; });
+    setPendingSong(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
+    setError('');
+    setProcessingStage(prev => { const updated = [...prev]; updated[slot] = mode; return updated; });
+
+    try {
+      console.log(`🔊 Processing Song ${slot + 1} (mode: ${mode})...`);
+      const response = await fetch('/api/process-song', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          wav_filename: pending.wavFilename,
+          filename: pending.filename,
+          slot,
+          mode
+        })
       });
 
       if (!response.ok) throw new Error(`Server error: ${response.status}`);
@@ -210,116 +247,57 @@ export default function DualMixer() {
         return newMetadata;
       });
 
-      // Set audio sources
+      // Fetch + decode every stem into an AudioBuffer up front, so Play can
+      // just schedule already-in-memory buffers instead of relying on 14
+      // concurrent streaming connections (browsers cap that at 6 per origin).
       console.log(`🎵 Song ${slot + 1} stems received:`, Object.keys(data.stems));
-      Object.entries(data.stems).forEach(([stemName, url]) => {
-        if (audioRefsRef.current[slot][stemName]?.current) {
-          audioRefsRef.current[slot][stemName].current.src = url;
-          audioRefsRef.current[slot][stemName].current.load();
-          console.log(`✅ Loaded ${stemName} for Song ${slot + 1}: ${url}`);
-        } else {
-          console.warn(`⚠️ No audio ref for ${stemName} on Song ${slot + 1}`);
+      setAudioReady(prev => { const updated = [...prev]; updated[slot] = false; return updated; });
+      await Promise.all(Object.entries(data.stems).map(async ([stemName, url]) => {
+        try {
+          await playerRef.current.loadStem(slot, stemName, url);
+          console.log(`✅ Decoded ${stemName} for Song ${slot + 1}: ${url}`);
+        } catch (err) {
+          console.error(`❌ Could not load ${stemName} for Song ${slot + 1}:`, err);
         }
+      }));
+      setAudioReady(prev => {
+        const updated = [...prev];
+        updated[slot] = playerRef.current.isSlotReady(slot, stemNames);
+        return updated;
       });
 
       // Refresh stats
       fetchStats();
     } catch (err) {
       console.error(`❌ Error:`, err);
-      setError(`Error loading Song ${slot + 1}: ${err.message}`);
+      setError(`Error processing Song ${slot + 1}: ${err.message}`);
+      // Restore the pending choice so the user can retry without re-uploading
+      setPendingSong(prev => { const updated = [...prev]; updated[slot] = pending; return updated; });
     } finally {
       setLoading(prevLoading => {
         const updated = [...prevLoading];
         updated[slot] = false;
         return updated;
       });
+      setProcessingStage(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
     }
-  }, [fetchStats]);
+  }, [pendingSong, fetchStats]);
 
-  // Play/pause both songs
-  // Resolves once an element has enough buffered data to play through
-  // smoothly (HAVE_FUTURE_DATA), or after a timeout so one slow-loading stem
-  // can't block the rest from ever starting.
-  const waitUntilReady = (audioEl) => new Promise(resolve => {
-    if (audioEl.readyState >= 3) { resolve(); return; }
-    const cleanup = () => {
-      audioEl.removeEventListener('canplay', onReady);
-      clearTimeout(timer);
-    };
-    const onReady = () => { cleanup(); resolve(); };
-    audioEl.addEventListener('canplay', onReady, { once: true });
-    const timer = setTimeout(() => { cleanup(); resolve(); }, 3000);
-  });
 
-  const togglePlayback = async () => {
+  // Play/pause both songs. All 14 stems are already fully decoded into
+  // AudioBuffers (see handleStemsLoaded), so this just schedules playback --
+  // no per-stem network readiness to wait on anymore.
+  const togglePlayback = () => {
     if (playing) {
-      // Set this BEFORE pausing -- each .pause() call below fires a native
-      // 'pause' event synchronously, and the auto-recovery handler on each
-      // <audio> element checks this ref to tell an intentional pause apart
-      // from a stem stalling out on its own.
-      playingRef.current = false;
-
-      // Pause and maintain position for resume
-      [0, 1].forEach(slot => {
-        stemNames.forEach(stem => {
-          if (audioRefsRef.current[slot][stem]?.current) {
-            audioRefsRef.current[slot][stem].current.pause();
-            // Keep currentTime so it resumes from same position
-          }
-        });
-      });
+      playerRef.current.pause();
       setPlaying(false);
     } else {
-      playingRef.current = true;
-      setPlaying(true); // Optimistic -- flips the button to PAUSE immediately, the wait below is normally sub-frame
-
-      // Web Audio is only needed for Song 2 (the beat-offset delay node) --
-      // create/resume it here, inside the click handler, so it always runs
-      // in the same user-gesture call stack instead of racing a separate
-      // "first click anywhere" listener.
-      const audioContext = initAudioContext();
-      if (audioContext?.state === 'suspended') {
-        audioContext.resume();
-      }
-      connectSong2Sources();
-
-      // Wait for every stem to be sufficiently buffered before playing ANY of
-      // them -- otherwise whichever stems happen to be less-buffered at this
-      // exact instant start audibly later than the rest instead of together.
-      const elementsToPlay = [];
-      [0, 1].forEach(slot => {
-        stemNames.forEach(stem => {
-          const audioEl = audioRefsRef.current[slot][stem]?.current;
-          if (audioEl && audioEl.src) {
-            elementsToPlay.push({ slot, stem, audioEl });
-          } else {
-            console.warn(`⚠️ Song ${slot + 1} ${stem}: no src or element missing`);
-          }
-        });
-      });
-      await Promise.all(elementsToPlay.map(({ audioEl }) => waitUntilReady(audioEl)));
-
-      // Play all loaded stems
-      const crossfadePercent = crossfader / 100;
-      const song1Volume = 1 - crossfadePercent; // 1 at 0%, 0 at 100%
-      const song2Volume = crossfadePercent; // 0 at 0%, 1 at 100%
-      const loadedCount = { 0: 0, 1: 0 };
-
-      elementsToPlay.forEach(({ slot, stem, audioEl }) => {
-        const masterVol = slot === 0 ? song1Volume : song2Volume;
-        const stemVol = volumes[slot]?.[stem] ?? 1.0;
-        audioEl.volume = masterVol * stemVol;
-        audioEl.playbackRate = 1.0; // Clear any leftover drift-correction nudge from a previous session
-        // AbortError here just means pause() was called before this play()
-        // promise settled -- expected whenever the user pauses quickly, not
-        // a real failure.
-        audioEl.play().catch(e => {
-          if (e.name !== 'AbortError') console.error(`Play error (Song ${slot + 1} ${stem}):`, e);
-        });
-        loadedCount[slot]++;
-      });
-      console.log(`▶️ Playing Song 1: ${loadedCount[0]}/${stemNames.length} stems loaded`);
-      console.log(`▶️ Playing Song 2: ${loadedCount[1]}/${stemNames.length} stems loaded`);
+      // ensureContext()/play() must run synchronously in this click handler
+      // (no await before them) -- creating/resuming an AudioContext requires
+      // a live user-gesture call stack.
+      playerRef.current.ensureContext();
+      playerRef.current.play(stemNames);
+      setPlaying(true);
     }
   };
 
@@ -329,36 +307,13 @@ export default function DualMixer() {
       ...prev,
       [slot]: { ...prev[slot], [stem]: value }
     }));
-
-    if (playing && audioRefsRef.current[slot][stem]?.current) {
-      const crossfadePercent = crossfader / 100;
-      const masterVol = slot === 0 ? (1 - crossfadePercent) : crossfadePercent;
-      audioRefsRef.current[slot][stem].current.volume = masterVol * value;
-    }
-  }, [playing, crossfader]);
+    playerRef.current.setVolume(slot, stem, value);
+  }, []);
 
   // Update crossfader
   const handleCrossfaderChange = (value) => {
     setCrossfader(value);
-
-    if (playing) {
-      const crossfadePercent = value / 100;
-      const song1Volume = 1 - crossfadePercent;
-      const song2Volume = crossfadePercent;
-      console.log(`🎚️ Crossfader: Song1=${song1Volume.toFixed(2)}, Song2=${song2Volume.toFixed(2)}`);
-
-      [0, 1].forEach(slot => {
-        const masterVol = slot === 0 ? song1Volume : song2Volume;
-        console.log(`   Slot ${slot}: masterVol=${masterVol.toFixed(2)}`);
-        stemNames.forEach(stem => {
-          const audioEl = audioRefsRef.current[slot][stem]?.current;
-          if (audioEl && audioEl.src) {
-            const stemVol = volumes[slot]?.[stem] ?? 1.0;
-            audioEl.volume = masterVol * stemVol;
-          }
-        });
-      });
-    }
+    playerRef.current.setCrossfader(value);
   };
 
   const handleSeek = (e) => {
@@ -370,218 +325,64 @@ export default function DualMixer() {
     const percentage = clickX / rect.width;
     const newTime = percentage * duration;
 
-    // Seek all audio elements
-    stemNames.forEach(stem => {
-      [0, 1].forEach(slot => {
-        const audioEl = audioRefsRef.current[slot][stem]?.current;
-        if (audioEl) {
-          audioEl.currentTime = newTime;
-        }
-      });
-    });
-
+    playerRef.current.seek(newTime, stemNames);
     setCurrentTime(newTime);
   };
 
-  // Track progress
+  // Track progress. Playback loops natively now (AudioBufferSourceNode.loop
+  // with loopEnd set to the reference duration), so there's no boundary to
+  // detect and no manual restart to do -- getPosition() already wraps via
+  // modulo, this just mirrors it into state for the progress bar/Waveform.
   useEffect(() => {
     if (!playing) return;
 
     const interval = setInterval(() => {
-      if (audioRefsRef.current[0].vocals?.current) {
-        const ct = audioRefsRef.current[0].vocals.current.currentTime;
-        const dur = audioRefsRef.current[0].vocals.current.duration || 0;
-        setCurrentTime(ct);
-        setDuration(dur);
-
-        if (ct >= dur - 0.1) {
-          // Auto-loop: restart playback
-          setCurrentTime(0);
-          [0, 1].forEach(slot => {
-            stemNames.forEach(stem => {
-              if (audioRefsRef.current[slot][stem]?.current) {
-                audioRefsRef.current[slot][stem].current.currentTime = 0;
-                audioRefsRef.current[slot][stem].current.playbackRate = 1.0;
-                audioRefsRef.current[slot][stem].current.play().catch(() => {});
-              }
-            });
-          });
-        }
-      }
-    }, 250);
+      setCurrentTime(playerRef.current.getPosition());
+      setDuration(playerRef.current.getReferenceDuration());
+    }, 100);
 
     return () => clearInterval(interval);
   }, [playing]);
 
-  // Keep each song's 7 stems phase-locked to each other in real time. A stem
-  // can hit a network 'waiting' stall the others don't, and once that
-  // happens its currentTime permanently lags behind -- nothing used to pull
-  // it back until the next full loop reset. This runs independently of
-  // React state (straight DOM reads/writes on the audio refs) so it can
-  // tick fast without triggering re-renders.
-  useEffect(() => {
-    if (!playing) return;
-
-    const HARD_SNAP_THRESHOLD = 0.1;  // seconds of drift -- audible, snap immediately
-    const NUDGE_THRESHOLD = 0.03;     // seconds of drift -- correct gently instead
-    const NUDGE_RATE = 0.05;          // +/-5% playback speed while nudging
-
-    const syncSlot = (slot) => {
-      const activeEls = stemNames
-        .map(stem => audioRefsRef.current[slot]?.[stem]?.current)
-        .filter(el => el && el.src && !el.paused && !el.seeking);
-
-      if (activeEls.length < 2) return;
-
-      // Nothing can get ahead of real time -- only fall behind via a stall --
-      // so the furthest-progressed stem is the one to trust, whichever it is.
-      const referenceTime = Math.max(...activeEls.map(el => el.currentTime));
-
-      activeEls.forEach(el => {
-        const drift = referenceTime - el.currentTime; // >= 0
-        if (drift > HARD_SNAP_THRESHOLD) {
-          el.currentTime = referenceTime;
-          el.playbackRate = 1.0;
-        } else if (drift > NUDGE_THRESHOLD) {
-          el.playbackRate = 1 + NUDGE_RATE;
-        } else if (el.playbackRate !== 1.0) {
-          el.playbackRate = 1.0;
-        }
-      });
-    };
-
-    const syncInterval = setInterval(() => {
-      syncSlot(0);
-      syncSlot(1);
-    }, 100);
-
-    return () => clearInterval(syncInterval);
-  }, [playing]);
-
-  // Create (or reuse) the shared AudioContext + Song 2 delay node. Idempotent,
-  // and safe to call from inside a click handler -- creating/resuming an
-  // AudioContext must happen within a user-gesture call stack, so this is
-  // called directly from togglePlayback() rather than a mount-time effect
-  // racing against whenever `stems` last changed.
-  const initAudioContext = () => {
-    if (!audioContextRef.current) {
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        audioContextRef.current = ctx;
-        delayNodeRef.current = ctx.createDelay(8); // Max 8 seconds
-        delayNodeRef.current.connect(ctx.destination);
-        console.log('🎵 Audio context created:', ctx.state);
-      } catch (e) {
-        console.error('Audio context init failed:', e);
-      }
-    }
-    return audioContextRef.current;
-  };
-
-  // Route Song 2's stems through the delay node so the beat-offset slider can
-  // shift them in time. Song 1 plays natively (see togglePlayback) -- it
-  // never needs Web Audio, so only 7 of the 14 stem elements are ever
-  // captured into the graph, halving the surface area for a stray
-  // createMediaElementSource/connect() failure to silence a stem.
-  const connectSong2Sources = () => {
-    const audioContext = audioContextRef.current;
-    if (!audioContext || !delayNodeRef.current) return;
-
-    for (let stem of stemNames) {
-      const audioEl = audioRefsRef.current[1]?.[stem]?.current;
-      const key = `1-${stem}`;
-
-      if (audioEl?.src && !audioSourcesRef.current[key]) {
-        try {
-          const source = audioContext.createMediaElementSource(audioEl);
-          source.connect(delayNodeRef.current);
-          audioSourcesRef.current[key] = source;
-          console.log(`🎵 Song 2 ${stem} connected to beat-offset delay`);
-        } catch (e) {
-          console.error(`Could not connect Song 2 ${stem} to the beat-offset graph:`, e);
-        }
-      }
-    }
-  };
-
   // Update beat offset delay in real-time
   useEffect(() => {
-    if (!audioContextRef.current || !delayNodeRef.current) return;
-
-    // Get Song 2's BPM from metadata
     const song2BpmStr = metadata[1]?.bpm ? String(metadata[1].bpm) : '120';
     const song2Bpm = parseFloat(song2BpmStr.split('-')[0]) || 120;
-
-    // Calculate delay in seconds: (beats / BPM) * 60
-    const delaySeconds = beatOffset > 0 ? (beatOffset / song2Bpm) * 60 : 0;
-
-    try {
-      // Update delay time with smooth ramping
-      delayNodeRef.current.delayTime.setValueAtTime(
-        Math.max(0, Math.min(delaySeconds, 8)), // Clamp between 0-8 seconds
-        audioContextRef.current.currentTime
-      );
-
-      if (beatOffset > 0) {
-        console.log(`⏱️ Beat offset: ${beatOffset} beats @ ${song2Bpm} BPM = ${delaySeconds.toFixed(3)}s`);
-      }
-    } catch (e) {
-      console.warn('Could not update delay time:', e);
-    }
+    playerRef.current.setBeatOffset(beatOffset, song2Bpm);
   }, [beatOffset, metadata]);
 
-  // Load waveforms for selected stems
+  // Load waveforms for selected stems -- reuses the AudioBuffers already
+  // decoded for playback (see handleStemsLoaded) instead of re-fetching and
+  // re-decoding the same files a second time just for the display.
   useEffect(() => {
-    if (!metadata[0] && !metadata[1]) return;
+    if (!audioReady[0] && !audioReady[1]) return;
     if (!selectedStemsForWaveform.length) return;
 
-    const loadStemWaveforms = async () => {
-      try {
-        const context = initAudioContext();
-        if (!context) return;
-        const waveformData = { stems: {}, duration: 0 };
+    const waveformData = { stems: {}, duration: 0 };
 
-        // Load waveforms for selected stems, both songs
-        for (let stem of selectedStemsForWaveform) {
-          waveformData.stems[stem] = { data1: null, data2: null };
+    for (const stem of selectedStemsForWaveform) {
+      waveformData.stems[stem] = { data1: null, data2: null };
 
-          for (let slot = 0; slot < 2; slot++) {
-            if (!metadata[slot]?.timestamp) continue;
+      for (let slot = 0; slot < 2; slot++) {
+        const audioBuffer = playerRef.current.buffers[slot]?.[stem];
+        if (!audioBuffer) continue;
 
-            const stemUrl = `/api/audio/${metadata[slot].timestamp}/${stem}.wav`;
-
-            try {
-              const response = await fetch(stemUrl);
-              const arrayBuffer = await response.arrayBuffer();
-              const audioBuffer = await context.decodeAudioData(arrayBuffer);
-
-              const rawData = audioBuffer.getChannelData(0);
-              const samples = Math.min(rawData.length, 2048); // Limit samples for display
-              const stemData = new Float32Array(samples);
-
-              for (let i = 0; i < samples; i++) {
-                stemData[i] = rawData[Math.floor((i / samples) * rawData.length)];
-              }
-
-              waveformData.stems[stem][`data${slot + 1}`] = stemData;
-              waveformData.duration = Math.max(waveformData.duration, audioBuffer.duration);
-              console.log(`✅ Loaded ${stem} waveform for Song ${slot + 1}`);
-            } catch (e) {
-              console.warn(`Could not load ${stem} for Song ${slot + 1}:`, e.message);
-            }
-          }
+        const rawData = audioBuffer.getChannelData(0);
+        const samples = Math.min(rawData.length, 2048); // Limit samples for display
+        const stemData = new Float32Array(samples);
+        for (let i = 0; i < samples; i++) {
+          stemData[i] = rawData[Math.floor((i / samples) * rawData.length)];
         }
 
-        if (Object.keys(waveformData.stems).length > 0) {
-          setKickWaveforms(waveformData);
-        }
-      } catch (e) {
-        console.warn('Waveform loading failed:', e);
+        waveformData.stems[stem][`data${slot + 1}`] = stemData;
+        waveformData.duration = Math.max(waveformData.duration, audioBuffer.duration);
       }
-    };
+    }
 
-    loadStemWaveforms();
-  }, [metadata, selectedStemsForWaveform]);
+    if (Object.keys(waveformData.stems).length > 0) {
+      setKickWaveforms(waveformData);
+    }
+  }, [audioReady, metadata, selectedStemsForWaveform]);
 
   const formatTime = (seconds) => {
     const mins = Math.floor(seconds / 60);
@@ -743,13 +544,13 @@ export default function DualMixer() {
           return newMetadata;
         });
 
-        // Update audio refs to use processed stems
-        Object.entries(data.processed_stems).forEach(([stemName, url]) => {
-          if (audioRefsRef.current[slot][stemName]?.current) {
-            audioRefsRef.current[slot][stemName].current.src = url;
-            audioRefsRef.current[slot][stemName].current.load();
-          }
-        });
+        // Re-fetch + re-decode the processed stems, replacing the buffers
+        // used for playback (the backend already confirms the files are
+        // fully written before responding, so no artificial delay needed).
+        await Promise.all(Object.entries(data.processed_stems).map(([stemName, url]) =>
+          playerRef.current.loadStem(slot, stemName, url).catch(err =>
+            console.error(`Could not reload processed ${stemName} for Song ${slot + 1}:`, err))
+        ));
 
         setTransposedStems(prev => {
           const n = [...prev];
@@ -761,16 +562,6 @@ export default function DualMixer() {
           n[slot] = data.processed_stems;
           return n;
         });
-
-        // Update audio refs only after small delay to ensure files are written
-        setTimeout(() => {
-          Object.entries(data.processed_stems).forEach(([stemName, url]) => {
-            if (audioRefsRef.current[slot][stemName]?.current) {
-              audioRefsRef.current[slot][stemName].current.src = url;
-              audioRefsRef.current[slot][stemName].current.load();
-            }
-          });
-        }, 500);
 
         setTransposingStatus(prev => {
           const n = [...prev];
@@ -921,10 +712,12 @@ export default function DualMixer() {
       if (response.ok) {
         alert('✅ Cleanup complete! All audio files deleted.');
         // Reset state
+        playerRef.current.reset();
         setStems([null, null]);
         setMetadata([null, null]);
         setLoading([false, false]);
-        playingRef.current = false;
+        setAudioReady([false, false]);
+        setPendingSong([null, null]);
         setPlaying(false);
         setCurrentTime(0);
         setDuration(0);
@@ -938,16 +731,6 @@ export default function DualMixer() {
       alert(`❌ Error: ${err.message}`);
     }
   };
-
-  // Diagnostic logging for stem dropouts -- 'waiting' (buffer underrun) and
-  // 'stalled' (network not delivering data) fire with no error and no visual
-  // change, so without this a stem going silent mid-playback leaves no trace.
-  const logStemEvent = useCallback((slot, stem, eventName, target) => {
-    console.warn(
-      `🩺 [${new Date().toISOString().slice(11, 23)}] Song ${slot + 1} ${stem}: ${eventName}`,
-      { currentTime: target.currentTime.toFixed(2), readyState: target.readyState, networkState: target.networkState, paused: target.paused }
-    );
-  }, []);
 
   return (
     <div className="dual-mixer">
@@ -974,14 +757,15 @@ export default function DualMixer() {
               effectiveBpm={getEffectiveBpm(slot)}
               effectiveKey={getEffectiveKey(slot)}
               volumes={volumes[slot]}
-              audioRefs={audioRefsRef.current[slot]}
-              playingRef={playingRef}
-              logStemEvent={logStemEvent}
+              audioReady={audioReady[slot]}
+              pendingSong={pendingSong[slot]}
+              processingStage={processingStage[slot]}
               onBpmOverride={handleBpmOverride}
               onKeyOverride={handleKeyOverride}
               onToggleEditingBpm={toggleEditingBpm}
               onToggleEditingKey={toggleEditingKey}
-              onStemsLoaded={handleStemsLoaded}
+              onFileDropped={handleFileDropped}
+              onChooseMode={handleChooseMode}
               onVolumeChange={handleVolumeChange}
             />
           ))}
@@ -1059,13 +843,13 @@ export default function DualMixer() {
               <button
                 onClick={togglePlayback}
                 className="play-btn"
-                disabled={isProcessing || isTransposing}
+                disabled={isProcessing || isTransposing || !audioReady[0] || !audioReady[1]}
                 style={{
-                  opacity: (isProcessing || isTransposing) ? 0.5 : 1,
-                  cursor: (isProcessing || isTransposing) ? 'not-allowed' : 'pointer'
+                  opacity: (isProcessing || isTransposing || !audioReady[0] || !audioReady[1]) ? 0.5 : 1,
+                  cursor: (isProcessing || isTransposing || !audioReady[0] || !audioReady[1]) ? 'not-allowed' : 'pointer'
                 }}
               >
-                {playing ? '⏸ PAUSE' : '▶ PLAY BOTH'}
+                {!audioReady[0] || !audioReady[1] ? '⏳ Preparing audio...' : playing ? '⏸ PAUSE' : '▶ PLAY BOTH'}
               </button>
 
               <div

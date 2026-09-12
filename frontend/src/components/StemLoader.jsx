@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
 
-export default function StemLoader({ onStemsLoaded, loading }) {
+export default function StemLoader({ onStemsLoaded, loading, loadingLabel = 'Separating stems... (this may take a minute)' }) {
   const fileInputRef = useRef(null);
 
   const handleFileSelect = (e) => {
@@ -73,7 +73,7 @@ export default function StemLoader({ onStemsLoaded, loading }) {
       {loading ? (
         <div className="loader">
           <div className="spinner"></div>
-          <p>Separating stems... (this may take a minute)</p>
+          <p>{loadingLabel}</p>
         </div>
       ) : (
         <>

@@ -9,6 +9,9 @@ flask-cors
 scipy
 soundfile
 mutagen
+waitress
 
-# Note: Madmom removed (Python 3.12 incompatibility with pkg_resources)
+# Note: Madmom removed (doesn't install here -- pkg_resources incompatibility).
+#       Essentia's RhythmExtractor2013 replaces it for all beat/BPM detection.
 # Note: RubberBand is CLI tool, install via: apt-get/brew install rubberband-cli
+#       Needed only for the optional "Align beatgrid" per-song feature.
