@@ -1,7 +1,5 @@
 # Screenshots
 
-Drop the following screenshots in this folder with these exact filenames — the main `README.md` already links to them:
-
 | File | Description |
 |---|---|
 | `01-intro-screen.png` | The intro/upload screen when you first open DualSync Pro |
