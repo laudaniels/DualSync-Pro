@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import Waveform from './Waveform';
 import SongMixer from './SongMixer';
 import { stemNames, stemLabels } from './stemConstants';
+import { getKeyRecommendations, camelotCode, camelotDistanceBetween } from './camelotWheel';
 import { DualStemPlayer } from '../audio/DualStemPlayer';
 import '../styles/DualMixer.css';
 
@@ -43,8 +44,17 @@ export default function DualMixer() {
   const currentProcessingSlotRef = useRef(0); // Which slot handleProcessAllChanges is currently on
 
   const beatSnapTimeoutRef = useRef(null); // Debounce for magnetic snap visual feedback
-  const [beatOffset, setBeatOffset] = useState(0); // 0-8 beats for Song 2
-  const [beatOffsetDisplay, setBeatOffsetDisplay] = useState(0); // Fine-tuned display value
+  // Slider's own unit is BARS (0-32) -- far more precise to drag/snap at
+  // this range than raw beats were (0.15 BEATS used to be the magnetic-snap
+  // threshold when the max was 8 beats; at 128 beats that threshold became
+  // smaller than a single pixel of slider drag, so snapping silently never
+  // fired). beatOffset (derived below, x4) is what the player/render still
+  // consume, since those work in beats.
+  const [barOffset, setBarOffset] = useState(0); // 0-32 bars for Song 2
+  const [barOffsetDisplay, setBarOffsetDisplay] = useState(0); // Fine-tuned display value
+  const beatOffset = barOffset * 4; // what the player/render actually consume
+  const [driftCorrection, setDriftCorrection] = useState(50); // 0-100, live playbackRate drift correction strength for Song 2
+  const [driftInfo, setDriftInfo] = useState({ instantaneousMs: 0, cumulativeBeats: 0 }); // live readout, polled from the player while playing
   const [isSnappedToBeat, setIsSnappedToBeat] = useState(false); // Visual feedback for snap
   const [kickWaveforms, setKickWaveforms] = useState(null); // Kick drum waveforms for display
   const [selectedStemsForWaveform, setSelectedStemsForWaveform] = useState(['kick']); // Which stems to display in waveform
@@ -75,16 +85,16 @@ export default function DualMixer() {
     fetchStats();
   }, [fetchStats]);
 
-  // Magnetic snap behavior for beat offset
+  // Magnetic snap behavior for beat offset -- snaps to the nearest whole BAR
+  // now (not beat), since that's the slider's own unit at this range.
   React.useEffect(() => {
-    // Check if within 0.1 of a whole beat
-    const nearestBeat = Math.round(beatOffsetDisplay);
-    const snapThreshold = 0.15;
-    const distanceToNearestBeat = Math.abs(beatOffsetDisplay - nearestBeat);
+    const nearestBar = Math.round(barOffsetDisplay);
+    const snapThreshold = 0.1;
+    const distanceToNearestBar = Math.abs(barOffsetDisplay - nearestBar);
 
-    if (distanceToNearestBeat < snapThreshold && nearestBeat >= 0 && nearestBeat <= 8) {
-      // Snap to beat
-      setBeatOffset(nearestBeat);
+    if (distanceToNearestBar < snapThreshold && nearestBar >= 0 && nearestBar <= 32) {
+      // Snap to bar
+      setBarOffset(nearestBar);
       setIsSnappedToBeat(true);
 
       // Clear previous timeout
@@ -97,8 +107,8 @@ export default function DualMixer() {
         setIsSnappedToBeat(false);
       }, 200);
     } else {
-      // Not near a beat, just update beatOffset directly
-      setBeatOffset(parseFloat(beatOffsetDisplay.toFixed(1)));
+      // Not near a bar, just update barOffset directly
+      setBarOffset(parseFloat(barOffsetDisplay.toFixed(2)));
       setIsSnappedToBeat(false);
     }
 
@@ -107,7 +117,7 @@ export default function DualMixer() {
         clearTimeout(beatSnapTimeoutRef.current);
       }
     };
-  }, [beatOffsetDisplay]);
+  }, [barOffsetDisplay]);
 
   // Poll for processing logs while loading
   React.useEffect(() => {
@@ -128,12 +138,21 @@ export default function DualMixer() {
     return () => clearInterval(interval);
   }, [loading]);
 
-  // Auto-scroll logs to latest message
+  // Auto-scroll logs to latest message -- but keep the view on the song
+  // panels themselves (uploading/waiting/choosing) rather than being pulled
+  // down to the growing log, until Song 2 is actually being processed
+  // (loading[1]). Before that, Song 2 may just be waiting for Song 1 to
+  // finish so all 3 processing choices can be shown together.
   React.useEffect(() => {
-    if (logsEndRef.current) {
-      logsEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    if (logsEndRef.current && loading[1]) {
+      // block: 'end' aligns the BOTTOM of the log panel to the viewport's
+      // bottom edge -- the default ('start') aligns logsEndRef's top to the
+      // viewport's top instead, which (since it's a zero-height marker right
+      // after the last log line) pushes the whole log list above it clean
+      // off-screen.
+      logsEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
     }
-  }, [processingLogs]);
+  }, [processingLogs, loading]);
 
   // Helper: Generate filename with BPM labels
   const generateBpmLabel = (meta, isProcessed = false) => {
@@ -225,7 +244,11 @@ export default function DualMixer() {
           wav_filename: pending.wavFilename,
           filename: pending.filename,
           slot,
-          mode
+          mode,
+          // Only meaningful for mode === 'snap' -- Song 1's already-known
+          // grid to warp this song onto.
+          reference_bpm: mode === 'snap' ? metadata[0]?.bpm : undefined,
+          reference_anchor: mode === 'snap' ? metadata[0]?.beat_anchor : undefined
         })
       });
 
@@ -243,7 +266,29 @@ export default function DualMixer() {
 
       setMetadata(prevMetadata => {
         const newMetadata = [...prevMetadata];
-        newMetadata[slot] = { ...data, timestamp: data.timestamp || Date.now().toString() };
+        newMetadata[slot] = {
+          ...data,
+          timestamp: data.timestamp || Date.now().toString(),
+          mode,
+          sourceWavFilename: data.source_wav_filename,
+          unalignedWavFilename: mode === 'align' ? pending.wavFilename : null,
+          // How much the initial align/snap step corrected (null if mode
+          // was 'as_is', or if align/snap failed) -- { mean_ms, max_ms }.
+          gridCorrection: data.grid_correction,
+          // Immutable snapshot of what was originally detected -- always the
+          // basis for the NEXT reprocess (see getEffectiveBpm/Key), and what
+          // the upload box keeps showing regardless of later reprocessing.
+          detectedBpm: data.bpm,
+          detectedKey: data.key,
+          // 'major' | 'minor' | null -- only Essentia detects mode, Librosa
+          // can't. Needed for Camelot-wheel-aware key recommendations.
+          detectedScale: data.scale,
+          // What's actually loaded/playing right now -- starts the same as
+          // detected, updated after each successful reprocess (see
+          // processStems below) via getCurrentBpm/Key.
+          currentBpm: data.bpm,
+          currentKey: data.key
+        };
         return newMetadata;
       });
 
@@ -281,7 +326,7 @@ export default function DualMixer() {
       });
       setProcessingStage(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
     }
-  }, [pendingSong, fetchStats]);
+  }, [pendingSong, fetchStats, metadata]);
 
 
   // Play/pause both songs. All 14 stems are already fully decoded into
@@ -339,6 +384,7 @@ export default function DualMixer() {
     const interval = setInterval(() => {
       setCurrentTime(playerRef.current.getPosition());
       setDuration(playerRef.current.getReferenceDuration());
+      setDriftInfo(playerRef.current.getDriftInfo());
     }, 100);
 
     return () => clearInterval(interval);
@@ -346,10 +392,40 @@ export default function DualMixer() {
 
   // Update beat offset delay in real-time
   useEffect(() => {
-    const song2BpmStr = metadata[1]?.bpm ? String(metadata[1].bpm) : '120';
-    const song2Bpm = parseFloat(song2BpmStr.split('-')[0]) || 120;
+    // Use the ACTUAL current BPM of the loaded audio, not the fixed
+    // originally-detected value -- after a beatmatch reprocess, Song 2 is
+    // really playing at its new tempo, and the beat-offset delay (a number
+    // of BEATS converted to seconds) has to be timed against that real
+    // tempo or the two songs' beat grids drift out of phase. (Inlined
+    // rather than calling getCurrentBpm so this effect's deps stay exact --
+    // that helper isn't memoized, so listing it would fire this every render.)
+    const song2Bpm = overrideBpm[1] ?? metadata[1]?.currentBpm ?? metadata[1]?.detectedBpm ?? metadata[1]?.bpm ?? 120;
     playerRef.current.setBeatOffset(beatOffset, song2Bpm);
-  }, [beatOffset, metadata]);
+  }, [beatOffset, metadata, overrideBpm]);
+
+  // Feed each song's current bpm + beat anchor to the player's continuous
+  // drift corrector. A time-stretch scales EVERY time position in the file,
+  // including where the first beat lands, so the anchor has to be scaled
+  // by the same ratio the tempo changed by, or the corrector would measure
+  // phase against a stale reference point.
+  useEffect(() => {
+    for (const slot of [0, 1]) {
+      const detectedBpm = metadata[slot]?.detectedBpm;
+      const detectedAnchor = metadata[slot]?.beat_anchor;
+      if (!detectedBpm || detectedAnchor == null) {
+        playerRef.current.setBeatGridInfo(slot, null, null);
+        continue;
+      }
+      const currentBpm = overrideBpm[slot] ?? metadata[slot]?.currentBpm ?? detectedBpm;
+      const scaledAnchor = detectedAnchor * (detectedBpm / currentBpm);
+      playerRef.current.setBeatGridInfo(slot, currentBpm, scaledAnchor);
+    }
+  }, [metadata, overrideBpm]);
+
+  // Drift correction strength slider (0-100 -> 0-1)
+  useEffect(() => {
+    playerRef.current.setDriftCorrectionStrength(driftCorrection / 100);
+  }, [driftCorrection]);
 
   // Load waveforms for selected stems -- reuses the AudioBuffers already
   // decoded for playback (see handleStemsLoaded) instead of re-fetching and
@@ -392,44 +468,65 @@ export default function DualMixer() {
 
   const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-  // Get recommended target key (best compromise between both songs)
-  const getRecommendedKey = () => {
+  // The mode (major/minor) a song was detected in never changes -- pitch
+  // shifting can move a track to a different key, but not turn a minor
+  // recording major, so unlike bpm/key there's no separate "current" vs
+  // "detected" scale to track.
+  const getEffectiveScale = (slot) => metadata[slot]?.detectedScale ?? null;
+
+  // Up to 5 candidate shared target keys, ranked by Camelot-wheel
+  // compatibility (circle-of-fifths distance) rather than raw semitone
+  // distance -- see camelotWheel.js for why that's a better metric for how
+  // natural a transposition will sound.
+  const getKeyRecommendationsList = () => {
     const key0 = getEffectiveKey(0);
     const key1 = getEffectiveKey(1);
-
-    if (!key0 || !key1 || !stems[0] || !stems[1]) return null;
-
-    const keyToIndex = {};
-    KEYS.forEach((k, i) => keyToIndex[k] = i);
-
-    const idx0 = keyToIndex[key0];
-    const idx1 = keyToIndex[key1];
-
-    let bestKey = null;
-    let bestScore = Infinity;
-
-    // Find key that minimizes maximum transposition (most balanced)
-    // Example: E + F# → F is better (both ±1) than E (0 + 2) or F# (1 + 0)
-    KEYS.forEach((testKey, testIdx) => {
-      const shift0 = Math.abs(getSemitoneShift(key0, testKey));
-      const shift1 = Math.abs(getSemitoneShift(key1, testKey));
-      const score = Math.max(shift0, shift1); // Minimize maximum individual shift
-
-      if (score < bestScore) {
-        bestScore = score;
-        bestKey = testKey;
-      }
-    });
-
-    return bestKey;
+    if (!key0 || !key1 || !stems[0] || !stems[1]) return [];
+    return getKeyRecommendations(key0, getEffectiveScale(0), key1, getEffectiveScale(1), 5);
   };
 
+  // Are the songs ALREADY Camelot-compatible as they stand (same key, or a
+  // relative-major/minor / adjacent-fifth pair)? The ranked list above can
+  // never surface this, since it only considers moving BOTH songs to one
+  // identical shared pitch class -- it can't represent "leave them as they
+  // are, they're already a compatible pair in different keys."
+  const getOwnCompatibility = () => {
+    const key0 = getEffectiveKey(0);
+    const key1 = getEffectiveKey(1);
+    if (!key0 || !key1 || !stems[0] || !stems[1]) return null;
+    return camelotDistanceBetween(key0, getEffectiveScale(0), key1, getEffectiveScale(1));
+  };
+
+  // The basis for the NEXT processing action -- always the originally
+  // detected value (or the user's manual correction to it), never a
+  // previous processing round's result. Reprocessing always starts fresh
+  // from the initial WAV, so a second "Process" click has to compute its
+  // semitone/tempo shift from the ORIGINAL analysis, not from wherever the
+  // last click left off -- otherwise (key especially, which has no
+  // convergence/self-correction like BPM does) it silently lands on the
+  // wrong result. See getCurrentBpm/getCurrentKey for "what's actually
+  // loaded and playing right now" instead.
   const getEffectiveBpm = (slot) => {
     if (overrideBpm[slot] !== null) return overrideBpm[slot];
-    // Prioritize measured_bpm (after beatmatching) over detected bpm
-    return metadata[slot]?.measured_bpm || metadata[slot]?.bpm;
+    return metadata[slot]?.detectedBpm ?? metadata[slot]?.bpm;
   };
-  const getEffectiveKey = (slot) => overrideKey[slot] !== null ? overrideKey[slot] : metadata[slot]?.key;
+  const getEffectiveKey = (slot) => {
+    if (overrideKey[slot] !== null) return overrideKey[slot];
+    return metadata[slot]?.detectedKey ?? metadata[slot]?.key;
+  };
+
+  // What the currently loaded/playing stems actually are right now (updates
+  // after each successful reprocess) -- used for real-time playback timing
+  // (beat offset) and the "current stems" status line, as opposed to
+  // getEffectiveBpm/Key's fixed planning basis above.
+  const getCurrentBpm = (slot) => {
+    if (overrideBpm[slot] !== null) return overrideBpm[slot];
+    return metadata[slot]?.currentBpm ?? metadata[slot]?.detectedBpm ?? metadata[slot]?.bpm;
+  };
+  const getCurrentKey = (slot) => {
+    if (overrideKey[slot] !== null) return overrideKey[slot];
+    return metadata[slot]?.currentKey ?? metadata[slot]?.detectedKey ?? metadata[slot]?.key;
+  };
 
   const getSemitoneShift = (fromKey, toKey) => {
     const keyToIndex = { C: 0, 'C#': 1, D: 2, 'D#': 3, E: 4, F: 5, 'F#': 6, G: 7, 'G#': 8, A: 9, 'A#': 10, B: 11 };
@@ -522,6 +619,7 @@ export default function DualMixer() {
           target_key: needsTranspose ? newTargetKey : null,
           timestamp: metadata[slot].timestamp,
           filename: metadata[slot].filename,
+          source_wav_filename: metadata[slot].sourceWavFilename,
           slot: slot
         })
       });
@@ -530,15 +628,22 @@ export default function DualMixer() {
       const data = await response.json();
 
       if (data.processed_stems) {
-        // Store measured BPM in metadata for accurate file naming
+        // Store measured BPM/key in metadata for accurate file naming, and
+        // update the "currently playing" values (NOT the immutable
+        // detected/effective ones -- those stay fixed as the basis for the
+        // NEXT reprocess, which always starts fresh from the initial WAV).
         setMetadata(prevMetadata => {
           const newMetadata = [...prevMetadata];
-          if (newMetadata[slot] && data.measured_bpm) {
+          if (newMetadata[slot]) {
             newMetadata[slot] = {
               ...newMetadata[slot],
-              measured_bpm: data.measured_bpm,
-              source_bpm: data.source_bpm,
-              target_bpm: data.target_bpm
+              ...(data.measured_bpm && {
+                measured_bpm: data.measured_bpm,
+                source_bpm: data.source_bpm,
+                target_bpm: data.target_bpm,
+                currentBpm: data.measured_bpm
+              }),
+              ...(data.measured_key && { currentKey: data.measured_key })
             };
           }
           return newMetadata;
@@ -652,19 +757,9 @@ export default function DualMixer() {
       // Track last processed values
       if (needsBpmChange) setLastProcessedBpm(targetBpm);
       if (needsKeyChange) setLastProcessedKey(targetKey);
-
-      // Update metadata with new key if transposed
-      if (needsKeyChange) {
-        setMetadata(prev => {
-          const updated = [...prev];
-          for (let i = 0; i < updated.length; i++) {
-            if (updated[i]) {
-              updated[i] = { ...updated[i], key: targetKey };
-            }
-          }
-          return updated;
-        });
-      }
+      // (metadata.currentKey/currentBpm are updated per-slot, from the
+      // backend's actual measured result, inside processStems above --
+      // no need to blanket-assign the requested target here.)
     } finally {
       clearInterval(progressInterval);
       setTimeout(() => {
@@ -701,27 +796,77 @@ export default function DualMixer() {
     }
   };
 
-  // Cleanup all audio files
+  // Clean and reset: delete all generated audio files AND take the whole
+  // GUI back to its just-loaded state, so starting over with two new songs
+  // never has to contend with leftover state from the previous pair
+  // (target bpm/key, overrides, volumes, beat offset, drift-correction
+  // stats, waveform selection, logs -- all of it).
   const handleCleanup = async () => {
-    if (!confirm('🗑️ Delete all generated audio files? This cannot be undone.')) return;
+    if (!confirm('🗑️ Clean and reset: delete all generated audio files and start over? This cannot be undone.')) return;
 
     try {
       const response = await fetch('/api/cleanup', { method: 'POST' });
       const data = await response.json();
 
       if (response.ok) {
-        alert('✅ Cleanup complete! All audio files deleted.');
-        // Reset state
+        alert('✅ Cleaned up and reset! All audio files deleted, ready to start over.');
         playerRef.current.reset();
+
+        // Core song/stem state
         setStems([null, null]);
         setMetadata([null, null]);
         setLoading([false, false]);
+        setError('');
         setAudioReady([false, false]);
         setPendingSong([null, null]);
+        setProcessingStage([null, null]);
+
+        // BPM/Key override editing
+        setEditingBpm([false, false]);
+        setEditingKey([false, false]);
+        setOverrideBpm([null, null]);
+        setOverrideKey([null, null]);
+
+        // Target BPM/Key reprocessing
+        setTargetKey(null);
+        setTargetBpm(null);
+        setTransposedStems([null, null]);
+        setTransposingStatus([null, null]);
+        setBeatmatchedStems([null, null]);
+        setBeatmatchStatus([null, null]);
+        setProcessingProgress(0);
+        setIsProcessing(false);
+        setTransposingProgress(0);
+        setIsTransposing(false);
+        setLastProcessedBpm(null);
+        setLastProcessedKey(null);
+
+        // Playback
         setPlaying(false);
         setCurrentTime(0);
         setDuration(0);
+        setProcessingLogs([]);
+
+        // Beat offset & live drift correction
+        setBarOffset(0);
+        setBarOffsetDisplay(0);
+        setDriftCorrection(50);
+        setDriftInfo({ instantaneousMs: 0, cumulativeBeats: 0 });
+        setIsSnappedToBeat(false);
+
+        // Waveform
+        setKickWaveforms(null);
+        setSelectedStemsForWaveform(['kick']);
+        setWaveformZoom(10);
+
+        // Mixer
+        setVolumes({
+          0: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 },
+          1: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 }
+        });
         setCrossfader(50);
+        setDownloadingKey(null);
+
         setAudioStats({ file_count: 0, total_size_formatted: '0 MB' });
       } else {
         alert(`❌ Cleanup failed: ${data.error}`);
@@ -731,6 +876,16 @@ export default function DualMixer() {
       alert(`❌ Error: ${err.message}`);
     }
   };
+
+  // Whether the "original" stems download is actually aligned stems (or a
+  // mix of both, across the two songs) -- purely for the button label.
+  const slotsWithStems = [0, 1].filter(slot => stems[slot]);
+  const anySlotAligned = slotsWithStems.some(slot => metadata[slot]?.mode === 'align');
+  const allSlotsAligned = slotsWithStems.length > 0 && slotsWithStems.every(slot => metadata[slot]?.mode === 'align');
+  const originalStemsLabel = allSlotsAligned ? 'Aligned Stems' : anySlotAligned ? 'Original/Aligned Stems' : 'Original Stems';
+  const keyRecommendations = getKeyRecommendationsList();
+  const ownCompatibility = getOwnCompatibility();
+  const song1Ready = !!stems[0] && metadata[0]?.bpm != null && metadata[0]?.beat_anchor != null;
 
   return (
     <div className="dual-mixer">
@@ -760,6 +915,8 @@ export default function DualMixer() {
               audioReady={audioReady[slot]}
               pendingSong={pendingSong[slot]}
               processingStage={processingStage[slot]}
+              canSnapToSong1={slot === 1 && song1Ready}
+              waitingForSong1={slot === 1 && !song1Ready}
               onBpmOverride={handleBpmOverride}
               onKeyOverride={handleKeyOverride}
               onToggleEditingBpm={toggleEditingBpm}
@@ -839,6 +996,10 @@ export default function DualMixer() {
         {/* Playback & Crossfader Controls */}
         {stems[0] && stems[1] ? (
           <div className="playback-section">
+            {/* Now playing: the actual current bpm/key of the loaded stems */}
+            <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '10px' }}>
+              📦 Now playing: Song 1 [{getCurrentKey(0)} {getCurrentBpm(0)} BPM] + Song 2 [{getCurrentKey(1)} {getCurrentBpm(1)} BPM]
+            </div>
             <div className="playback-controls">
               <button
                 onClick={togglePlayback}
@@ -874,8 +1035,8 @@ export default function DualMixer() {
                 kicks={kickWaveforms}
                 currentTime={currentTime}
                 beatOffset={beatOffset}
-                song2Bpm={metadata[1]?.bpm ? parseFloat(String(metadata[1].bpm).split('-')[0]) : 120}
-                song1Bpm={metadata[0]?.bpm ? parseFloat(String(metadata[0].bpm).split('-')[0]) : 120}
+                song2Bpm={getCurrentBpm(1) || 120}
+                song1Bpm={getCurrentBpm(0) || 120}
                 song1BeatAnchor={metadata[0]?.beat_anchor ?? 0}
                 zoomLevel={waveformZoom}
                 onZoomChange={setWaveformZoom}
@@ -904,22 +1065,25 @@ export default function DualMixer() {
               </div>
             </div>
 
-            {/* Beat Offset for Song 2 with Magnetic Snap */}
+            {/* Beat Offset for Song 2 with Magnetic Snap -- up to 32 bars.
+                The slider's own unit is BARS (precise to drag/snap at this
+                range); beatOffset (bars*4) is what's sent to the player and
+                the render, since those work in beats. */}
             <div className="crossfader-section" style={{ marginTop: '15px' }}>
-              <label>🎵 Beat Offset (Song 2) — Fine-tune + Snap to Beats</label>
+              <label>🎵 Beat Offset (Song 2) — Fine-tune + Snap to Bars</label>
               <div className="crossfader-labels">
                 <span>Sync</span>
                 <span>Offset</span>
-                <span>+8 beats</span>
+                <span>+32 bars</span>
               </div>
               <div style={{ position: 'relative' }}>
                 <input
                   type="range"
                   min="0"
-                  max="8"
-                  step="0.1"
-                  value={beatOffsetDisplay}
-                  onChange={(e) => setBeatOffsetDisplay(parseFloat(e.target.value))}
+                  max="32"
+                  step="0.05"
+                  value={barOffsetDisplay}
+                  onChange={(e) => setBarOffsetDisplay(parseFloat(e.target.value))}
                   disabled={!stems[0] || !stems[1]}
                   className="crossfader-slider"
                   style={{
@@ -930,35 +1094,54 @@ export default function DualMixer() {
               </div>
               <div className="crossfader-value">
                 {isSnappedToBeat ? (
-                  `🎯 Snapped: +${beatOffset} beat${beatOffset !== 1 ? 's' : ''} (fine-tune: ${beatOffsetDisplay.toFixed(1)})`
-                ) : beatOffsetDisplay === 0 ? (
+                  `🎯 Snapped: +${barOffset} bar${barOffset !== 1 ? 's' : ''} (${beatOffset} beats) — fine-tune: ${barOffsetDisplay.toFixed(2)} bars`
+                ) : barOffsetDisplay === 0 ? (
                   '✓ Sync (no offset)'
                 ) : (
-                  `⚙️ Fine-tuning: +${beatOffsetDisplay.toFixed(1)} beats`
+                  `⚙️ Fine-tuning: +${barOffsetDisplay.toFixed(2)} bars (${(barOffsetDisplay * 4).toFixed(1)} beats)`
                 )}
               </div>
             </div>
 
-            {/* Stems Version Info - Directly under Controls */}
-            {(stems[0] || stems[1]) && (
-              <div style={{
-                background: 'rgba(100, 116, 139, 0.2)',
-                border: '1px solid rgba(100, 116, 139, 0.4)',
-                padding: '8px 12px',
-                borderRadius: '6px',
-                fontSize: '11px',
-                color: '#94a3b8',
-                marginTop: '10px'
-              }}>
-                📦 Current stems: {stems[0] && `Song 1 [${getEffectiveKey(0)} ${getEffectiveBpm(0)} BPM]`} {stems[1] && `+ Song 2 [${getEffectiveKey(1)} ${getEffectiveBpm(1)} BPM]`}
-                {(targetBpm || targetKey) && !isLocked && (
-                  <>
-                    <br />
-                    🎯 Will process to: {stems[0] && `Song 1 [${targetKey || getEffectiveKey(0)} ${targetBpm || getEffectiveBpm(0)} BPM]`} {stems[1] && `+ Song 2 [${targetKey || getEffectiveKey(1)} ${targetBpm || getEffectiveBpm(1)} BPM]`}
-                  </>
-                )}
+            {/* Continuous drift correction -- the beat offset above is a
+                one-time static nudge; this keeps correcting Song 2's tiny
+                residual tempo error against Song 1 in real time as they play. */}
+            <div className="crossfader-section" style={{ marginTop: '15px' }}>
+              <label>🧲 Live Beat-Grid Correction (Song 2 sticks to Song 1)</label>
+              <div className="crossfader-labels">
+                <span>Off</span>
+                <span>Gentle</span>
+                <span>Aggressive</span>
               </div>
-            )}
+              <div style={{ position: 'relative' }}>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value={driftCorrection}
+                  onChange={(e) => setDriftCorrection(parseFloat(e.target.value))}
+                  disabled={!stems[0] || !stems[1]}
+                  className="crossfader-slider"
+                  style={{
+                    opacity: (!stems[0] || !stems[1]) ? 0.5 : 1,
+                    cursor: (!stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
+                  }}
+                />
+              </div>
+              <div className="crossfader-value">
+                {driftCorrection === 0
+                  ? '✓ Off (no live correction)'
+                  : `🧲 Correcting up to ±${(0.005 * (driftCorrection / 100) * 100).toFixed(2)}% playback rate as needed`}
+              </div>
+              {driftCorrection > 0 && playing && (
+                <div style={{ fontSize: '11px', color: '#999', marginTop: '4px' }}>
+                  Current drift: {driftInfo.instantaneousMs >= 0 ? '+' : ''}{driftInfo.instantaneousMs.toFixed(1)}ms
+                  {' · '}Total realigned so far: {driftInfo.cumulativeBeats.toFixed(2)} beats
+                </div>
+              )}
+            </div>
+
           </div>
         ) : null}
 
@@ -971,9 +1154,12 @@ export default function DualMixer() {
             borderRadius: '12px',
             marginTop: '20px'
           }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '15px' }}>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '5px' }}>
               ⚙️ Processing (BPM & Key)
             </label>
+            <p style={{ margin: '0 0 15px 0', fontSize: '11px', color: '#888' }}>
+              ℹ️ Each time you process, it starts fresh from the originally detected BPM/Key (not from the last processed result) -- so the target you set here is always an absolute destination, not an additional shift.
+            </p>
 
             {/* BPM Input */}
             <div style={{ marginBottom: '15px' }}>
@@ -1009,7 +1195,7 @@ export default function DualMixer() {
               <select
                 value={targetKey || ''}
                 onChange={(e) => handleTargetKeyChange(e.target.value)}
-                disabled={isLocked}
+                disabled={isLocked || !stems[0] || !stems[1]}
                 style={{
                   width: '100%',
                   padding: '8px',
@@ -1020,8 +1206,8 @@ export default function DualMixer() {
                   fontSize: '14px',
                   boxSizing: 'border-box',
                   colorScheme: 'dark',
-                  opacity: isLocked ? 0.5 : 1,
-                  cursor: isLocked ? 'not-allowed' : 'pointer'
+                  opacity: (isLocked || !stems[0] || !stems[1]) ? 0.5 : 1,
+                  cursor: (isLocked || !stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
                 }}
               >
                 <option value="" style={{ background: '#1a1f3a', color: '#fff' }}>No transposition</option>
@@ -1121,8 +1307,11 @@ export default function DualMixer() {
           </div>
         ) : null}
 
-        {/* Processing Status & Recommendations */}
-        {stems[0] && stems[1] && (targetBpm || targetKey) && (
+        {/* Processing Status & Recommendations -- shown as soon as this
+            processing window is available (both songs have stems), not only
+            after a target BPM/key has already been picked, so the
+            recommendation can actually inform that choice. */}
+        {stems[0] && stems[1] && (
           <div style={{
             background: 'rgba(99, 102, 241, 0.05)',
             border: '1px solid rgba(99, 102, 241, 0.2)',
@@ -1130,26 +1319,67 @@ export default function DualMixer() {
             borderRadius: '12px',
             marginTop: '20px'
           }}>
-            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '15px' }}>
-              💡 Recommended Key: <button
-                onClick={() => handleTargetKeyChange(getRecommendedKey())}
-                style={{
-                  background: 'transparent',
-                  color: '#a78bfa',
-                  border: '1px solid #8b5cf6',
-                  padding: '4px 10px',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '11px',
-                  fontWeight: 'bold',
-                  marginLeft: '10px'
-                }}
-              >
-                {getRecommendedKey()}
-              </button>
+            <label style={{ display: 'block', fontSize: '14px', fontWeight: 'bold', color: '#ccc', marginBottom: '10px' }}>
+              💡 Recommended Keys (Camelot Wheel)
             </label>
 
-            {/* Processing Preview */}
+            {ownCompatibility !== null && ownCompatibility <= 1 && (
+              <div style={{
+                background: 'rgba(34, 197, 94, 0.12)',
+                border: '1px solid rgba(34, 197, 94, 0.4)',
+                borderRadius: '6px',
+                padding: '8px 12px',
+                marginBottom: '12px',
+                fontSize: '12px',
+                color: '#86efac'
+              }}>
+                ✅ No change needed -- Song 1 [{camelotCode(getEffectiveKey(0), getEffectiveScale(0))}] and Song 2 [{camelotCode(getEffectiveKey(1), getEffectiveScale(1))}] are already
+                {ownCompatibility === 0 ? ' in the same key.' : ' a compatible pair (relative or adjacent on the Camelot wheel).'}
+              </div>
+            )}
+
+            <p style={{ margin: '0 0 12px 0', fontSize: '11px', color: '#888' }}>
+              Ranked by harmonic compatibility (circle-of-fifths distance), not raw semitone distance -- a smaller shift isn't always the more natural-sounding one.
+            </p>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '15px' }}>
+              {keyRecommendations.length === 0 ? (
+                <span style={{ fontSize: '12px', color: '#888' }}>No recommendation available yet.</span>
+              ) : keyRecommendations.map(rec => (
+                <button
+                  key={rec.key}
+                  onClick={() => handleTargetKeyChange(rec.key)}
+                  disabled={isLocked}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    gap: '10px',
+                    background: targetKey === rec.key ? 'rgba(139, 92, 246, 0.25)' : 'transparent',
+                    color: '#e5e7eb',
+                    border: targetKey === rec.key ? '1px solid #8b5cf6' : '1px solid rgba(139, 92, 246, 0.3)',
+                    padding: '6px 12px',
+                    borderRadius: '6px',
+                    cursor: isLocked ? 'not-allowed' : 'pointer',
+                    fontSize: '12px',
+                    textAlign: 'left',
+                    opacity: isLocked ? 0.5 : 1
+                  }}
+                >
+                  <span>{rec.emoji} <strong>{rec.key}</strong> <span style={{ color: '#999' }}>({rec.label})</span></span>
+                  <span style={{ color: '#999', fontSize: '11px' }}>
+                    {[0, 1].filter(slot => stems[slot]).map(slot => {
+                      const shift = getSemitoneShift(getEffectiveKey(slot), rec.key);
+                      const sign = shift > 0 ? '+' : '';
+                      const camelot = slot === 0 ? rec.camelot1 : rec.camelot2;
+                      return `Song ${slot + 1}: ${camelot ?? '?'} (${sign}${shift} st)`;
+                    }).join('  ·  ')}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            {/* Processing Preview -- only meaningful once a target is set */}
+            {(targetBpm || targetKey) && (
             <div style={{
               background: 'rgba(99, 102, 241, 0.1)',
               border: '1px solid rgba(99, 102, 241, 0.2)',
@@ -1162,17 +1392,19 @@ export default function DualMixer() {
                 const sourceKey = getEffectiveKey(slot);
                 const keyShift = targetKey ? getSemitoneShift(sourceKey, targetKey) : 0;
                 const keyDirection = keyShift > 0 ? '↑' : keyShift < 0 ? '↓' : '=';
+                const keyShiftLabel = targetKey && keyShift !== 0 ? ` (${keyShift > 0 ? '+' : ''}${keyShift} semitone${Math.abs(keyShift) === 1 ? '' : 's'})` : '';
 
                 return (
                   <div key={slot} style={{ marginBottom: slot === 0 ? '8px' : '0', color: '#aaa', fontSize: '12px' }}>
                     <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong><br/>
                     {targetBpm && `${sourceBpm} → ${targetBpm} BPM`}
                     {targetBpm && targetKey && ' | '}
-                    {targetKey && `${sourceKey} → ${targetKey} ${keyDirection}`}
+                    {targetKey && `${sourceKey} → ${targetKey} ${keyDirection}${keyShiftLabel}`}
                   </div>
                 );
               })}
             </div>
+            )}
           </div>
         )}
 
@@ -1187,7 +1419,10 @@ export default function DualMixer() {
           }}>
             <h4 style={{ margin: '0 0 15px 0', color: '#6366f1' }}>📥 Downloads</h4>
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
-              {/* Download Original Stems */}
+              {/* Download Original (or Aligned, if that's what was actually
+                  separated) Stems -- once a song is processed with 'align',
+                  the stems here ARE the aligned ones; there's no separate
+                  unaligned copy unless the button below is used. */}
               <button
                 onClick={() => {
                   const timestamps = metadata.map(m => m?.timestamp).filter(Boolean);
@@ -1195,10 +1430,14 @@ export default function DualMixer() {
                     alert('No stems to download');
                     return;
                   }
-                  const metadataList = metadata.map(m => m ? {
+                  // Label with the CURRENT actual bpm/key, not the fixed
+                  // originally-detected one -- this download's content is
+                  // whatever the latest separated stems are (post any
+                  // BPM/Key reprocessing), so the filename should match.
+                  const metadataList = metadata.map((m, i) => m ? {
                     filename: m.filename,
-                    bpm: generateBpmLabel(m, false),
-                    key: m.key
+                    bpm: getCurrentBpm(i) ?? generateBpmLabel(m, false),
+                    key: getCurrentKey(i) ?? m.key
                   } : null);
 
                   handleDownload('original', '/api/download-stems-zip', {
@@ -1221,8 +1460,47 @@ export default function DualMixer() {
                   fontWeight: 'bold'
                 }}
               >
-                {downloadingKey === 'original' ? '⏳ Preparing ZIP...' : '📦 Original Stems'}
+                {downloadingKey === 'original' ? '⏳ Preparing ZIP...' : `📦 ${originalStemsLabel}`}
               </button>
+
+              {/* Download Unaligned Originals -- on request only: re-runs
+                  Demucs on the pre-alignment WAV for whichever song(s) used
+                  'align', since that source is never separated automatically. */}
+              {anySlotAligned && (
+                <button
+                  onClick={() => {
+                    const wavFilenames = metadata.map(m => m?.mode === 'align' ? m.unalignedWavFilename : null);
+                    if (!wavFilenames.some(Boolean)) {
+                      alert('No unaligned originals available');
+                      return;
+                    }
+                    const metadataList = metadata.map(m => m ? {
+                      filename: m.filename,
+                      bpm: generateBpmLabel(m, false),
+                      key: m.key
+                    } : null);
+
+                    handleDownload('unaligned', '/api/download-unaligned-stems', {
+                      wav_filenames: wavFilenames,
+                      metadata: metadataList
+                    });
+                  }}
+                  disabled={downloadingKey !== null}
+                  style={{
+                    background: 'rgba(99, 102, 241, 0.2)',
+                    color: '#a78bfa',
+                    border: '1px dashed #6366f1',
+                    padding: '10px 16px',
+                    borderRadius: '6px',
+                    cursor: downloadingKey !== null ? 'not-allowed' : 'pointer',
+                    opacity: downloadingKey !== null ? 0.5 : 1,
+                    fontSize: '12px',
+                    fontWeight: 'bold'
+                  }}
+                >
+                  {downloadingKey === 'unaligned' ? '⏳ Separating + preparing ZIP...' : '📦 Unaligned Originals'}
+                </button>
+              )}
 
               {/* Download Processed Stems */}
               {(transposedStems[0] || transposedStems[1] || beatmatchedStems[0] || beatmatchedStems[1]) && (
@@ -1274,7 +1552,8 @@ export default function DualMixer() {
                   const metadataList = metadata.map(m => m ? {
                     filename: m.filename,
                     bpm: generateBpmLabel(m, true),
-                    key: targetKey || m.key
+                    key: targetKey || m.key,
+                    beat_anchor: m.beat_anchor
                   } : null);
 
                   handleDownload('final', '/api/render-final-mix', {
@@ -1299,11 +1578,11 @@ export default function DualMixer() {
                   fontWeight: 'bold'
                 }}
               >
-                {downloadingKey === 'final' ? '⏳ Rendering...' : '🎵 Final Mix (FLAC)'}
+                {downloadingKey === 'final' ? '⏳ Rendering...' : '🎵 Final Mix (WAV)'}
               </button>
             </div>
             <p style={{ margin: '12px 0 0 0', color: '#999', fontSize: '12px' }}>
-              💡 All downloads use FLAC format with metadata tags: songname-[BPM]-[KEY]-[stem/mix].flac
+              💡 All downloads are WAV with an embedded ACID chunk (BPM/key DAWs like FL Studio can auto-detect on import): songname-[BPM]-[KEY]-[stem/mix].wav
             </p>
           </div>
         )}
@@ -1339,7 +1618,7 @@ export default function DualMixer() {
             onMouseEnter={(e) => e.target.style.background = 'rgba(239, 68, 68, 0.3)'}
             onMouseLeave={(e) => e.target.style.background = 'rgba(239, 68, 68, 0.2)'}
           >
-            🗑️ Cleanup Audio Files
+            🗑️ Clean and Reset
           </button>
         </div>
       </div>

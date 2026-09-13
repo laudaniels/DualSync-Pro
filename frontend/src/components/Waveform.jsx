@@ -223,7 +223,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, son
         <input
           type="range"
           min="3"
-          max="30"
+          max="200"
           step="1"
           value={zoomLevel}
           onChange={(e) => onZoomChange(parseInt(e.target.value))}

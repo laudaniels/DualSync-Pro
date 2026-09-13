@@ -93,6 +93,14 @@ def upload_audio():
         if result.returncode != 0:
             raise RuntimeError(f"WAV conversion failed: {result.stderr[-500:]}")
 
+        # Peak-normalize to 97% so both songs enter the pipeline (alignment,
+        # analysis, separation) at a consistent, headroom-safe level rather
+        # than whatever level they happened to be mastered at. Best-effort:
+        # if it fails, the unnormalized WAV is left in place.
+        add_log_message("📏 Normalizing peak level to 97%...", slot)
+        from mashup_engine import MashupEngine
+        MashupEngine().normalize_peak(str(wav_path), str(wav_path), target_peak=0.97)
+
         add_log_message("✅ Ready -- choose how to process this song", slot)
 
         return jsonify({
@@ -114,6 +122,11 @@ def process_song():
     filename = data.get('filename', wav_filename)
     slot = data.get('slot')
     mode = data.get('mode', 'as_is')
+    # Only used for mode == 'snap': the OTHER song's already-known bpm/beat
+    # anchor to warp this one onto (see /api/upload-audio's normalize step --
+    # this runs on that same normalized WAV, before separation).
+    reference_bpm = data.get('reference_bpm')
+    reference_anchor = data.get('reference_anchor')
 
     if not wav_filename:
         return jsonify({'error': 'Missing wav_filename'}), 400
@@ -130,20 +143,43 @@ def process_song():
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
+        # How much the initial beat-grid step (align or snap) actually
+        # corrected -- None if neither ran or it failed, else {mean_ms, max_ms}
+        # for the frontend to display alongside this song's detected info.
+        grid_correction = None
+
         if mode == 'align':
             add_log_message("🎯 Aligning beatgrid (correcting tempo drift)...", slot)
             try:
                 aligned_path = audio_dir / f"aligned_{file_path.stem}.wav"
-                _, orig_bpm, _orig_anchor = engine.align_beatgrid(str(file_path), str(aligned_path))
+                _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.align_beatgrid(str(file_path), str(aligned_path))
                 file_path = aligned_path
-                add_log_message(f"✅ Beatgrid aligned (was {orig_bpm:.1f} BPM with drift)", slot)
+                grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
+                add_log_message(f"✅ Beatgrid aligned (was {orig_bpm:.1f} BPM with drift, mean correction {mean_ms:.1f}ms)", slot)
             except Exception as e:
                 logging.error(f"Beatgrid alignment failed: {e}", exc_info=True)
                 add_log_message(f"⚠️ Beatgrid alignment failed, continuing without it: {e}", slot)
 
+        elif mode == 'snap':
+            if not reference_bpm or reference_anchor is None:
+                add_log_message("⚠️ Snap beat requested but no reference song info was provided, continuing without it", slot)
+            else:
+                add_log_message(f"🧲 Snapping beat grid to the other song ({reference_bpm:.1f} BPM)...", slot)
+                try:
+                    snapped_path = audio_dir / f"snapped_{file_path.stem}.wav"
+                    _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.snap_to_reference(
+                        str(file_path), str(snapped_path), float(reference_bpm), float(reference_anchor)
+                    )
+                    file_path = snapped_path
+                    grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
+                    add_log_message(f"✅ Snapped to reference beat grid (was {orig_bpm:.1f} BPM, mean correction {mean_ms:.1f}ms)", slot)
+                except Exception as e:
+                    logging.error(f"Beat-grid snap failed: {e}", exc_info=True)
+                    add_log_message(f"⚠️ Beat-grid snap failed, continuing without it: {e}", slot)
+
         # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
         add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...", slot)
-        bpm, beat_anchor, key = engine.analyze_track_and_key(str(file_path))
+        bpm, beat_anchor, key, scale = engine.analyze_track_and_key(str(file_path))
         key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
 
         add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
@@ -182,8 +218,16 @@ def process_song():
             'bpm': round(bpm, 1),
             'beat_anchor': beat_anchor,
             'key': key_name,
+            'scale': scale,
             'filename': filename,
-            'timestamp': timestamp
+            # The WAV that was ACTUALLY analyzed and separated (the aligned
+            # copy if mode=='align', otherwise the plain converted WAV) --
+            # /api/process-stems must reprocess from this, not the raw
+            # original upload, or it'll ignore alignment entirely and can
+            # reintroduce MP3-decode/WAV timing mismatches.
+            'source_wav_filename': file_path.name,
+            'timestamp': timestamp,
+            'grid_correction': grid_correction
         })
     except Exception as e:
         logging.error(f"Stem separation failed: {e}", exc_info=True)
@@ -282,6 +326,49 @@ def _set_slot_state(slot, **fields):
     _processing_state['slots'][slot].update(fields)
 
 
+_VALID_KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label):
+    """Copy stem_file to dest_path and embed tempo/key info a DAW can
+    actually use: an ACID chunk (what FL Studio/Logic/Cubase/Reaper/etc.
+    read on import) plus basic ID3-in-WAV tags for players/taggers. Returns
+    True on success (dest_path is written either way; tagging failures are
+    logged and swallowed so a bad tag never blocks the download)."""
+    import shutil
+    shutil.copy2(str(stem_file), str(dest_path))
+
+    bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
+    try:
+        numeric_bpm = float(bpm_str)
+    except (ValueError, TypeError):
+        numeric_bpm = None
+
+    if numeric_bpm:
+        try:
+            engine.write_acid_chunk(str(dest_path), numeric_bpm, key if key in _VALID_KEY_NAMES else None)
+        except Exception as acid_err:
+            logging.error(f"ACID chunk write failed for {dest_path.name}: {acid_err}")
+
+    try:
+        from mutagen.wave import WAVE
+        from mutagen.id3 import TIT2, TPE1, TBPM, TKEY, COMM
+        audio = WAVE(str(dest_path))
+        if audio.tags is None:
+            audio.add_tags()
+        audio.tags.add(TIT2(encoding=3, text=f'{song_name} ({stem_label})'))
+        audio.tags.add(TPE1(encoding=3, text=song_name))
+        if numeric_bpm:
+            audio.tags.add(TBPM(encoding=3, text=str(int(round(numeric_bpm)))))
+        audio.tags.add(TKEY(encoding=3, text=str(key)))
+        audio.tags.add(COMM(encoding=3, lang='eng', desc='', text=f'{stem_label} stem - DualSync Pro'))
+        audio.save()
+    except Exception as tag_err:
+        logging.error(f"WAV tagging failed for {dest_path.name}: {tag_err}")
+
+    return True
+
+
 @app.route('/api/process-stems', methods=['POST'])
 def process_stems():
     """Process FULL SONG (BPM + Key), then separate into stems"""
@@ -295,6 +382,7 @@ def process_stems():
         target_key = data.get('target_key')
         timestamp = data.get('timestamp')
         filename = data.get('filename')
+        source_wav_filename = data.get('source_wav_filename')
 
         # Both songs can process at once -- only clear this slot's own
         # previous log lines, not the other song's.
@@ -310,9 +398,13 @@ def process_stems():
             add_log_message(f"❌ Missing timestamp or filename", slot)
             return jsonify({'error': 'Missing timestamp or filename'}), 400
 
-        # Find original file
+        # Reprocess from the SAME WAV that produced the currently-loaded
+        # stems (the aligned copy if the song used beatgrid alignment,
+        # otherwise the plain converted WAV) -- not the raw original upload.
+        # Falling back to `filename` (the raw upload) only for old sessions
+        # that never got a source_wav_filename.
         audio_dir = BASE_DIR / 'Audio'
-        original_file = audio_dir / filename
+        original_file = audio_dir / (source_wav_filename or filename)
         if not original_file.exists():
             add_log_message(f"❌ Original file not found", slot)
             return jsonify({'error': 'Original file not found'}), 400
@@ -328,6 +420,7 @@ def process_stems():
         processed_song = audio_dir / f"processed_{timestamp}_{Path(filename).stem}.wav"
 
         measured_bpm = None
+        measured_key_name = None
         # Apply BPM beatmatch if needed
         current_input = original_file
         if source_bpm and target_bpm and float(source_bpm) != float(target_bpm):
@@ -360,8 +453,8 @@ def process_stems():
                 success, measured_key = engine.pitch_shift_audio(str(current_input), str(transposed_song), semitones, source_idx)
                 if success:
                     current_input = transposed_song
-                    key_name = engine._key_to_note(measured_key) if measured_key >= 0 else "?"
-                    add_log_message(f"✅ Transposed to {key_name}", slot)
+                    measured_key_name = engine._key_to_note(measured_key) if measured_key >= 0 else target_key
+                    add_log_message(f"✅ Transposed to {measured_key_name}", slot)
                 else:
                     add_log_message(f"⚠️ Transpose failed, continuing", slot)
 
@@ -402,7 +495,9 @@ def process_stems():
             'processed_stems': processed_stems,
             'measured_bpm': measured_bpm,
             'target_bpm': target_bpm,
-            'source_bpm': source_bpm
+            'source_bpm': source_bpm,
+            'measured_key': measured_key_name,
+            'target_key': target_key
         })
     except Exception as e:
         logging.error(f"Process error: {e}", exc_info=True)
@@ -447,15 +542,22 @@ def split_drums():
 
 @app.route('/api/render-final-mix', methods=['POST'])
 def render_final_mix():
-    """Render final mixed FLAC from stems with beatmatching, volumes, and beat offset"""
+    """Render final mixed WAV from stems with beatmatching, volumes, and beat offset"""
     data = request.json
     try:
+        import shutil
         from pathlib import Path
-        from mutagen.flac import FLAC
+        from mutagen.wave import WAVE
+        from mutagen.id3 import TIT2, TPE1, TBPM, TKEY, COMM
         from mashup_engine import MashupEngine
 
         timestamps = data.get('timestamps')  # [timestamp_slot0, timestamp_slot1]
-        volumes = data.get('volumes')  # {0: {stem: vol}, 1: {stem: vol}}
+        # JSON object keys are always strings, so the request body has
+        # {"0": {...}, "1": {...}} -- normalize to int keys once here so the
+        # rest of this function can use `volumes.get(slot)` with slot as an
+        # int (as it does everywhere else) without silently missing every
+        # lookup.
+        volumes = {int(k): v for k, v in (data.get('volumes') or {}).items()}
         crossfader = data.get('crossfader', 50)
         metadata_list = data.get('metadata', [None, None])
         beat_offsets = data.get('beat_offsets', [0, 0])  # beats to offset Song 2
@@ -479,8 +581,18 @@ def render_final_mix():
         # Create output directory
         output_dir = BASE_DIR / 'Audio' / 'renders'
         output_dir.mkdir(exist_ok=True)
-        temp_wav = output_dir / f"temp_mix_{int(time.time() * 1000)}.wav"
-        final_flac = output_dir / f"{mix_name}-{bpm_label}-{key}-mix.flac"
+        # Timestamp-prefixed so every render gets its own file/URL -- a
+        # deterministic name here would mean re-rendering with different
+        # settings (e.g. a new beat offset) overwrites the same filename,
+        # risking a stale browser-cached copy being served for the "new"
+        # download instead of the actual latest render.
+        render_timestamp = int(time.time() * 1000)
+        # WAV, not FLAC: FL Studio (and most other DAWs -- Logic, Cubase,
+        # Reaper, Reason, Sound Forge, Samplitude) read tempo/key from a WAV
+        # ACID chunk on import, not from FLAC Vorbis comments or ID3 tags --
+        # those are correctly embedded but simply never checked by DAW
+        # sample importers.
+        final_wav = output_dir / f"{render_timestamp}_{mix_name}-{bpm_label}-{key}-mix.wav"
 
         # Collect stem files and metadata for engine.render()
         engine = MashupEngine()
@@ -513,9 +625,11 @@ def render_final_mix():
                 except (ValueError, IndexError):
                     bpms[slot] = None
 
-                # Try to get beat anchor from metadata if available
-                # For now, we'll detect it during render
-                beat_anchors[slot] = None
+                # From the original /api/process-song analysis (see the
+                # frontend's metadataList for this endpoint) -- without this,
+                # the beatmatch pre-pass in render() has no anchor to work
+                # with and silently skips phase alignment entirely.
+                beat_anchors[slot] = metadata_list[slot].get('beat_anchor')
 
         # Build params for engine.render()
         params = {
@@ -532,65 +646,74 @@ def render_final_mix():
                 's1_pitch_shift': 0.0,
                 's1_speed': 1.0
             },
-            'crossfader': crossfader / 100.0
+            # Raw 0-100 (matches render()'s own default of 50 and its
+            # internal /100.0 -- pre-dividing here too used to silently
+            # crush Song 2 to ~1% volume at the default 50/50 crossfader,
+            # since render() would divide by 100 a SECOND time).
+            'crossfader': crossfader
         }
 
-        # Convert stem volumes to engine format
+        # Convert stem volumes to engine format -- these have to land inside
+        # params['sliders'], since that's the only dict render()'s `sliders`
+        # variable ever actually reads from.
         for slot in range(2):
             if volumes.get(slot):
                 for stem_name, vol in volumes[slot].items():
-                    params[f's{slot}_{stem_name}_volume'] = vol
+                    params['sliders'][f's{slot}_{stem_name}_volume'] = vol
 
         logging.info(f"Rendering mix: beatmatch={params['beatmatch']}, beat_offsets={beat_offsets}, target_bpm={target_bpm}")
 
         # Render using engine (applies beatmatching and beat offset)
         try:
             engine.render(params, preview=False)
-            output_file = BASE_DIR / 'final_remix.mp3'
+            output_file = BASE_DIR / 'final_remix.wav'
 
-            if output_file.exists():
-                # Convert MP3 to FLAC
-                import subprocess
-                result = subprocess.run(
-                    ['ffmpeg', '-y', '-i', str(output_file), '-c:a', 'flac', str(final_flac)],
-                    capture_output=True,
-                    text=True,
-                    timeout=300
-                )
-
-                if result.returncode == 0 and final_flac.exists():
-                    # Add FLAC tags
-                    try:
-                        audio = FLAC(str(final_flac))
-                        audio['TITLE'] = f'{mix_name} Mix'
-                        bpm_str = str(bpm_label).split('-')[0] if isinstance(bpm_label, str) else str(bpm_label)
-                        try:
-                            audio['BPM'] = str(int(float(bpm_str)))
-                        except (ValueError, IndexError):
-                            audio['BPM'] = str(bpm_label)
-                        audio['INITIALKEY'] = str(key)
-                        audio['ARTIST'] = 'DualSync Pro'
-                        audio['COMMENT'] = f'Mixed with beatmatch (offset: {beat_offsets[1]} beats)'
-                        audio.save()
-                        logging.info(f"✅ Tagged FLAC: {final_flac.name} (BPM: {audio['BPM'][0]}, Key: {key})")
-                    except Exception as tag_err:
-                        logging.error(f"FLAC tagging failed: {tag_err}")
-
-                    # Cleanup
-                    output_file.unlink(missing_ok=True)
-
-                    logging.info(f"✅ Mix rendered with beatmatching: {final_flac}")
-                    return jsonify({
-                        'status': 'success',
-                        'file': f'/api/download-file/{final_flac.name}',
-                        'size_mb': round(final_flac.stat().st_size / (1024 * 1024), 2)
-                    })
-                else:
-                    logging.error(f"FLAC conversion failed: {result.stderr}")
-                    output_file.unlink(missing_ok=True)
-                    return jsonify({'error': 'FLAC conversion failed'}), 500
-            else:
+            if not output_file.exists():
                 return jsonify({'error': 'Render output not found'}), 500
+
+            shutil.move(str(output_file), str(final_wav))
+
+            # Parse the bpm label the same way the rest of this endpoint
+            # already does ("115", "115.5", "115-manual-115-measured").
+            bpm_str = str(bpm_label).split('-')[0] if isinstance(bpm_label, str) else str(bpm_label)
+            try:
+                numeric_bpm = float(bpm_str)
+            except (ValueError, TypeError):
+                numeric_bpm = None
+
+            if numeric_bpm:
+                try:
+                    engine.write_acid_chunk(str(final_wav), numeric_bpm, key if key in
+                                             ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] else None)
+                    logging.info(f"✅ Wrote ACID chunk: {final_wav.name} (BPM: {numeric_bpm}, Key: {key})")
+                except Exception as acid_err:
+                    logging.error(f"ACID chunk write failed: {acid_err}", exc_info=True)
+            else:
+                logging.warning(f"No numeric BPM available ('{bpm_label}') -- skipping ACID chunk")
+
+            # Basic descriptive tags too (title/artist/bpm/key/comment) --
+            # secondary to the ACID chunk above, but still useful for any
+            # player/tagger that reads ID3-in-WAV.
+            try:
+                audio = WAVE(str(final_wav))
+                if audio.tags is None:
+                    audio.add_tags()
+                audio.tags.add(TIT2(encoding=3, text=f'{mix_name} Mix'))
+                audio.tags.add(TPE1(encoding=3, text='DualSync Pro'))
+                if numeric_bpm:
+                    audio.tags.add(TBPM(encoding=3, text=str(int(round(numeric_bpm)))))
+                audio.tags.add(TKEY(encoding=3, text=str(key)))
+                audio.tags.add(COMM(encoding=3, lang='eng', desc='', text=f'Mixed with beatmatch (offset: {beat_offsets[1]} beats)'))
+                audio.save()
+            except Exception as tag_err:
+                logging.error(f"WAV tagging failed: {tag_err}")
+
+            logging.info(f"✅ Mix rendered with beatmatching: {final_wav}")
+            return jsonify({
+                'status': 'success',
+                'file': f'/api/download-file/{final_wav.name}',
+                'size_mb': round(final_wav.stat().st_size / (1024 * 1024), 2)
+            })
 
         except Exception as render_err:
             logging.error(f"Engine render failed: {render_err}", exc_info=True)
@@ -603,22 +726,21 @@ def render_final_mix():
 
 @app.route('/api/download-stems-zip', methods=['POST'])
 def download_stems_zip():
-    """Download all stems as ZIP with FLAC format and tags"""
+    """Download all stems as a ZIP of WAVs, each carrying an ACID chunk
+    (BPM/key) so DAWs can auto-detect tempo on import -- see _tag_stem_wav."""
     data = request.json
     try:
         import zipfile
         import io
-        import subprocess
-        from mutagen.flac import FLAC
         import tempfile
-        import os
+        from mashup_engine import MashupEngine
 
         timestamps = data.get('timestamps')
         metadata_list = data.get('metadata', [None, None])  # [{filename, bpm, key}, ...]
         include_original = data.get('include_original', True)
         include_processed = data.get('include_processed', True)
 
-        # Create temporary directory for FLAC conversions
+        engine = MashupEngine()
         temp_dir = tempfile.mkdtemp()
 
         zip_buffer = io.BytesIO()
@@ -639,48 +761,15 @@ def download_stems_zip():
 
                 logging.info(f"Processing slot {slot}: {song_name} ({key} {bpm}BPM)")
 
-                # Add original stems as FLAC
                 if include_original:
                     for stem in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
                         stem_file = stems_dir / f"{stem}.wav"
                         if stem_file.exists():
-                            # Convert WAV to FLAC with tags
-                            flac_name = f"{song_name}-{bpm}-{key}-{stem}.flac"
-                            flac_path = Path(temp_dir) / flac_name
+                            wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
+                            dest_path = Path(temp_dir) / wav_name
+                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem)
+                            zip_file.write(str(dest_path), f"original/{wav_name}")
 
-                            # Use FFmpeg to convert to FLAC
-                            cmd = [
-                                'ffmpeg', '-i', str(stem_file),
-                                '-c:a', 'flac', '-y',
-                                str(flac_path)
-                            ]
-                            result = subprocess.run(cmd, capture_output=True, timeout=60)
-
-                            if result.returncode == 0 and flac_path.exists():
-                                # Add FLAC tags
-                                try:
-                                    audio = FLAC(str(flac_path))
-                                    audio['TITLE'] = f'{song_name} ({stem})'
-                                    # Extract numeric BPM from various formats
-                                    bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
-                                    try:
-                                        audio['BPM'] = str(int(float(bpm_str)))
-                                    except (ValueError, IndexError):
-                                        audio['BPM'] = str(bpm)
-                                    audio['INITIALKEY'] = str(key)
-                                    audio['ARTIST'] = song_name
-                                    audio['COMMENT'] = f'{stem} stem - DualSync Pro'
-                                    audio.save()
-                                    logging.info(f"✅ Tagged FLAC: {flac_name}")
-                                except Exception as tag_err:
-                                    logging.error(f"FLAC tagging failed: {tag_err}")
-
-                                arcname = f"original/{flac_name}"
-                                zip_file.write(str(flac_path), arcname)
-                            else:
-                                logging.error(f"FLAC conversion failed for {stem}")
-
-                # Add processed stems as FLAC
                 if include_processed:
                     for stem in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
                         stem_file = stems_dir / f"{stem}_processed.wav"
@@ -688,41 +777,10 @@ def download_stems_zip():
                             stem_file = stems_dir / f"{stem}.wav"
 
                         if stem_file.exists():
-                            # Convert WAV to FLAC with tags
-                            flac_name = f"{song_name}-{bpm}-{key}-{stem}.flac"
-                            flac_path = Path(temp_dir) / f"processed_{flac_name}"
-
-                            # Use FFmpeg to convert to FLAC
-                            cmd = [
-                                'ffmpeg', '-i', str(stem_file),
-                                '-c:a', 'flac', '-y',
-                                str(flac_path)
-                            ]
-                            result = subprocess.run(cmd, capture_output=True, timeout=60)
-
-                            if result.returncode == 0 and flac_path.exists():
-                                # Add FLAC tags
-                                try:
-                                    audio = FLAC(str(flac_path))
-                                    audio['TITLE'] = f'{song_name} ({stem})'
-                                    # Extract numeric BPM from various formats
-                                    bpm_str = str(bpm).split('-')[0] if isinstance(bpm, str) else str(bpm)
-                                    try:
-                                        audio['BPM'] = str(int(float(bpm_str)))
-                                    except (ValueError, IndexError):
-                                        audio['BPM'] = str(bpm)
-                                    audio['INITIALKEY'] = str(key)
-                                    audio['ARTIST'] = song_name
-                                    audio['COMMENT'] = f'{stem} stem - DualSync Pro'
-                                    audio.save()
-                                    logging.info(f"✅ Tagged FLAC: {flac_name}")
-                                except Exception as tag_err:
-                                    logging.error(f"FLAC tagging failed: {tag_err}")
-
-                                arcname = f"processed/{flac_name}"
-                                zip_file.write(str(flac_path), arcname)
-                            else:
-                                logging.error(f"FLAC conversion failed for processed {stem}")
+                            wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
+                            dest_path = Path(temp_dir) / f"processed_{wav_name}"
+                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem)
+                            zip_file.write(str(dest_path), f"processed/{wav_name}")
 
         # Cleanup temp directory
         import shutil
@@ -744,6 +802,80 @@ def download_stems_zip():
 
     except Exception as e:
         logging.error(f"ZIP error: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/download-unaligned-stems', methods=['POST'])
+def download_unaligned_stems():
+    """On-demand only: separate + download the stems of the ORIGINAL
+    (pre-beatgrid-alignment) WAV for songs where 'Align beatgrid first' was
+    used. Not run automatically -- Demucs separation is expensive and most
+    users downloading the (already generated) aligned stems won't need it."""
+    data = request.json or {}
+    try:
+        import zipfile
+        import io
+        import shutil
+        import tempfile
+        from mashup_engine import MashupEngine
+
+        wav_filenames = data.get('wav_filenames', [None, None])
+        metadata_list = data.get('metadata', [None, None])
+
+        audio_dir = BASE_DIR / 'Audio'
+        engine = MashupEngine()
+        temp_dir = tempfile.mkdtemp()
+
+        zip_buffer = io.BytesIO()
+        wrote_any = False
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for slot, wav_filename in enumerate(wav_filenames):
+                if not wav_filename:
+                    continue
+                wav_path = audio_dir / wav_filename
+                if not wav_path.exists():
+                    logging.error(f"Unaligned WAV not found for slot {slot}: {wav_filename}")
+                    continue
+
+                meta = metadata_list[slot] or {}
+                raw_filename = meta.get('filename', f'Song_{slot + 1}')
+                song_name = Path(raw_filename).stem
+                bpm = meta.get('bpm', '?')
+                key = meta.get('key', '?')
+
+                logging.info(f"Separating unaligned original for slot {slot}: {song_name}")
+                stem_dict = engine.separate_stems([str(wav_path)])[0]
+
+                for stem_name, stem_path in stem_dict.items():
+                    if not Path(stem_path).exists():
+                        continue
+
+                    wav_name = f"{song_name}-{bpm}-{key}-{stem_name}.wav"
+                    dest_path = Path(temp_dir) / wav_name
+                    _tag_stem_wav(engine, stem_path, dest_path, song_name, bpm, key, f"{stem_name} (unaligned original)")
+                    zip_file.write(str(dest_path), f"unaligned_original/{wav_name}")
+                    wrote_any = True
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if not wrote_any:
+            return jsonify({'error': 'No unaligned WAVs found to separate'}), 400
+
+        zip_buffer.seek(0)
+        timestamp_str = int(time.time() * 1000)
+        zip_path = audio_dir / f'unaligned_stems_{timestamp_str}.zip'
+        with open(zip_path, 'wb') as f:
+            f.write(zip_buffer.getvalue())
+
+        logging.info(f"✅ Unaligned stems ZIP created: {zip_path}")
+        return jsonify({
+            'status': 'success',
+            'file': f'/api/download-file/{zip_path.name}',
+            'size_mb': round(zip_path.stat().st_size / (1024 * 1024), 2)
+        })
+
+    except Exception as e:
+        logging.error(f"Unaligned stems ZIP error: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
 

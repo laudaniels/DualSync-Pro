@@ -23,6 +23,8 @@ function SongMixer({
   audioReady,
   pendingSong,
   processingStage,
+  canSnapToSong1,
+  waitingForSong1,
   onBpmOverride,
   onKeyOverride,
   onToggleEditingBpm,
@@ -40,6 +42,16 @@ function SongMixer({
       {metadata && (
         <div className="metadata">
           <p><strong>{metadata.filename}</strong></p>
+          {hasStems && (metadata.detectedBpm || metadata.detectedKey) && (
+            <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
+              Initial: {metadata.detectedBpm} BPM{metadata.detectedBpm && metadata.detectedKey ? ', ' : ''}{metadata.detectedKey}
+            </p>
+          )}
+          {hasStems && metadata.gridCorrection && (
+            <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
+              {metadata.mode === 'snap' ? '🧲 Snap' : '🎯 Alignment'} corrected: {metadata.gridCorrection.mean_ms}ms avg (max {metadata.gridCorrection.max_ms}ms)
+            </p>
+          )}
           {hasStems && (
           <div style={{ marginTop: '10px', display: 'flex', gap: '20px', fontSize: '13px' }}>
             {/* BPM Override */}
@@ -182,7 +194,16 @@ function SongMixer({
             {loading ? (
               <div className="loader">
                 <div className="spinner"></div>
-                <p>{processingStage === 'align' ? 'Aligning beatgrid...' : 'Separating stems... (this may take a minute)'}</p>
+                <p>
+                  {processingStage === 'align' ? 'Aligning beatgrid...'
+                    : processingStage === 'snap' ? 'Snapping beat grid to Song 1...'
+                    : 'Separating stems... (this may take a minute)'}
+                </p>
+              </div>
+            ) : waitingForSong1 ? (
+              <div className="loader">
+                <div className="spinner"></div>
+                <p>⏳ Waiting for Song 1 to finish, so all 3 options (including snapping to it) can be shown together...</p>
               </div>
             ) : (
               <>
@@ -217,6 +238,23 @@ function SongMixer({
                 >
                   2️⃣ Align beatgrid first
                 </button>
+                {canSnapToSong1 && (
+                  <button
+                    onClick={() => onChooseMode(slot, 'snap')}
+                    style={{
+                      background: 'transparent',
+                      color: '#22c55e',
+                      border: '2px solid #22c55e',
+                      padding: '14px 24px',
+                      borderRadius: '8px',
+                      cursor: 'pointer',
+                      fontSize: '14px',
+                      width: '80%'
+                    }}
+                  >
+                    3️⃣ 🧲 Snap beat grid to Song 1
+                  </button>
+                )}
               </>
             )}
           </div>

@@ -10,7 +10,13 @@ BASE_DIR = Path(__file__).resolve().parent
 class MashupEngine:
     """Build FFmpeg mixes and optionally prepare Demucs source stems."""
 
+    # Demucs' own native output stems -- used only to locate its raw files
+    # on disk in separate_stems() before the drums stem gets split further.
     STEM_NAMES = ("vocals", "drums", "bass", "other")
+    # The actual final 7-stem structure used everywhere else (render(),
+    # the API, the frontend) once separate_stems() has split "drums" into
+    # its 4 components.
+    FINAL_STEM_NAMES = ("vocals", "kick", "snare", "hihat", "tom", "bass", "other")
     TARGET_SAMPLE_RATE = 44100
 
     # Class-level, not per-instance: the GUI creates a fresh MashupEngine()
@@ -259,8 +265,10 @@ class MashupEngine:
 
     def analyze_track_and_key(self, song_path):
         """Detect BPM and key in a single pass with 5-pass BPM strategy.
-        Returns tuple: (bpm, beat_anchor, key).
+        Returns tuple: (bpm, beat_anchor, key, scale).
         Key is 0-11 (C=0, C#=1, ..., B=11), or -1 if detection fails.
+        Scale is 'major', 'minor', or None if the mode couldn't be determined
+        (only Essentia detects mode; Librosa's chroma-argmax approach can't).
 
         Strategy:
         - BPM: 5 passes for robustness (intro often BPM-less, use middle for small files)
@@ -277,7 +285,7 @@ class MashupEngine:
             y, sr = librosa.load(song_path, sr=None, mono=True)
         except Exception as e:
             logging.error(f"Failed to load audio: {e}")
-            return 120.0, 0.0, -1
+            return 120.0, 0.0, -1, None
 
         # BPM detection using Essentia first (better accuracy than a single
         # Librosa pass; madmom would have been the neural-net alternative
@@ -355,21 +363,30 @@ class MashupEngine:
         except Exception as e:
             logging.warning(f"Librosa key detection failed: {e}")
 
-        # Secondary: Essentia for verification/cross-check
+        # Secondary: Essentia for verification/cross-check -- also the ONLY
+        # source of scale (major/minor); Librosa's chroma-argmax approach
+        # has no concept of mode at all.
+        scale = None
         try:
             from essentia.standard import MonoLoader, KeyExtractor
 
             loader = MonoLoader(filename=song_path, sampleRate=44100)
             audio = loader()
             key_extractor = KeyExtractor()
-            key_str, confidence = key_extractor(audio)
+            # KeyExtractor returns (key, scale, strength) -- a 3-tuple, not
+            # 2. Unpacking this into 2 variables used to throw on every
+            # single call ("too many values to unpack"), silently discarding
+            # Essentia's key AND scale/mode and falling back to Librosa
+            # (which can't detect mode at all) every time.
+            key_str, scale_str, confidence = key_extractor(audio)
 
             if key_str and confidence > 0.5:
                 key_notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
                 key_name = key_str.split()[0]
                 if key_name in key_notes:
                     key_essentia = key_notes.index(key_name)
-                    logging.info(f"✅ Essentia key: {key_name} (confidence: {confidence:.2f})")
+                    scale = scale_str if scale_str in ('major', 'minor') else None
+                    logging.info(f"✅ Essentia key: {key_name} {scale} (confidence: {confidence:.2f})")
         except Exception as e:
             logging.warning(f"Essentia key detection failed: {e}")
 
@@ -384,7 +401,7 @@ class MashupEngine:
             key = key_essentia
             logging.info(f"Using Essentia key (Librosa failed): {self._key_to_note(key)}")
 
-        return bpm, beat_anchor, key
+        return bpm, beat_anchor, key, scale
 
     def analyze_key(self, song_path):
         """Detect the musical key using librosa chroma (reliable) or essentia (fallback).
@@ -452,8 +469,12 @@ class MashupEngine:
         (removes wobble, keeps the same overall tempo). Pass a specific BPM
         to align and retarget tempo in one pass.
 
-        Returns (output_path, bpm, beat_anchor) -- bpm/beat_anchor are from
-        the ORIGINAL (pre-alignment) analysis, for the caller to log/store.
+        Returns (output_path, bpm, beat_anchor, mean_correction_ms,
+        max_correction_ms) -- bpm/beat_anchor are from the ORIGINAL
+        (pre-alignment) analysis; the correction stats are how far each
+        detected beat sat from its ideal grid position before warping (the
+        actual size of the drift this step corrected), for the caller to
+        log/store/display.
 
         Raises RuntimeError if rubberband isn't installed, or if fewer than
         2 beats were detected (nothing to align to).
@@ -496,56 +517,242 @@ class MashupEngine:
             if target_bpm is None:
                 target_bpm = bpm
 
-            info = sf.info(str(wav_in))
-            sr = info.samplerate
-            total_frames = info.frames
-
-            ideal_interval = 60.0 / target_bpm
-            first_beat = float(ticks[0])
-
-            # Timemap: (source_frame, target_frame) pairs -- anchor the file
-            # start, snap each beat to its ideal grid position, then hold the
-            # tail (after the last beat) at a constant offset so it isn't cut.
-            timemap = [(0, 0)]
-            for i, t in enumerate(ticks):
-                src = int(float(t) * sr)
-                tgt = int((first_beat + i * ideal_interval) * sr)
-                timemap.append((src, tgt))
-
-            last_src = int(float(ticks[-1]) * sr)
-            last_tgt = int((first_beat + (len(ticks) - 1) * ideal_interval) * sr)
-            tail_frames = total_frames - last_src
-            total_output_frames = last_tgt + tail_frames
-            timemap.append((total_frames, total_output_frames))
-
-            time_ratio = total_output_frames / total_frames if total_frames > 0 else 1.0
-
-            map_path = tmpdir / "timemap.txt"
-            with open(map_path, "w") as f:
-                for src, tgt in timemap:
-                    f.write(f"{src} {tgt}\n")
-
-            wav_out = tmpdir / "out.wav"
-            result = subprocess.run(
-                ["rubberband", "--timemap", str(map_path), "-t", f"{time_ratio:.10f}",
-                 str(wav_in), str(wav_out)],
-                capture_output=True, text=True, timeout=600
+            time_ratio, mean_correction_ms, max_correction_ms = self._warp_beats_to_grid(
+                wav_in, ticks, target_bpm, float(ticks[0]), output_path, tmpdir
             )
-            if result.returncode != 0:
-                raise RuntimeError(f"RubberBand beatgrid warp failed: {result.stderr[-500:]}")
 
-            # Encode to the requested output path/format (the rest of the
-            # pipeline feeds a plain WAV into Demucs)
+        logging.info(f"🎯 Beatgrid aligned: {len(ticks)} beats -> {target_bpm:.1f} BPM steady grid "
+                     f"(time ratio {time_ratio:.4f}, mean correction {mean_correction_ms:.1f}ms, "
+                     f"max {max_correction_ms:.1f}ms)")
+        return str(output_path), bpm, beat_anchor, mean_correction_ms, max_correction_ms
+
+    def snap_to_reference(self, input_path, output_path, reference_bpm, reference_anchor):
+        """Warp input_path's beats onto ANOTHER track's beat grid (its bpm +
+        anchor phase) instead of an idealized self-grid -- so two different
+        songs' beat grids stay phase-locked for the whole track instead of
+        slowly drifting apart, which a single constant-ratio stretch
+        (time_stretch_audio) can't guarantee since it only targets an
+        average tempo within some tolerance. Same per-beat rubberband
+        --timemap mechanism as align_beatgrid, just anchored to the
+        reference's grid instead of the input's own first beat.
+
+        Returns (output_path, bpm, beat_anchor, mean_correction_ms,
+        max_correction_ms) -- bpm/beat_anchor are from the ORIGINAL
+        (pre-warp) analysis of input_path; the correction stats are how far
+        each of input_path's detected beats sat from the reference's ideal
+        grid position before warping, for the caller to log/store/display.
+
+        Raises RuntimeError if rubberband isn't installed, or if fewer than
+        2 beats were detected in input_path (nothing to warp).
+        """
+        import logging
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        if shutil.which("rubberband") is None:
+            raise RuntimeError(
+                "Beat-grid snapping needs the 'rubberband' command-line tool.\n"
+                "Install it with: apt-get install rubberband-cli (Linux) or "
+                "brew install rubberband (macOS)."
+            )
+
+        os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            # Same MP3-decoder-mismatch reasoning as align_beatgrid: detect
+            # beats on the same decoded WAV that gets warped.
+            wav_in = tmpdir / "in.wav"
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(wav_out), str(output_path)],
+                ["ffmpeg", "-y", "-i", str(input_path), "-ar", "44100", str(wav_in)],
                 capture_output=True, text=True, timeout=120
             )
             if result.returncode != 0:
-                raise RuntimeError(f"Could not finalize aligned output: {result.stderr[-500:]}")
+                raise RuntimeError(f"Could not convert input to WAV: {result.stderr[-500:]}")
 
-        logging.info(f"🎯 Beatgrid aligned: {len(ticks)} beats -> {target_bpm:.1f} BPM steady grid "
-                     f"(time ratio {time_ratio:.4f})")
-        return str(output_path), bpm, beat_anchor
+            bpm, beat_anchor, ticks = self._detect_beats_essentia(str(wav_in))
+
+            time_ratio, mean_correction_ms, max_correction_ms = self._warp_beats_to_grid(
+                wav_in, ticks, reference_bpm, reference_anchor, output_path, tmpdir
+            )
+
+        logging.info(f"🧲 Snapped to reference grid: {len(ticks)} beats -> {reference_bpm:.1f} BPM "
+                     f"(anchor {reference_anchor:.2f}s, time ratio {time_ratio:.4f}, "
+                     f"mean correction {mean_correction_ms:.1f}ms, max {max_correction_ms:.1f}ms)")
+        return str(output_path), bpm, beat_anchor, mean_correction_ms, max_correction_ms
+
+    def _warp_beats_to_grid(self, wav_in, ticks, target_bpm, target_anchor, output_path, tmpdir):
+        """Shared core of align_beatgrid/snap_to_reference: build a rubberband
+        --timemap mapping each detected beat in `ticks` onto an evenly-spaced
+        grid of `target_bpm` starting at `target_anchor` seconds, warp
+        wav_in through it, and encode the result to output_path.
+
+        Returns (time_ratio, mean_correction_ms, max_correction_ms):
+        time_ratio is the overall ratio applied (output duration / input
+        duration); the correction stats are how far each detected beat sat
+        from its ideal grid position BEFORE warping -- i.e. the actual size
+        of the drift/misalignment this step corrected, in milliseconds,
+        averaged and worst-case across all beats."""
+        import subprocess
+        import soundfile as sf
+
+        info = sf.info(str(wav_in))
+        sr = info.samplerate
+        total_frames = info.frames
+
+        ideal_interval = 60.0 / target_bpm
+
+        # Timemap: (source_frame, target_frame) pairs -- anchor the file
+        # start, snap each beat to its ideal grid position, then hold the
+        # tail (after the last beat) at a constant offset so it isn't cut.
+        timemap = [(0, 0)]
+        corrections_ms = []
+        for i, t in enumerate(ticks):
+            src = int(float(t) * sr)
+            tgt = max(0, int((target_anchor + i * ideal_interval) * sr))
+            timemap.append((src, tgt))
+            corrections_ms.append(abs(src - tgt) / sr * 1000.0)
+
+        last_src = int(float(ticks[-1]) * sr)
+        last_tgt = max(0, int((target_anchor + (len(ticks) - 1) * ideal_interval) * sr))
+        tail_frames = total_frames - last_src
+        total_output_frames = last_tgt + tail_frames
+        timemap.append((total_frames, total_output_frames))
+
+        time_ratio = total_output_frames / total_frames if total_frames > 0 else 1.0
+        mean_correction_ms = sum(corrections_ms) / len(corrections_ms) if corrections_ms else 0.0
+        max_correction_ms = max(corrections_ms) if corrections_ms else 0.0
+
+        map_path = tmpdir / "timemap.txt"
+        with open(map_path, "w") as f:
+            for src, tgt in timemap:
+                f.write(f"{src} {tgt}\n")
+
+        wav_out = tmpdir / "out.wav"
+        result = subprocess.run(
+            ["rubberband", "--timemap", str(map_path), "-t", f"{time_ratio:.10f}",
+             str(wav_in), str(wav_out)],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"RubberBand beatgrid warp failed: {result.stderr[-500:]}")
+
+        # Encode to the requested output path/format (the rest of the
+        # pipeline feeds a plain WAV into Demucs)
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", str(wav_out), str(output_path)],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Could not finalize warped output: {result.stderr[-500:]}")
+
+        return time_ratio, mean_correction_ms, max_correction_ms
+
+    def normalize_peak(self, input_path, output_path, target_peak=0.97):
+        """Peak-normalize audio so its loudest sample sits at exactly
+        `target_peak` (linear, 0-1) of full scale -- a pure gain change, so
+        it doesn't touch the waveform shape or affect BPM/key detection.
+        Two ffmpeg passes: measure the current peak, then apply the exact
+        gain needed to reach the target. Returns True on success; on
+        failure, logs a warning and leaves the file untouched (returns
+        False) rather than raising, since normalization is a nice-to-have,
+        not something that should block the upload."""
+        import logging
+        import math
+        import os
+        import re
+        import subprocess
+
+        try:
+            measure = subprocess.run(
+                ["ffmpeg", "-i", str(input_path), "-af", "volumedetect", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=120
+            )
+            match = re.search(r"max_volume:\s*(-?\d+(?:\.\d+)?)\s*dB", measure.stderr)
+            if not match:
+                logging.warning(f"Peak normalization skipped (couldn't measure level): {input_path}")
+                return False
+
+            current_peak_db = float(match.group(1))
+            target_peak_db = 20 * math.log10(target_peak)
+            gain_db = target_peak_db - current_peak_db
+
+            temp_output = f"{output_path}.normtmp.wav"
+            result = subprocess.run(
+                ["ffmpeg", "-y", "-i", str(input_path), "-af", f"volume={gain_db:.3f}dB", temp_output],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                logging.warning(f"Peak normalization failed, leaving original levels: {result.stderr[-300:]}")
+                os.remove(temp_output) if os.path.exists(temp_output) else None
+                return False
+
+            os.replace(temp_output, output_path)
+            logging.info(f"🔊 Peak-normalized to {target_peak*100:.0f}% (was {current_peak_db:.1f} dB, applied {gain_db:+.2f} dB)")
+            return True
+
+        except Exception as e:
+            logging.warning(f"Peak normalization failed, leaving original levels: {e}")
+            return False
+
+    def write_acid_chunk(self, wav_path, bpm, key=None):
+        """Append a Sonic Foundry ACID chunk to a WAV file so DAWs can
+        auto-detect its tempo/key on import. This -- NOT FLAC Vorbis
+        comments or ID3 tags -- is the actual convention FL Studio, Logic,
+        Cubase, Reaper, Reason, Sound Forge, and Samplitude read for sample
+        tempo detection; a 'BPM' Vorbis field in a FLAC is correctly
+        embedded metadata that those importers simply never look at.
+
+        `key` is a note name ("C".."B", matching _key_to_note's output) or
+        None if unknown. Mutates wav_path in place.
+        """
+        import struct
+
+        key_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+        with open(wav_path, 'rb') as f:
+            data = f.read()
+        if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+            raise ValueError(f"{wav_path} is not a valid WAV file")
+
+        import soundfile as sf
+        duration = sf.info(str(wav_path)).duration
+        num_beats = max(1, int(round(duration * bpm / 60.0)))
+
+        # type_flags bits: 0x01 one-shot, 0x02 root note is valid, 0x04
+        # "let this be time-stretched to the project tempo", 0x10 use the
+        # standard MIDI note range (C4=60) for the root note field below
+        # rather than the alternate 0x30-0x3B range.
+        type_flags = 0x04
+        if key is not None and key in key_names:
+            type_flags |= 0x02 | 0x10
+            root_note = 60 + key_names.index(key)
+        else:
+            root_note = 0
+
+        # 24-byte ACID payload: type_flags(u32), root_note(u16),
+        # unknown(u16, conventionally 0x8000), unknown(f32, conventionally
+        # 0), num_beats(u32), meter_denominator(u16), meter_numerator(u16),
+        # tempo(f32). Assumes 4/4 like the rest of this app's beat-grid code.
+        acid_payload = struct.pack(
+            '<IHHfIHHf',
+            type_flags, root_note, 0x8000, 0.0,
+            num_beats, 4, 4, float(bpm)
+        )
+        acid_chunk = b'acid' + struct.pack('<I', len(acid_payload)) + acid_payload
+        if len(acid_payload) % 2:
+            acid_chunk += b'\x00'  # RIFF chunks are word-aligned
+
+        new_data = data + acid_chunk
+        new_riff_size = len(new_data) - 8
+        new_data = new_data[:4] + struct.pack('<I', new_riff_size) + new_data[8:]
+
+        with open(wav_path, 'wb') as f:
+            f.write(new_data)
 
     def time_stretch_audio(self, input_path, output_path, target_bpm, source_bpm=None):
         """Time-stretch audio to exact target BPM with multi-pass verification.
@@ -580,13 +787,24 @@ class MashupEngine:
             else:
                 logging.warning("⚠️  RubberBand not found, falling back to FFmpeg atempo")
 
-            for pass_num in range(1, max_passes + 1):
+            # NOTE: this used to be a `for pass_num in range(...)` loop with
+            # `pass_num -= 1; continue` on failure -- reassigning a for-loop's
+            # variable does nothing (the next iteration still comes from
+            # range()), so a failed RubberBand pass silently skipped straight
+            # to the NEXT pass instead of actually retrying with FFmpeg, and
+            # the final pass returned success unconditionally even when badly
+            # off target. Rewritten as an explicit while-loop so retries and
+            # the tolerance check both work as intended.
+            pass_num = 1
+            rubberband_disabled = False
+            while pass_num <= max_passes:
                 tempo_ratio = target_bpm / current_source_bpm
-                temp_output = output_path if pass_num == max_passes else str(Path(output_path).parent / f"{Path(output_path).stem}_pass{pass_num}.wav")
+                is_last_pass = pass_num == max_passes
+                temp_output = output_path if is_last_pass else str(Path(output_path).parent / f"{Path(output_path).stem}_pass{pass_num}.wav")
 
                 # Pass 1: Always use FFmpeg for stability; RubberBand produces corrupted output on first pass
-                # Pass 2+: Try RubberBand if available
-                try_rubberband = use_rubberband and pass_num > 1
+                # Pass 2+: Try RubberBand if available (unless it already failed once)
+                try_rubberband = use_rubberband and not rubberband_disabled and pass_num > 1
 
                 if try_rubberband:
                     cmd = [
@@ -614,9 +832,9 @@ class MashupEngine:
                     engine_name = "RubberBand" if try_rubberband else "FFmpeg"
                     logging.error(f"{engine_name} failed: {result.stderr}")
                     if try_rubberband:
-                        logging.warning("RubberBand failed on Pass {pass_num}, retrying with FFmpeg...")
-                        pass_num -= 1
-                        continue
+                        logging.warning(f"RubberBand failed on pass {pass_num}, retrying this pass with FFmpeg...")
+                        rubberband_disabled = True
+                        continue  # retry the SAME pass_num, now forced to FFmpeg
                     return False, None
 
                 # Analyze output BPM
@@ -625,11 +843,10 @@ class MashupEngine:
                 # Safety check: if BPM detection fails (returns 0), mark as error
                 if measured_bpm <= 0:
                     logging.error(f"BPM analysis failed (got {measured_bpm}), output file may be corrupted")
-                    if use_rubberband:
-                        logging.warning("RubberBand output failed, retrying with FFmpeg...")
-                        use_rubberband = False
-                        pass_num -= 1
-                        continue
+                    if try_rubberband:
+                        logging.warning(f"RubberBand output corrupted on pass {pass_num}, retrying this pass with FFmpeg...")
+                        rubberband_disabled = True
+                        continue  # retry the SAME pass_num, now forced to FFmpeg
                     return False, None
 
                 bpm_error = abs(measured_bpm - target_bpm)
@@ -637,25 +854,32 @@ class MashupEngine:
 
                 if bpm_error <= bpm_tolerance:
                     # Converged! Copy to final output if needed
-                    if pass_num < max_passes:
+                    if not is_last_pass:
                         shutil.copy2(temp_output, output_path)
-                        for p in range(1, pass_num + 1):
-                            temp = Path(output_path).parent / f"{Path(output_path).stem}_pass{p}.wav"
-                            temp.unlink(missing_ok=True)
+                    for p in range(1, pass_num + 1):
+                        temp = Path(output_path).parent / f"{Path(output_path).stem}_pass{p}.wav"
+                        temp.unlink(missing_ok=True)
                     logging.info(f"✅ Time-stretched to {measured_bpm:.1f} BPM (target: {target_bpm}) in {pass_num} pass(es)")
                     return True, measured_bpm
 
-                # Prepare for next pass
-                if pass_num < max_passes:
-                    current_input = temp_output
-                    current_source_bpm = measured_bpm
-                else:
-                    # Last pass - clean up temp files
+                if is_last_pass:
+                    # Did NOT converge within tolerance after all passes --
+                    # report failure instead of silently handing back audio
+                    # at the wrong tempo.
+                    logging.error(
+                        f"Time-stretch did not converge: {measured_bpm:.1f} BPM vs target "
+                        f"{target_bpm} (error {bpm_error:.2f} BPM) after {max_passes} passes"
+                    )
                     for p in range(1, max_passes):
                         temp = Path(output_path).parent / f"{Path(output_path).stem}_pass{p}.wav"
                         temp.unlink(missing_ok=True)
-                    logging.info(f"✅ Time-stretched to {measured_bpm:.1f} BPM (target: {target_bpm}) after {max_passes} passes")
-                    return True, measured_bpm
+                    Path(output_path).unlink(missing_ok=True)
+                    return False, None
+
+                # Prepare for next pass
+                current_input = temp_output
+                current_source_bpm = measured_bpm
+                pass_num += 1
 
             return False, None
 
@@ -667,11 +891,13 @@ class MashupEngine:
             return False, None
 
     def pitch_shift_audio(self, input_path, output_path, semitones, source_key=None):
-        """Pitch-shift audio using FFmpeg asetrate filter (faster than librosa).
-        Positive semitones = pitch up, negative = pitch down.
+        """Pitch-shift audio by `semitones` while preserving tempo/duration.
+        Tries RubberBand's true pitch-shift first (--pitch), falls back to
+        FFmpeg's asetrate/atempo combo if RubberBand isn't available.
         Returns tuple (success, measured_key) where measured_key is the detected key of output."""
         import logging
         import os
+        import shutil
         import subprocess
 
         try:
@@ -680,41 +906,59 @@ class MashupEngine:
             # Ensure output directory exists
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-            # Use FFmpeg asetrate filter (much faster than librosa pitch_shift)
-            # pitch shift: rate = 2^(semitones/12)
             pitch_ratio = 2 ** (semitones / 12.0)
+            use_rubberband = shutil.which("rubberband") is not None
+            success = False
 
-            cmd = [
-                "ffmpeg", "-i", str(input_path),
-                "-af", f"asetrate=44100*{pitch_ratio},aresample=44100",
-                "-y", "-q:a", "9", str(output_path)
-            ]
+            if use_rubberband:
+                # -F preserves formants (avoids the "chipmunk"/"demon" voice
+                # artifact on vocal-heavy stems). No -t/-T given, so duration
+                # is untouched -- this is a true pitch-only shift.
+                cmd = ["rubberband", "--pitch", str(semitones), "-F", str(input_path), str(output_path)]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if result.returncode == 0:
+                    success = True
+                else:
+                    logging.warning(f"RubberBand pitch-shift failed: {result.stderr}, falling back to FFmpeg")
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode == 0:
-                logging.info(f"✅ Pitch-shifted {input_path} → {output_path} by {semitones} semitones (ratio {pitch_ratio:.4f})")
+            if not success:
+                # NOTE: asetrate alone changes pitch AND tempo together (it's
+                # a playback-speed trick) -- this used to be the whole filter
+                # chain, which silently sped up/slowed down the song by the
+                # pitch ratio (e.g. a +2 semitone shift made a 133 BPM song
+                # play at ~149 BPM). The atempo term(s) compensate the tempo
+                # back out so only pitch actually changes.
+                atempo_chain = self._atempo_chain(1 / pitch_ratio)
+                cmd = [
+                    "ffmpeg", "-i", str(input_path),
+                    "-af", f"asetrate=44100*{pitch_ratio},aresample=44100,{atempo_chain}",
+                    "-y", "-q:a", "9", str(output_path)
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if result.returncode != 0:
+                    logging.error(f"FFmpeg pitch shift failed: {result.stderr}")
+                    return False, -1
 
-                # Analyze the output to verify the key was shifted correctly
-                try:
-                    _, _, measured_key = self.analyze_track_and_key(str(output_path))
+            logging.info(f"✅ Pitch-shifted {input_path} → {output_path} by {semitones} semitones (ratio {pitch_ratio:.4f})")
 
-                    # Calculate expected key after shift
-                    if source_key is not None and source_key >= 0:
-                        expected_key = (source_key + semitones) % 12
-                        key_name_measured = self._key_to_note(measured_key) if measured_key >= 0 else "?"
-                        key_name_expected = self._key_to_note(expected_key)
-                        logging.info(f"✅ Key analysis: measured={key_name_measured}, expected={key_name_expected}")
-                    else:
-                        key_name_measured = self._key_to_note(measured_key) if measured_key >= 0 else "?"
-                        logging.info(f"✅ Key detected: {key_name_measured}")
+            # Analyze the output to verify the key was shifted correctly
+            try:
+                _, _, measured_key, _measured_scale = self.analyze_track_and_key(str(output_path))
 
-                    return True, measured_key
-                except Exception as key_err:
-                    logging.warning(f"Key analysis after pitch shift failed: {key_err}, but pitch shift succeeded")
-                    return True, -1
-            else:
-                logging.error(f"FFmpeg pitch shift failed: {result.stderr}")
-                return False, -1
+                # Calculate expected key after shift
+                if source_key is not None and source_key >= 0:
+                    expected_key = (source_key + semitones) % 12
+                    key_name_measured = self._key_to_note(measured_key) if measured_key >= 0 else "?"
+                    key_name_expected = self._key_to_note(expected_key)
+                    logging.info(f"✅ Key analysis: measured={key_name_measured}, expected={key_name_expected}")
+                else:
+                    key_name_measured = self._key_to_note(measured_key) if measured_key >= 0 else "?"
+                    logging.info(f"✅ Key detected: {key_name_measured}")
+
+                return True, measured_key
+            except Exception as key_err:
+                logging.warning(f"Key analysis after pitch shift failed: {key_err}, but pitch shift succeeded")
+                return True, -1
 
         except subprocess.TimeoutExpired:
             logging.error(f"Pitch shift timeout for {input_path}")
@@ -825,13 +1069,16 @@ class MashupEngine:
                 # a phase offset either, since nudging the reference's own
                 # anchor would just be a roundabout way of shifting every
                 # other track by the same amount -- same result, more
-                # confusing knob. Expressed in each other song's own native
-                # tempo. Alignment below is modulo one beat_period, so only
-                # the fractional part shifts anything audible -- whole-beat
-                # offsets land on an equivalent beat and cancel out. This is
-                # beat-level phase correction, not bar/downbeat selection.
-                offset_beats = 0.0 if slot == 0 else (beat_offsets[slot] if slot < len(beat_offsets) else 0.0)
-                anchor = anchor + offset_beats * (60.0 / detected_bpm)
+                # confusing knob.
+                #
+                # NOTE: the user's beat_offsets choice is intentionally NOT
+                # folded in here -- it's applied separately below as a plain
+                # forward delay (see user_delay), matching exactly what the
+                # live player does (DualStemPlayer.setBeatOffset: a direct,
+                # always-non-negative beats->seconds delay on Song 2, nothing
+                # more). This anchor is ONLY the automatic phase-correction
+                # target: where Song 2's beat would need to land to line up
+                # with Song 1's, before any of the user's own offset choice.
                 tempo_ratio = target_bpm / detected_bpm
                 pitch = float(sliders.get(f"s{slot}_pitch_shift", 0.0))
                 speed = float(sliders.get(f"s{slot}_speed", 1.0)) * tempo_ratio
@@ -864,32 +1111,31 @@ class MashupEngine:
             fade = fades.get(slot, 1.0)
             stem_set = stems_by_slot[slot] if slot < len(stems_by_slot) else None
             valid_stems = (isinstance(stem_set, dict) and
-                           all(name in stem_set and Path(stem_set[name]).is_file() for name in self.STEM_NAMES))
+                           all(name in stem_set and Path(stem_set[name]).is_file() for name in self.FINAL_STEM_NAMES))
 
             if valid_stems:
+                # Matches the keys server.py's /api/render-final-mix sends:
+                # params[f's{slot}_{stem_name}_volume'] for each of the 7 stems.
                 volumes = {
-                    "vocals": float(sliders.get(f"s{slot}_vocals_vol", 1.0)),
-                    "drums": float(sliders.get(f"s{slot}_beats_vol", 1.0)),
-                    "bass": float(sliders.get(f"s{slot}_bass_vol", 1.0)),
-                    "other": float(sliders.get(f"s{slot}_other_vol", 1.0)),
+                    stem: float(sliders.get(f"s{slot}_{stem}_volume", 1.0))
+                    for stem in self.FINAL_STEM_NAMES
                 }
                 labels = []
-                for stem in self.STEM_NAMES:
+                for stem in self.FINAL_STEM_NAMES:
                     inputs.extend(["-i", stem_set[stem]])
                     label = f"stem_{slot}_{stem}"
                     filters.append(f"[{input_number}:a]volume={volumes[stem] * fade}[{label}]")
                     labels.append(f"[{label}]")
                     input_number += 1
-                chain = "".join(labels) + f"amix=inputs=4:normalize=0,{normalize}"
+                chain = "".join(labels) + f"amix=inputs={len(self.FINAL_STEM_NAMES)}:normalize=0,{normalize}"
             else:
-                inputs.extend(["-i", song])
-                total_volume = (
-                    float(sliders.get(f"s{slot}_vocals_vol", 1.0)) +
-                    float(sliders.get(f"s{slot}_beats_vol", 1.0)) +
-                    float(sliders.get(f"s{slot}_bass_vol", 1.0))
-                ) / 3 * fade
-                chain = f"[{input_number}:a]volume={total_volume},{normalize}"
-                input_number += 1
+                # There's no raw (pre-separation) song file kept around at
+                # render time in this app -- everything downstream of upload
+                # is stems-only, so there's nothing sensible to fall back to.
+                raise RuntimeError(
+                    f"Song {slot + 1}'s stems are missing or incomplete -- cannot render without them. "
+                    f"Try reprocessing this song's stems."
+                )
 
             # BPM-match this track to the user's target tempo, if both a
             # target and a detected BPM are available. Falsy detected_bpm
@@ -899,13 +1145,30 @@ class MashupEngine:
 
             chain, _duration_scale = self._effects(chain, sliders, slot, tempo_ratio)
 
-            # Nudge this track's start later (never earlier -- delaying is
-            # the only direction adelay can go) so its beat anchor lines up
-            # with the reference track's, modulo one beat period.
+            # Two INDEPENDENT delay contributions, both always >= 0 (adelay
+            # can only push a track later, never earlier -- summing two
+            # non-negative delays can never go negative, unlike trying to
+            # fold the user's offset into the anchor before modulo-wrapping):
+            #
+            # 1. The user's own beat-offset choice, as a plain forward delay
+            #    -- matches the live player exactly (DualStemPlayer's
+            #    DelayNode: beats/bpm*60, nothing more), so what you hear in
+            #    the final render matches what you heard live, bars and all.
+            offset_beats = 0.0 if slot == 0 else (beat_offsets[slot] if slot < len(beat_offsets) else 0.0)
+            effective_bpm = target_bpm if (beatmatch and detected_bpm) else detected_bpm
+            user_delay = (offset_beats * 60.0 / effective_bpm) if (offset_beats and effective_bpm) else 0.0
+
+            # 2. Automatic phase correction from beatmatching -- a small,
+            #    modulo-one-beat nudge so this track's OWN natural beat lines
+            #    up with the reference's, independent of whatever the user
+            #    additionally asked for above.
+            auto_delay = 0.0
             if beatmatch and reference_slot is not None and slot != reference_slot and slot in final_anchors:
-                delta = (final_anchors[reference_slot] - final_anchors[slot]) % beat_period
-                if delta > 0.005:
-                    chain += f",adelay={int(round(delta * 1000))}:all=1"
+                auto_delay = (final_anchors[reference_slot] - final_anchors[slot]) % beat_period
+
+            total_delay = user_delay + auto_delay
+            if total_delay > 0.005:
+                chain += f",adelay={int(round(total_delay * 1000))}:all=1"
 
             filters.append(f"{chain}[track_{slot}]")
             mixed_tracks.append(f"[track_{slot}]")
@@ -914,17 +1177,21 @@ class MashupEngine:
         filter_complex += ";" + "".join(mixed_tracks)
         filter_complex += f"amix=inputs={len(mixed_tracks)}:duration=longest:normalize=0,alimiter=limit=0.95[final]"
 
-        # Use unique preview files to avoid concurrent render conflicts
+        # Use unique preview files to avoid concurrent render conflicts.
+        # Preview stays MP3 (small, fast to generate/stream for a quick
+        # listen); the real final render is WAV -- genuinely lossless, and
+        # a WAV (not a FLAC re-encode of an already-lossy MP3, which is what
+        # this used to produce) is also what write_acid_chunk() needs to
+        # embed tempo/key info DAWs can actually read.
         if preview:
             import time
             timestamp = str(int(time.time() * 1000))[-8:]  # Last 8 digits of milliseconds
             output = str(BASE_DIR / f"preview_temp_{timestamp}.mp3")
         else:
-            output = str(BASE_DIR / "final_remix.mp3")
+            output = str(BASE_DIR / "final_remix.wav")
         command = [self.ffmpeg, "-y", *inputs, "-filter_complex", filter_complex, "-map", "[final]"]
-        command += ["-c:a", "libmp3lame", "-q:a", "2"]
         if preview:
-            command += ["-t", str(preview_duration)]
+            command += ["-c:a", "libmp3lame", "-q:a", "2", "-t", str(preview_duration)]
         command += [output]
 
         # Run via Popen (not subprocess.run) and track the process so
