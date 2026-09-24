@@ -1,7 +1,7 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import Waveform from './Waveform';
 import SongMixer from './SongMixer';
-import { stemNames, stemLabels } from './stemConstants';
+import { stemNames, stemLabels, orderStems } from './stemConstants';
 import { getKeyRecommendations, camelotCode, camelotDistanceBetween } from './camelotWheel';
 import { DualStemPlayer } from '../audio/DualStemPlayer';
 import '../styles/DualMixer.css';
@@ -65,6 +65,18 @@ export default function DualMixer() {
     0: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 },
     1: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 }
   });
+
+  // Whichever stems the loaded song(s) actually have -- 7 in legacy mode, 9
+  // in multi-engine mode (adds guitar/piano). Falls back to the legacy list
+  // before any song has loaded stems, so nothing downstream crashes on an
+  // empty array while pendingSong/upload UI is still showing.
+  const activeStemNames = useMemo(() => {
+    const keys = new Set();
+    for (const s of stems) {
+      if (s) Object.keys(s).forEach(k => keys.add(k));
+    }
+    return keys.size > 0 ? orderStems([...keys]) : stemNames;
+  }, [stems]);
 
   // Crossfader: 0 = song1 only, 50 = both, 100 = song2 only
   const [crossfader, setCrossfader] = useState(50);
@@ -307,7 +319,7 @@ export default function DualMixer() {
       }));
       setAudioReady(prev => {
         const updated = [...prev];
-        updated[slot] = playerRef.current.isSlotReady(slot, stemNames);
+        updated[slot] = playerRef.current.isSlotReady(slot, Object.keys(data.stems));
         return updated;
       });
 
@@ -341,7 +353,7 @@ export default function DualMixer() {
       // (no await before them) -- creating/resuming an AudioContext requires
       // a live user-gesture call stack.
       playerRef.current.ensureContext();
-      playerRef.current.play(stemNames);
+      playerRef.current.play(activeStemNames);
       setPlaying(true);
     }
   };
@@ -370,7 +382,7 @@ export default function DualMixer() {
     const percentage = clickX / rect.width;
     const newTime = percentage * duration;
 
-    playerRef.current.seek(newTime, stemNames);
+    playerRef.current.seek(newTime, activeStemNames);
     setCurrentTime(newTime);
   };
 
@@ -912,6 +924,7 @@ export default function DualMixer() {
               effectiveBpm={getEffectiveBpm(slot)}
               effectiveKey={getEffectiveKey(slot)}
               volumes={volumes[slot]}
+              stemNames={stems[slot] ? orderStems(Object.keys(stems[slot])) : []}
               audioReady={audioReady[slot]}
               pendingSong={pendingSong[slot]}
               processingStage={processingStage[slot]}
@@ -943,7 +956,7 @@ export default function DualMixer() {
               📊 Select Stems for Waveform Display {playing ? '(paused to enable)' : '(☑ paused only)'}
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '15px', justifyContent: 'center' }}>
-              {stemNames.map(stem => (
+              {activeStemNames.map(stem => (
                 <label key={stem} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: playing ? 'not-allowed' : 'pointer', opacity: playing ? 0.5 : 1 }}>
                   <input
                     type="checkbox"
@@ -959,7 +972,7 @@ export default function DualMixer() {
                     title={playing ? 'Pause to enable' : `Display ${stem} in waveform`}
                     style={{ cursor: playing ? 'not-allowed' : 'pointer', width: '16px', height: '16px' }}
                   />
-                  <span style={{ fontSize: '12px' }}>{stemLabels[stem]}</span>
+                  <span style={{ fontSize: '12px' }}>{stemLabels[stem] || stem}</span>
                 </label>
               ))}
             </div>

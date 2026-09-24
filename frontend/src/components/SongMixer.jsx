@@ -1,6 +1,6 @@
 import React from 'react';
 import StemLoader from './StemLoader';
-import { stemNames, stemLabels } from './stemConstants';
+import { stemLabels } from './stemConstants';
 
 const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -20,6 +20,7 @@ function SongMixer({
   effectiveBpm,
   effectiveKey,
   volumes,
+  stemNames,
   audioReady,
   pendingSong,
   processingStage,
@@ -268,9 +269,9 @@ function SongMixer({
       ) : (
         <div className="stem-controls">
           <h4>🎚️ Volumes {!audioReady && <span style={{ fontWeight: 'normal', fontSize: '11px', color: '#999' }}>(⏳ preparing audio...)</span>}</h4>
-          {stemNames.map(stem => (
+          {(stemNames || []).map(stem => (
             <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <label style={{ minWidth: '80px' }}>{stemLabels[stem]}</label>
+              <label style={{ minWidth: '80px' }}>{stemLabels[stem] || stem}</label>
               <input
                 type="range"
                 min="0"

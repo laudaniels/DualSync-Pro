@@ -189,7 +189,7 @@ def process_song():
         use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
 
         if use_multi_engine:
-            add_log_message("🚀 Separating stems using multi-engine pipeline (Mel-Band RoFormer + BS-RoFormer + HiFi++)...", slot)
+            add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep + HiFi++)...", slot)
             add_log_message("  Stage 1: Parallel vocal extraction + 6-stem separation", slot)
             add_log_message("  Stage 2: Drum splitting into kick/snare/hihat/tom", slot)
             add_log_message("  Stage 3: Optional HiFi++ GAN restoration", slot)
@@ -472,7 +472,9 @@ def process_stems():
         # Step 2: Now separate stems from the PROCESSED full song (includes auto drum splitting)
         _set_slot_state(slot, progress=50, current_step=_processing_state['steps'][3])
         add_log_message(f"🔊 Separating stems from processed song...", slot)
-        stem_dict = engine.separate_stems([str(current_input)])[0]
+        import os
+        use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
+        stem_dict = engine.separate_stems([str(current_input)], use_multi_engine=use_multi_engine)[0]
 
         # Copy processed stems to serve directory
         stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamp
@@ -617,12 +619,11 @@ def render_final_mix():
 
             stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamps[slot]
 
-            # Get stem files (7-stem structure: vocals, kick, snare, hihat, tom, bass, other)
-            stems = {}
-            for stem_name in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
-                stem_file = stems_dir / f"{stem_name}.wav"
-                if stem_file.exists():
-                    stems[stem_name] = str(stem_file)
+            # Discover whatever stem files actually exist on disk, rather than
+            # a hardcoded list -- this dir holds 7 stems in legacy mode or 9 in
+            # multi-engine mode (see DUALSYNC_MULTI_ENGINE), and a fixed list
+            # here used to silently drop guitar/piano from the final render.
+            stems = {f.stem: str(f) for f in stems_dir.glob('*.wav')} if stems_dir.is_dir() else {}
 
             if stems:
                 stems_list[slot] = stems
@@ -772,11 +773,11 @@ def download_stems_zip():
 
                 logging.info(f"Processing slot {slot}: {song_name} ({key} {bpm}BPM)")
 
-                # Dynamically discover available stems (supports both 7-stem legacy and 13-stem advanced)
+                # Dynamically discover available stems (supports both 7-stem legacy and 9-stem advanced)
                 # Legacy priority: vocals, kick, snare, hihat, tom, bass, other
-                # Advanced stems: vocals_lead, vocals_backing, kick, snare, hihat, tom, bass, guitar, piano, strings, synth_lead, synth_pad, ambient
+                # Advanced stems: vocals, kick, snare, hihat, tom, bass, guitar, piano, other
                 legacy_stems = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']
-                advanced_stems = ['vocals_lead', 'vocals_backing', 'kick', 'snare', 'hihat', 'tom', 'bass', 'guitar', 'piano', 'strings', 'synth_lead', 'synth_pad', 'ambient']
+                advanced_stems = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'guitar', 'piano', 'other']
 
                 # Auto-detect which stems are available
                 available_stems = []

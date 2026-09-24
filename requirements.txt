@@ -11,8 +11,9 @@ soundfile
 mutagen
 waitress
 
-# Multi-engine stem separation (Mel-Band RoFormer + BS-RoFormer)
+# Multi-engine stem separation (Mel-Band Roformer Karaoke + MDX23C DrumSep)
 audio-separator>=0.17.0
+onnxruntime  # required by audio-separator; use onnxruntime-gpu instead for GPU inference
 
 # Optional: HiFi++ GAN restoration for artifact removal
 julius>=0.2.8

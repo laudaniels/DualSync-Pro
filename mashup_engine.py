@@ -8,16 +8,15 @@ BASE_DIR = Path(__file__).resolve().parent
 
 
 class MashupEngine:
-    """Build FFmpeg mixes with multi-engine stem separation: Mel-Band RoFormer (vocals),
-    BS-RoFormer-6s (multi-instrument), Demucs (drum splitting), HiFi++ GAN (restoration)."""
+    """Build FFmpeg mixes with multi-engine stem separation: Mel-Band RoFormer Karaoke
+    (lead/backing vocals), Demucs htdemucs_6s (bass/guitar/piano/other/drums),
+    MDX23C DrumSep (kick/snare/hihat/tom), HiFi++ GAN (restoration)."""
 
     STEM_NAMES = ("vocals", "drums", "bass", "other")
     FINAL_STEM_NAMES = (
-        "vocals_lead", "vocals_backing",
+        "vocals",
         "kick", "snare", "hihat", "tom",
-        "bass", "guitar",
-        "piano", "strings",
-        "synth_lead", "synth_pad", "ambient"
+        "bass", "guitar", "piano", "other",
     )
     TARGET_SAMPLE_RATE = 44100
 
@@ -61,8 +60,9 @@ class MashupEngine:
 
         Args:
             songs: List of audio file paths
-            use_multi_engine: If True, use advanced Mel-Band + BS-RoFormer + HiFi++ pipeline (13 stems).
-                             If False, use legacy Demucs-only (7 stems) for backward compatibility.
+            use_multi_engine: If True, use advanced Karaoke + Demucs-6s + DrumSep + HiFi++
+                             pipeline (9 stems). If False, use legacy Demucs-only (7 stems)
+                             for backward compatibility.
             use_restoration: If True and use_multi_engine=True, apply HiFi++ GAN restoration.
 
         Returns:
@@ -1042,15 +1042,13 @@ class MashupEngine:
         if not isinstance(stem_set, dict):
             return []
 
-        # Try 13-stem mode first, then fall back to 7-stem legacy mode
+        # Try 9-stem multi-engine mode first, then fall back to 7-stem legacy mode
         stem_priority = [
-            "vocals_lead", "vocals_backing",
+            "vocals",
             "kick", "snare", "hihat", "tom",
-            "bass", "guitar",
-            "piano", "strings",
-            "synth_lead", "synth_pad", "ambient",
-            # Fallback legacy 7-stem names
-            "vocals", "drums", "other"
+            "bass", "guitar", "piano", "other",
+            # Fallback legacy stem name
+            "drums",
         ]
 
         available = []
@@ -1139,7 +1137,7 @@ class MashupEngine:
             fade = fades.get(slot, 1.0)
             stem_set = stems_by_slot[slot] if slot < len(stems_by_slot) else None
 
-            # Dynamically determine available stems (7-stem legacy OR 13-stem advanced)
+            # Dynamically determine available stems (7-stem legacy OR 9-stem advanced)
             available_stems = self._get_available_stems(stem_set)
 
             if available_stems:
@@ -1370,10 +1368,26 @@ class MashupEngine:
             raise
 
     def separate_stems_multi_engine(self, songs, use_restoration=True):
-        """Advanced multi-engine stem separation: Mel-Band RoFormer (vocals) + BS-RoFormer-6s
-        (multi-instrument) + Demucs drum splitting + optional HiFi++ GAN restoration.
+        """Advanced multi-engine stem separation: Mel-Band Roformer Karaoke (vocals) +
+        Demucs htdemucs_6s (bass/guitar/piano/other/drums) + MDX23C DrumSep
+        (kick/snare, ML) + frequency-split (hihat/tom, approximate) + optional
+        HiFi++ GAN artifact restoration.
 
-        Returns list of dicts with 13 stems per song (best quality per stem-type).
+        Every stem is derived straight from the full song: the Karaoke model and
+        htdemucs_6s both run directly against the original/processed WAV, in
+        parallel. The one deliberate exception is kick/snare/hihat/tom -- both
+        DrumSep and the frequency-split fallback need an isolated drum stem, not
+        a full mix, so stage 2 runs them on htdemucs_6s's 'drums' output rather
+        than on the song itself.
+
+        Verified against a real 25s clip: DrumSep (MDX23C-DrumSep-aufr33-jarredou)
+        only separates kick + snare, not hihat/tom -- there's no ML model for
+        those in the audio-separator registry, so hihat/tom fall back to the
+        legacy bandpass-filter split (split_drums()) on the same drum stem,
+        applied only for those two components; DrumSep's kick/snare are kept.
+
+        Returns list of dicts with 9 stems per song (7 ML-separated + hihat/tom
+        approximated via frequency filtering).
         """
         import logging
         import threading
@@ -1388,91 +1402,77 @@ class MashupEngine:
             song_out_dir = self.stems_dir / song_hash
             song_out_dir.mkdir(exist_ok=True, parents=True)
 
-            # STAGE 1: Parallel extraction (Mel-Band + BS-RoFormer)
+            # STAGE 1: Parallel extraction, both straight from the full song
             logging.info(f"📊 [STAGE 1] Parallel vocal + multi-instrument extraction...")
 
-            vocals_stem = None
-            bs_roformer_stems = None
+            vocals_path = None
+            demucs_stems = None
 
-            threads = []
             vocals_lock = threading.Lock()
-            bs_lock = threading.Lock()
+            demucs_lock = threading.Lock()
 
             def extract_vocals():
-                nonlocal vocals_stem
+                nonlocal vocals_path
                 try:
-                    logging.info(f"  🎤 Mel-Band RoFormer: extracting lead vocals...")
-                    vocals = self._extract_vocals_melband(str(song), str(song_out_dir))
+                    logging.info(f"  🎤 Mel-Band Roformer Karaoke: extracting vocals...")
+                    v = self._separate_vocals_karaoke(str(song), str(song_out_dir))
                     with vocals_lock:
-                        vocals_stem = vocals
-                    logging.info(f"  ✅ Lead vocals: {Path(vocals).name}")
+                        vocals_path = v
+                    logging.info(f"  ✅ Vocals extracted")
                 except Exception as e:
-                    logging.error(f"  ❌ Mel-Band RoFormer failed: {e}")
+                    logging.error(f"  ❌ Karaoke vocal separation failed: {e}")
                     with vocals_lock:
-                        vocals_stem = None
+                        vocals_path = None
 
-            def extract_multiinstrument():
-                nonlocal bs_roformer_stems
+            def extract_instruments():
+                nonlocal demucs_stems
                 try:
-                    logging.info(f"  🎼 BS-RoFormer-6s: extracting 6-stem separation...")
-                    stems = self._separate_stems_bs_roformer(str(song), str(song_out_dir))
-                    with bs_lock:
-                        bs_roformer_stems = stems
+                    logging.info(f"  🎼 Demucs htdemucs_6s: extracting bass/guitar/piano/other/drums...")
+                    stems = self._separate_stems_demucs6s(str(song), str(song_out_dir))
+                    with demucs_lock:
+                        demucs_stems = stems
                     logging.info(f"  ✅ 6-stem separation complete")
                 except Exception as e:
-                    logging.error(f"  ❌ BS-RoFormer failed: {e}")
-                    with bs_lock:
-                        bs_roformer_stems = None
+                    logging.error(f"  ❌ Demucs htdemucs_6s failed: {e}")
+                    with demucs_lock:
+                        demucs_stems = None
 
             t1 = threading.Thread(target=extract_vocals)
-            t2 = threading.Thread(target=extract_multiinstrument)
-            threads = [t1, t2]
-            for t in threads:
+            t2 = threading.Thread(target=extract_instruments)
+            for t in (t1, t2):
                 t.start()
-            for t in threads:
+            for t in (t1, t2):
                 t.join()
 
-            if not vocals_stem or not bs_roformer_stems:
+            if not vocals_path or not demucs_stems:
                 raise RuntimeError(f"Stage 1 failed for {Path(song).name}")
 
-            # STAGE 2: Drum splitting
-            logging.info(f"🥁 [STAGE 2] Demucs drum splitting...")
-            drums_stem = bs_roformer_stems.get('drums')
-            if drums_stem and Path(drums_stem).is_file():
-                try:
-                    drum_splits = self.split_drums(drums_stem, str(song_out_dir))
-                    logging.info(f"  ✅ Drums split into: kick, snare, hihat, tom")
-                except Exception as e:
-                    logging.warning(f"  ⚠️  Drum split failed: {e}, using original drums")
-                    drum_splits = {
-                        'kick': drums_stem,
-                        'snare': drums_stem,
-                        'hihat': drums_stem,
-                        'tom': drums_stem,
-                    }
+            # STAGE 2: Drum splitting -- the one deliberate stem-of-stem step (see
+            # docstring above). Kick/snare come from DrumSep (real ML separation);
+            # hihat/tom come from bandpass filtering the same drum stem, since no
+            # ML model for those exists in the registry.
+            logging.info(f"🥁 [STAGE 2] Kick/snare (MDX23C DrumSep) + hihat/tom (frequency split)...")
+            drums_stem = demucs_stems['drums']
+            kick_snare = self._split_drums_mdx23c(drums_stem, str(song_out_dir))
+            hihat_tom = self.split_drums(drums_stem, str(song_out_dir))
 
-            # STAGE 3: Assemble final 13-stem structure
+            # STAGE 3: Assemble final stem structure
             logging.info(f"🔧 [STAGE 3] Assembling final stem structure...")
             final_stems = {
-                'vocals_lead': vocals_stem,
-                'vocals_backing': vocals_stem,  # Placeholder (same as lead; can be refined)
-                'kick': drum_splits.get('kick'),
-                'snare': drum_splits.get('snare'),
-                'hihat': drum_splits.get('hihat'),
-                'tom': drum_splits.get('tom'),
-                'bass': bs_roformer_stems.get('bass'),
-                'guitar': bs_roformer_stems.get('guitar'),
-                'piano': bs_roformer_stems.get('piano'),
-                'strings': bs_roformer_stems.get('other'),  # Fallback
-                'synth_lead': bs_roformer_stems.get('other'),
-                'synth_pad': bs_roformer_stems.get('other'),
-                'ambient': bs_roformer_stems.get('other'),
+                'vocals': vocals_path,
+                'kick': kick_snare.get('kick'),
+                'snare': kick_snare.get('snare'),
+                'hihat': hihat_tom.get('hihat'),
+                'tom': hihat_tom.get('tom'),
+                'bass': demucs_stems.get('bass'),
+                'guitar': demucs_stems.get('guitar'),
+                'piano': demucs_stems.get('piano'),
+                'other': demucs_stems.get('other'),
             }
 
-            # Verify all stems exist
             missing = [k for k, v in final_stems.items() if not v or not Path(v).is_file()]
             if missing:
-                logging.warning(f"  ⚠️  Missing stems: {missing}")
+                raise RuntimeError(f"Multi-engine separation did not produce: {missing}")
 
             # STAGE 4: Optional HiFi++ GAN restoration
             if use_restoration:
@@ -1485,100 +1485,140 @@ class MashupEngine:
 
             self._conform_stem_lengths(final_stems)
             results.append(final_stems)
-            logging.info(f"✅ Song {song_idx + 1} complete: 13 professional stems ready\n")
+            logging.info(f"✅ Song {song_idx + 1} complete: 9 stems ready\n")
 
         return results
 
-    def _extract_vocals_melband(self, audio_path, output_dir):
-        """Extract lead vocals using Mel-Band RoFormer (13.67 dB SDR quality)."""
+    def _separate_vocals_karaoke(self, audio_path, output_dir):
+        """Extract clean lead vocals using a Mel-Band Roformer Karaoke model, run
+        directly on the full song (not on an already-separated stem).
+
+        Verified against a real clip: despite the "Karaoke" name, this
+        checkpoint's second output is a generic Instrumental (full mix minus
+        vocals), not isolated backing/harmony vocals -- there's no dedicated
+        backing-vocal model in the audio-separator registry, so we only keep
+        the clean vocals file and discard the instrumental one. Roformer-family
+        vocal models like this one measurably outperform Demucs's built-in
+        vocal stem on separation quality (SDR), which is why we use this
+        instead of htdemucs_6s's own 'vocals' output.
+
+        Returns: path to the vocals-only WAV.
+        """
         import logging
 
         try:
-            import audio_separator
+            from audio_separator.separator import Separator
         except ImportError:
             raise RuntimeError(
-                "Mel-Band RoFormer requires: pip install audio-separator\n"
-                "This will also install the model automatically on first use."
+                "Multi-engine mode requires: pip install audio-separator onnxruntime\n"
+                "Models download automatically on first use."
             )
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         try:
-            separator = audio_separator.Separator(
-                model_name="mel_band_roformer",
-                vr_engine_type="aggr",
-                output_format="WAV"
-            )
+            separator = Separator(output_dir=str(output_dir_path), output_format="WAV")
+            separator.load_model(model_filename="mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt")
 
             logging.info(f"  Separating vocals from {Path(audio_path).name}...")
-            output_files = separator.separate(
-                audio_file_path=audio_path,
-                output_dir=str(output_dir_path),
-                output_single_stem="Vocals"
-            )
+            output_files = separator.separate(audio_path)
+            resolved = [p if Path(p).is_absolute() else str(output_dir_path / p) for p in output_files]
 
-            if output_files and isinstance(output_files, list):
-                vocals_path = output_files[0]
-            else:
-                # Fallback to expected output path
-                stem_name = Path(audio_path).stem
-                vocals_path = str(output_dir_path / f"{stem_name}_Vocals.wav")
+            logging.info(f"  Karaoke model produced: {[Path(p).name for p in resolved]}")
 
-            if not Path(vocals_path).is_file():
-                raise RuntimeError(f"Vocals file not created: {vocals_path}")
-
-            return vocals_path
+            vocals_matches = [p for p in resolved if 'vocal' in Path(p).stem.lower()]
+            if not vocals_matches:
+                raise RuntimeError(
+                    f"Could not identify the vocals file among: {[Path(p).name for p in resolved]}"
+                )
+            return vocals_matches[0]
         except Exception as e:
-            logging.error(f"Mel-Band RoFormer failed: {e}")
+            logging.error(f"Karaoke vocal separation failed: {e}")
             raise RuntimeError(f"Vocal extraction failed: {str(e)[-500:]}")
 
-    def _separate_stems_bs_roformer(self, audio_path, output_dir):
-        """Separate into 6 stems using BS-RoFormer (9.5 dB SDR, multi-instrument)."""
+    def _separate_stems_demucs6s(self, audio_path, output_dir):
+        """Separate bass/guitar/piano/other/drums directly from the full song using
+        Demucs' htdemucs_6s model (also outputs a 'vocals' stem, unused here --
+        the Karaoke model supplies our (higher-quality) vocals instead)."""
+        import logging
+
+        output_dir_path = Path(output_dir)
+        output_dir_path.mkdir(exist_ok=True, parents=True)
+
+        command = [sys.executable, "-m", "demucs", "-n", "htdemucs_6s",
+                   "--out", str(output_dir_path), audio_path]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "Demucs failed without an error message."
+            raise RuntimeError(f"Demucs htdemucs_6s could not separate {Path(audio_path).name}:\n{detail[-1200:]}")
+
+        song_folder = Path(audio_path).stem
+        candidates = list(output_dir_path.glob(f"htdemucs_6s/{song_folder}"))
+        if not candidates:
+            raise RuntimeError(f"Demucs htdemucs_6s finished, but no stem folder was found for {Path(audio_path).name}.")
+        folder = candidates[0]
+
+        stems = {name: str(folder / f"{name}.wav") for name in ("drums", "bass", "other", "guitar", "piano")}
+        missing = [name for name, path in stems.items() if not Path(path).is_file()]
+        if missing:
+            raise RuntimeError(f"Demucs htdemucs_6s did not create all expected stems: {', '.join(missing)}")
+
+        logging.info(f"  Demucs htdemucs_6s produced: {list(stems.keys())}")
+        return stems
+
+    def _split_drums_mdx23c(self, drums_path, output_dir):
+        """Split an isolated drum stem into kick + snare using the MDX23C DrumSep
+        model. This is a deliberate stem-of-stem step in the multi-engine
+        pipeline: DrumSep is trained on isolated drums, so it needs `drums_path`
+        (htdemucs_6s's drum stem) as input rather than the full song.
+
+        Verified against a real clip: MDX23C-DrumSep-aufr33-jarredou only
+        produces kick + snare, not hihat/tom -- there's no ML model for those in
+        the audio-separator registry (see split_drums() for that fallback).
+        """
         import logging
 
         try:
-            import audio_separator
+            from audio_separator.separator import Separator
         except ImportError:
             raise RuntimeError(
-                "BS-RoFormer requires: pip install audio-separator\n"
-                "This will also install the model automatically on first use."
+                "Multi-engine mode requires: pip install audio-separator onnxruntime\n"
+                "Models download automatically on first use."
             )
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         try:
-            separator = audio_separator.Separator(
-                model_name="bs_roformer",
-                vr_engine_type="aggr",
-                output_format="WAV"
-            )
+            separator = Separator(output_dir=str(output_dir_path), output_format="WAV")
+            separator.load_model(model_filename="MDX23C-DrumSep-aufr33-jarredou.ckpt")
 
-            logging.info(f"  Separating 6-stem from {Path(audio_path).name}...")
-            output_files = separator.separate(
-                audio_file_path=audio_path,
-                output_dir=str(output_dir_path),
-            )
+            logging.info(f"  Splitting kick/snare from {Path(drums_path).name}...")
+            output_files = separator.separate(drums_path)
+            resolved = [p if Path(p).is_absolute() else str(output_dir_path / p) for p in output_files]
 
-            stem_name = Path(audio_path).stem
-            stems = {
-                'vocals': str(output_dir_path / f"{stem_name}_Vocals.wav"),
-                'drums': str(output_dir_path / f"{stem_name}_Drums.wav"),
-                'bass': str(output_dir_path / f"{stem_name}_Bass.wav"),
-                'guitar': str(output_dir_path / f"{stem_name}_Guitar.wav"),
-                'piano': str(output_dir_path / f"{stem_name}_Piano.wav"),
-                'other': str(output_dir_path / f"{stem_name}_Other.wav"),
-            }
+            logging.info(f"  DrumSep produced {len(resolved)} files: {[Path(p).name for p in resolved]}")
 
-            missing = [k for k, v in stems.items() if not Path(v).is_file()]
+            mapping = {}
+            for path in resolved:
+                stem = Path(path).stem.lower()
+                if 'kick' in stem:
+                    mapping.setdefault('kick', path)
+                elif 'snare' in stem:
+                    mapping.setdefault('snare', path)
+
+            missing = [name for name in ('kick', 'snare') if name not in mapping]
             if missing:
-                raise RuntimeError(f"BS-RoFormer did not create all stems, missing: {missing}")
-
-            return stems
+                raise RuntimeError(
+                    f"Could not identify {missing} among DrumSep's output files: "
+                    f"{[Path(p).name for p in resolved]}. Update the keyword matching "
+                    f"above to match this model's actual naming."
+                )
+            return mapping
         except Exception as e:
-            logging.error(f"BS-RoFormer failed: {e}")
-            raise RuntimeError(f"6-stem separation failed: {str(e)[-500:]}")
+            logging.error(f"MDX23C DrumSep failed: {e}")
+            raise RuntimeError(f"Drum splitting failed: {str(e)[-500:]}")
 
     def _apply_hifi_restoration(self, stems, output_dir):
         """Apply spectral restoration to stems for artifact removal.

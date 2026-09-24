@@ -42,9 +42,9 @@ def main():
         print(f"❌ Legacy mode failed: {e}")
         return 1
 
-    # Test 2: Multi-engine mode (13 stems)
+    # Test 2: Multi-engine mode (9 stems)
     print("\n" + "="*60)
-    print("TEST 2: Multi-engine mode (13 stems)")
+    print("TEST 2: Multi-engine mode (9 stems)")
     print("="*60)
     print("This requires: pip install audio-separator>=0.17.0")
     try:
