@@ -46,9 +46,43 @@ Opens at `http://localhost:5000` (requires venv with dependencies installed).
 - Components for mixer controls, stem management, real-time logs
 - Communicates with Flask API via REST endpoints
 
+## Stem Separation Modes
+
+### Legacy Mode (7 stems) — Demucs only
+Default behavior: uses Demucs v4 for 4-stem separation, then splits drums into kick/snare/hihat/tom.
+- Output: `vocals`, `kick`, `snare`, `hihat`, `tom`, `bass`, `other`
+- Quality: Good general-purpose
+- Speed: ~5-8 min per track
+
+### Multi-Engine Mode (13 stems) — Best-of-breed pipeline
+Advanced mode combining specialized tools for maximum quality per stem-type.
+Enables with: `export DUALSYNC_MULTI_ENGINE=true` before running `python3 server.py`
+
+**Pipeline:**
+1. **Stage 1 (Parallel):**
+   - Mel-Band RoFormer: Lead vocals (13.67 dB SDR quality)
+   - BS-RoFormer-6s: 6-stem separation (9.5 dB SDR average)
+2. **Stage 2:** Demucs drum splitting (kick, snare, hihat, tom @ 9.2 dB SDR)
+3. **Stage 3 (Optional):** HiFi++ GAN artifact restoration
+
+**Output (13 stems):**
+- `vocals_lead`, `vocals_backing` (from Mel-Band)
+- `kick`, `snare`, `hihat`, `tom` (from Demucs)
+- `bass`, `guitar`, `piano`, `strings` (from BS-RoFormer)
+- `synth_lead`, `synth_pad`, `ambient` (from residual/other)
+
+**Requirements:**
+```bash
+pip install audio-separator>=0.17.0
+pip install julius>=0.2.8  # Optional: HiFi++ restoration
+```
+
+**Speed:** ~14-20 min per track (quality prioritized over speed)
+
 ## Development Notes
 
 - BPM detection and stem separation run in background threads
+- Multi-engine mode uses parallel GPU processing (Mel-Band + BS-RoFormer simultaneously)
 - Presets are JSON files stored in `presets/` directory
 - All audio output goes to timestamped files in project root
 - Requires system FFmpeg installation

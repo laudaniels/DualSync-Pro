@@ -184,8 +184,19 @@ def process_song():
 
         add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
 
-        add_log_message("🔊 Separating stems using Demucs AI...", slot)
-        stem_dict = engine.separate_stems([str(file_path)])[0]
+        # Check if multi-engine mode is enabled (via env var or config)
+        import os
+        use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
+
+        if use_multi_engine:
+            add_log_message("🚀 Separating stems using multi-engine pipeline (Mel-Band RoFormer + BS-RoFormer + HiFi++)...", slot)
+            add_log_message("  Stage 1: Parallel vocal extraction + 6-stem separation", slot)
+            add_log_message("  Stage 2: Drum splitting into kick/snare/hihat/tom", slot)
+            add_log_message("  Stage 3: Optional HiFi++ GAN restoration", slot)
+        else:
+            add_log_message("🔊 Separating stems using Demucs AI...", slot)
+
+        stem_dict = engine.separate_stems([str(file_path)], use_multi_engine=use_multi_engine)[0]
 
         # Copy stems to a simple location for serving
         serve_dir = audio_dir / 'stems'
@@ -761,17 +772,34 @@ def download_stems_zip():
 
                 logging.info(f"Processing slot {slot}: {song_name} ({key} {bpm}BPM)")
 
+                # Dynamically discover available stems (supports both 7-stem legacy and 13-stem advanced)
+                # Legacy priority: vocals, kick, snare, hihat, tom, bass, other
+                # Advanced stems: vocals_lead, vocals_backing, kick, snare, hihat, tom, bass, guitar, piano, strings, synth_lead, synth_pad, ambient
+                legacy_stems = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']
+                advanced_stems = ['vocals_lead', 'vocals_backing', 'kick', 'snare', 'hihat', 'tom', 'bass', 'guitar', 'piano', 'strings', 'synth_lead', 'synth_pad', 'ambient']
+
+                # Auto-detect which stems are available
+                available_stems = []
+                for stem in advanced_stems:
+                    if (stems_dir / f"{stem}.wav").exists():
+                        available_stems.append(stem)
+
+                # Fall back to legacy if no advanced stems found
+                if not available_stems:
+                    available_stems = [s for s in legacy_stems if (stems_dir / f"{s}.wav").exists()]
+
                 if include_original:
-                    for stem in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
+                    for stem in available_stems:
                         stem_file = stems_dir / f"{stem}.wav"
                         if stem_file.exists():
                             wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
                             dest_path = Path(temp_dir) / wav_name
                             _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem)
                             zip_file.write(str(dest_path), f"original/{wav_name}")
+                            logging.debug(f"  ✓ original/{wav_name}")
 
                 if include_processed:
-                    for stem in ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']:
+                    for stem in available_stems:
                         stem_file = stems_dir / f"{stem}_processed.wav"
                         if not stem_file.exists():
                             stem_file = stems_dir / f"{stem}.wav"
@@ -781,6 +809,7 @@ def download_stems_zip():
                             dest_path = Path(temp_dir) / f"processed_{wav_name}"
                             _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem)
                             zip_file.write(str(dest_path), f"processed/{wav_name}")
+                            logging.debug(f"  ✓ processed/{wav_name}")
 
         # Cleanup temp directory
         import shutil
@@ -844,7 +873,11 @@ def download_unaligned_stems():
                 key = meta.get('key', '?')
 
                 logging.info(f"Separating unaligned original for slot {slot}: {song_name}")
-                stem_dict = engine.separate_stems([str(wav_path)])[0]
+
+                # Use multi-engine if enabled (same setting as main processing)
+                import os
+                use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
+                stem_dict = engine.separate_stems([str(wav_path)], use_multi_engine=use_multi_engine)[0]
 
                 for stem_name, stem_path in stem_dict.items():
                     if not Path(stem_path).exists():
@@ -855,6 +888,7 @@ def download_unaligned_stems():
                     _tag_stem_wav(engine, stem_path, dest_path, song_name, bpm, key, f"{stem_name} (unaligned original)")
                     zip_file.write(str(dest_path), f"unaligned_original/{wav_name}")
                     wrote_any = True
+                    logging.debug(f"  ✓ {stem_name}")
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 

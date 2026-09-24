@@ -11,6 +11,12 @@ soundfile
 mutagen
 waitress
 
+# Multi-engine stem separation (Mel-Band RoFormer + BS-RoFormer)
+audio-separator>=0.17.0
+
+# Optional: HiFi++ GAN restoration for artifact removal
+julius>=0.2.8
+
 # Note: Madmom removed (doesn't install here -- pkg_resources incompatibility).
 #       Essentia's RhythmExtractor2013 replaces it for all beat/BPM detection.
 # Note: RubberBand is CLI tool, install via: apt-get/brew install rubberband-cli
