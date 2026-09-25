@@ -19,9 +19,12 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 ### Real-Time Mixing
 - **Dual-song mixer** — load two MP3s into independent slots with synchronized playback
 - **HTML5 audio synchronization** — first song's timeline controls both songs for seamless mixing
-- **Independent stem volumes** — control 7 stems separately for each song (0-100% sliders):
-  - Vocals, Bass, Other (standard stems)
-  - Kick, Snare, Hi-Hat, Tom (auto-split drum components via frequency-based filtering)
+- **Independent stem volumes** — control 9 stems separately for each song (0-100% sliders):
+  - **Vocals** (Mel-Band RoFormer AI, 12.6 dB SDR)
+  - **Drums:** Kick, Snare (MDX23C ML), Hi-Hat, Tom (frequency filtering)
+  - **Instruments:** Bass, Guitar, Piano (Demucs 6-stem AI, 9.5 dB SDR)
+  - **Other** (residual instruments)
+- **Waveform Preview Thumbnails** — visual waveform for each stem in the mixer to quickly verify audio content
 - **Crossfader** — blend between Song 1 and Song 2 in real-time
 - **Beat Offset Control with Magnetic Snap** — manually align Song 2's beat grid, up to 32 bars:
   - Slider ranges 0-32 bars with 0.05 bar fine-tune precision
@@ -46,12 +49,15 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 - **Clean and Reset** — a single button clears all generated audio files on the server AND resets the entire mixer UI back to its start-over state
 
 ### Audio Analysis & Processing
-- **AI Stem Separation** — isolate vocals, drums, bass, and other instruments using Demucs
-- **Automatic Drum Component Splitting** — further separate drum stem into kick, snare, hi-hat, and tom using frequency-based FFmpeg filtering:
-  - Kick: 20-250 Hz (low bass)
-  - Tom: 200-2000 Hz (mid-range drums)
-  - Snare: 1000-8000 Hz (high crack)
-  - Hi-Hat: 5000+ Hz (cymbals)
+- **Multi-Engine Stem Separation (9 stems)** — best-in-class models for maximum quality:
+  - **Mel-Band RoFormer** (12.6 dB SDR) — cleanest lead vocals
+  - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
+  - **MDX23C DrumSep** (SOTA) — ML-based kick and snare isolation
+  - **Frequency-based filtering** — hi-hat and tom (fallback, no ML model)
+- **Optional HiFi++ GAN Restoration** — artifact removal and quality enhancement:
+  - Instrument-aware expert routing (vocals/drums/bass/guitar/piano/other)
+  - CPJKU Music Source Restoration (multi-stage GAN pipeline)
+  - Graceful fallback to spectral filtering
 - **BPM & Key Detection** — Essentia (`RhythmExtractor2013` for tempo/beat positions, `KeyExtractor` for key/scale) analyzes each uploaded song
 - **Two Alignment Modes on Upload** — for each song you choose:
   - **Process as-is** — keep the song's natural timing
@@ -72,11 +78,11 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
   - Original stems: `songname-[detected-bpm]-[key]-[stem].wav`
   - Processed stems: `songname-[measured-bpm]-[key]-[stem].wav`
   - Manual BPM override: `songname-[target]-manual-[measured]-[key]-[stem].wav`
-- **22 downloadable files** (all as tagged WAV with verified output BPM):
-  - Original Song 1 stems (7 stems: vocals, kick, snare, hi-hat, tom, bass, other)
-  - Original Song 2 stems (7 stems: vocals, kick, snare, hi-hat, tom, bass, other)
-  - Beatmatched + transposed stems (7 stems with verified output BPM)
-  - Final mix (all stems combined with volume settings + crossfader, fully lossless — no intermediate MP3/lossy step)
+- **18+ downloadable files** (all as tagged WAV with verified output BPM, ACID chunks for DAW auto-detect):
+  - **Original stems:** Song 1 & Song 2 (9 stems each: vocals, kick, snare, hi-hat, tom, bass, guitar, piano, other)
+  - **Beatgrid-aligned stems:** Optional pre-alignment backup (on-demand)
+  - **Processed stems:** Beatmatched + transposed (9 stems with verified output BPM)
+  - **Final mix:** All stems combined with volume settings + crossfader (fully lossless)
 - **ZIP archives** — organized downloads with accurate naming
 
 ### User Experience
@@ -95,9 +101,12 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 When you upload an MP3 file:
 1. **Upload & Convert** — the file is converted to WAV and Essentia detects its BPM, beat grid, and key
 2. **Choose a mode** — Process as-is, Align beatgrid, or (for Song 2, once Song 1 is ready) Snap beat grid to Song 1
-3. **Stem Separation** — Demucs AI model isolates 4 tracks: Vocals, Drums, Bass, Other
-4. **Automatic Drum Splitting** — Drums stem is further split into Kick, Snare, Hi-Hat, and Tom using frequency-based filtering (7 total stems)
-5. **Real-Time Logging** — unified log window shows all processing steps (uploading, analyzing, separating, splitting)
+3. **Multi-Engine Stem Separation** (3-stage pipeline, ~14-20 min):
+   - **Stage 1 (Parallel):** Mel-Band RoFormer extracts vocals (12.6 dB SDR) + Demucs htdemucs_6s separates 6 stems (9.5 dB SDR)
+   - **Stage 2:** MDX23C DrumSep isolates kick/snare from drums stem (SOTA ML) + frequency filtering for hi-hat/tom
+   - **Stage 3 (Optional):** HiFi++ GAN restoration removes artifacts and enhances quality
+4. **Result:** 9 professional stems (7 ML-separated + 2 frequency-filtered)
+5. **Real-Time Logging** — unified log window shows all processing steps (uploading, analyzing, stage 1-3 progress)
 6. Results are displayed and ready for mixing
 
 Both songs are processed in parallel (independent uploads).
@@ -124,9 +133,9 @@ When you click **"Process All Changes"** button (BPM + Key):
    - Pass 2+ — Optional RubberBand processing for refinement (if available)
 3. **Transposition (if Key changed):**
    - Pitch-shift processed song to match target key using FFmpeg asetrate
-4. **Re-Separation** — Demucs re-separates the processed song into 7 stems (auto-split drums included)
+4. **Re-Separation** — Multi-engine pipeline re-separates the processed song into 9 stems using same best-in-class models
 5. **Stem Copying** — All processed stems copied to server with auto-scroll logs showing progress
-6. **Real-Time Logging** — unified log window shows all steps: loading, beatmatching, transposing, separating, copying
+6. **Real-Time Logging** — unified log window shows all steps: loading, beatmatching, transposing, multi-engine separation, copying
 7. Progress bar animates during processing, actual processing state updates when complete
 
 The **"Process All Changes" button is enabled** only when BPM or Key has changed from last processed value.
@@ -140,17 +149,18 @@ The **"Process All Changes" button is enabled** only when BPM or Key has changed
     - Real-time audio delay applied during playback (Web Audio API) — identical offset is used in the final render
   - **Live Beat-Grid Drift Correction** — a strength slider continuously nudges Song 2's playback rate toward Song 1's grid, with a live instantaneous-drift (ms) and cumulative-realignment (beats) readout
   - Watch Song 2 waveform shift visually as you adjust offset (shows actual alignment)
-  - Select any of 7 stems to display in waveform (vocals, kick, snare, hi-hat, tom, bass, other)
+  - Select any of 9 stems to display in waveform (vocals, kick, snare, hi-hat, tom, bass, guitar, piano, other)
   - Zoom waveform dynamically for the detail level you need, wide enough to see the full 32-bar offset range
   - Compare both Song 1 and Song 2 waveforms side-by-side
-  - Color-coded stems for easy identification
+  - Color-coded stems for easy identification (purple/indigo/pink/orange/green/blue/cyan/etc.)
   - Pause to inspect waveforms without playhead movement
 
 ![Real-time audio display](docs/images/05-realtime-audio-display.png)
 *Figure 5 — The multi-stem waveform display during live playback, showing both songs' beat alignment.*
 
 - **Volume Mixing:**
-  - Adjust 7 stem volumes independently for Song 1 and Song 2
+  - Adjust 9 stem volumes independently for Song 1 and Song 2
+  - Waveform preview thumbnail for each stem to verify audio content
   - Use crossfader to blend between songs (0% Song 1 → 50% Both → 100% Song 2)
 
 ![Real-time workspace — volumes](docs/images/04-realtime-workspace-volumes.png)
@@ -163,8 +173,10 @@ The **"Process All Changes" button is enabled** only when BPM or Key has changed
 
 ### 5. Download
 Download your results:
-- **Original Stems** — 7 stems at auto-detected BPM/Key (before beatmatching)
-- **Processed Stems** — 7 stems beatmatched + transposed with verified output BPM
+- **Original Stems** — 9 stems at auto-detected BPM/Key (before beatmatching)
+  - Vocals, Kick, Snare, Hi-Hat, Tom, Bass, Guitar, Piano, Other
+- **Processed Stems** — 9 stems beatmatched + transposed with verified output BPM
+- **Beatgrid-Aligned Stems** (optional) — pre-alignment backup if you used beatgrid correction
 - **Final Mix** — all stems combined with your volume settings and crossfader position
 
 All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable) plus ID3 tags (TITLE, BPM, KEY).
@@ -185,32 +197,40 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 - **DualMixer.jsx** — main component managing:
   - Upload and file handling
   - BPM/Key processing state and UI
-  - Stem volume sliders (per-song)
+  - Stem volume sliders for 9 stems (per-song)
+  - Waveform preview thumbnails (visual feedback for each stem)
   - Crossfader control
   - Playback synchronization
   - Progress indication during processing
+- **WaveformPreview.jsx** — 120x40px waveform visualization
+  - HTML5 AudioContext for audio decoding
+  - Canvas rendering with color-coded stems
 
 ### Backend (Flask)
 - **Flask** + Flask-CORS — REST API for audio processing
 - **Real-Time Processing Logs** — unified log system with streaming updates
 - **API Endpoints:**
   - `POST /api/upload-audio` — upload a song and convert it to WAV
-  - `POST /api/process-song` — run the chosen mode (as-is / align beatgrid / snap to Song 1), analyze BPM/key, separate into 7 stems
-  - `GET /api/process-status` — returns current processing progress (0-100%), current step, and real-time log messages
-  - `POST /api/process-stems` — process full song (beatmatch + transpose) then re-separate into stems (via FFmpeg/RubberBand)
-  - `POST /api/split-drums` — split a drums stem into kick/snare/hihat/tom
-  - `POST /api/render-final-mix` — mix all stems into the final lossless WAV, with an ACID chunk + ID3 tags
-  - `POST /api/download-stems-zip` — download original or processed stems as tagged WAV in a ZIP
-  - `POST /api/download-unaligned-stems` — download the pre-alignment stems as tagged WAV in a ZIP
+  - `POST /api/process-song` — run the chosen mode (as-is / align beatgrid / snap to Song 1), analyze BPM/key, separate into 9 stems (multi-engine pipeline)
+  - `GET /api/process-status` — returns current processing progress (0-100%), current stage, and real-time log messages
+  - `POST /api/process-stems` — process full song (beatmatch + transpose) then re-separate into 9 stems (via multi-engine pipeline)
+  - `POST /api/render-final-mix` — mix all 9 stems into the final lossless WAV, with an ACID chunk + ID3 tags
+  - `POST /api/download-stems-zip` — download original or processed 9 stems as tagged WAV in a ZIP
+  - `POST /api/download-unaligned-stems` — download the pre-alignment 9 stems as tagged WAV in a ZIP
   - `GET /api/download-file/<filename>` — download single audio file
   - `GET /api/audio/<path>` — serve individual audio files
   - `GET /api/audio-stats` — audio level/statistics for a file
   - `POST /api/cleanup` — delete all generated audio files (used by "Clean and Reset")
 
 ### Audio Processing Core (Python)
-- **Demucs** — AI stem separation (isolates vocals, drums, bass, other)
+- **Multi-Engine Stem Separation Pipeline (9 stems):**
+  - **Mel-Band RoFormer** (12.6 dB SDR) — lead vocals
+  - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
+  - **MDX23C DrumSep** (SOTA) — kick, snare from drums stem
+  - **Frequency filtering** — hi-hat, tom (fallback)
+  - **HiFi++ GAN** (CPJKU) — optional artifact removal and quality enhancement
 - **Essentia** — BPM/beat-grid detection (`RhythmExtractor2013`) and key detection (`KeyExtractor`)
-- **FFmpeg** — tempo-stretching, pitch-shifting, drum-band splitting, final mix rendering
+- **FFmpeg** — tempo-stretching, pitch-shifting, spectral filtering, final mix rendering
 - **RubberBand** — per-beat beatgrid warping (align/snap modes) and optional higher-quality time-stretching (Pass 2+)
 - **Mutagen** — WAV/ID3 metadata tagging (title, BPM, key); a hand-built RIFF ACID chunk provides DAW-readable tempo/key
 
