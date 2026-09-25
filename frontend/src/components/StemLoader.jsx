@@ -1,6 +1,6 @@
 import React, { useRef } from 'react';
 
-export default function StemLoader({ onStemsLoaded, loading, loadingLabel = 'Separating stems... (this may take a minute)' }) {
+export default function StemLoader({ onStemsLoaded, loading, loadingLabel = 'Separating stems... (this may take a minute)', progress, stepLabel }) {
   const fileInputRef = useRef(null);
 
   const handleFileSelect = (e) => {
@@ -73,7 +73,33 @@ export default function StemLoader({ onStemsLoaded, loading, loadingLabel = 'Sep
       {loading ? (
         <div className="loader">
           <div className="spinner"></div>
-          <p>{loadingLabel}</p>
+          <p>{stepLabel || loadingLabel}</p>
+          {progress != null && (
+            <div style={{ width: '80%' }}>
+              <div style={{
+                background: 'rgba(99, 102, 241, 0.15)',
+                border: '1px solid #6366f1',
+                borderRadius: '4px',
+                overflow: 'hidden',
+                height: '20px'
+              }}>
+                <div style={{
+                  width: `${progress}%`,
+                  height: '100%',
+                  background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                  transition: 'width 0.3s ease',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  color: '#fff',
+                  fontSize: '11px',
+                  fontWeight: 'bold'
+                }}>
+                  {Math.round(progress)}%
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       ) : (
         <>

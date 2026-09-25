@@ -78,11 +78,15 @@ def upload_audio():
 
         original_path = audio_dir / file.filename
         file.save(str(original_path))
+        if slot is not None:
+            _set_slot_state(slot, status='processing', progress=5, current_step='📥 Uploading file')
         add_log_message(f"📥 Uploading: {file.filename}", slot)
 
         # Convert to WAV (timestamp-prefixed so slot 0/1 uploading files with
         # the same name never collide, and so re-uploading the same filename
         # doesn't clobber a file the other song might still be using).
+        if slot is not None:
+            _set_slot_state(slot, progress=10, current_step='🔄 Converting to WAV')
         add_log_message("🔄 Converting to WAV...", slot)
         wav_filename = f"{int(time.time() * 1000)}_{Path(file.filename).stem}.wav"
         wav_path = audio_dir / wav_filename
@@ -97,10 +101,14 @@ def upload_audio():
         # analysis, separation) at a consistent, headroom-safe level rather
         # than whatever level they happened to be mastered at. Best-effort:
         # if it fails, the unnormalized WAV is left in place.
+        if slot is not None:
+            _set_slot_state(slot, progress=15, current_step='📏 Normalizing peak level')
         add_log_message("📏 Normalizing peak level to 97%...", slot)
         from mashup_engine import MashupEngine
         MashupEngine().normalize_peak(str(wav_path), str(wav_path), target_peak=0.97)
 
+        if slot is not None:
+            _set_slot_state(slot, progress=20, current_step='✅ Ready -- choose how to process this song')
         add_log_message("✅ Ready -- choose how to process this song", slot)
 
         return jsonify({
@@ -143,6 +151,8 @@ def process_song():
         from mashup_engine import MashupEngine
         engine = MashupEngine()
 
+        _set_slot_state(slot, status='processing', progress=5, current_step='📥 Loading original file')
+
         # How much the initial beat-grid step (align or snap) actually
         # corrected -- None if neither ran or it failed, else {mean_ms, max_ms}
         # for the frontend to display alongside this song's detected info.
@@ -150,6 +160,7 @@ def process_song():
         detected_bpm_before_grid_correction = None
 
         if mode == 'align':
+            _set_slot_state(slot, progress=15, current_step='🎯 Aligning beatgrid')
             add_log_message("🎯 Aligning beatgrid (correcting tempo drift)...", slot)
             try:
                 aligned_path = audio_dir / f"aligned_{file_path.stem}.wav"
@@ -166,6 +177,7 @@ def process_song():
             if not reference_bpm or reference_anchor is None:
                 add_log_message("⚠️ Snap beat requested but no reference song info was provided, continuing without it", slot)
             else:
+                _set_slot_state(slot, progress=15, current_step='🧲 Snapping beat grid to Song 1')
                 add_log_message(f"🧲 Snapping beat grid to the other song ({reference_bpm:.1f} BPM)...", slot)
                 try:
                     snapped_path = audio_dir / f"snapped_{file_path.stem}.wav"
@@ -181,6 +193,7 @@ def process_song():
                     add_log_message(f"⚠️ Beat-grid snap failed, continuing without it: {e}", slot)
 
         # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
+        _set_slot_state(slot, progress=25, current_step='🔍 Analyzing BPM and Key')
         add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...", slot)
         bpm, beat_anchor, key, scale = engine.analyze_track_and_key(str(file_path))
         key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
@@ -193,14 +206,26 @@ def process_song():
         use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
 
         if use_multi_engine:
-            add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep + HiFi++)...", slot)
-            add_log_message("  Stage 1: Parallel vocal extraction + 6-stem separation", slot)
-            add_log_message("  Stage 2: Drum splitting into kick/snare/hihat/tom", slot)
-            add_log_message("  Stage 3: Optional HiFi++ GAN restoration", slot)
+            add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep + ML restoration)...", slot)
         else:
             add_log_message("🔊 Separating stems using Demucs AI...", slot)
 
-        stem_dict = engine.separate_stems([str(file_path)], use_multi_engine=use_multi_engine)[0]
+        # Report each internal stage as it actually starts, rather than
+        # announcing all of them upfront -- separation takes minutes, so a
+        # log line that only moves at the very end makes the wait feel a lot
+        # longer than one that updates as each stage really begins. Mapped
+        # onto the 30-90% band, the biggest chunk of this endpoint's progress.
+        last_reported_label = None
+
+        def _on_separation_progress(fraction, label):
+            nonlocal last_reported_label
+            _set_slot_state(slot, progress=30 + round(fraction * 60), current_step=label)
+            if label != last_reported_label:
+                add_log_message(f"  {label}", slot)
+                last_reported_label = label
+
+        stem_dict = engine.separate_stems([str(file_path)], use_multi_engine=use_multi_engine,
+                                           progress_callback=_on_separation_progress)[0]
 
         # Copy stems to a simple location for serving
         serve_dir = audio_dir / 'stems'
@@ -212,6 +237,7 @@ def process_song():
         session_dir.mkdir(exist_ok=True)
 
         stems = {}
+        _set_slot_state(slot, progress=95, current_step='📦 Copying stems')
         add_log_message("📦 Copying stems to server...", slot)
         for stem_name, stem_path in stem_dict.items():
             if Path(stem_path).exists():
@@ -226,6 +252,7 @@ def process_song():
         if not stems:
             raise Exception("No stems were separated successfully")
 
+        _set_slot_state(slot, progress=100, current_step='✅ Complete', status='success')
         add_log_message("✨ Stem separation complete!", slot)
 
         return jsonify({
@@ -248,6 +275,7 @@ def process_song():
         })
     except Exception as e:
         logging.error(f"Stem separation failed: {e}", exc_info=True)
+        _set_slot_state(slot, progress=0, status='error')
         return jsonify({'error': f'Separation failed: {str(e)}'}), 500
 
 
@@ -346,7 +374,7 @@ def _set_slot_state(slot, **fields):
 _VALID_KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 
-def _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label):
+def _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label, beat_anchor=None):
     """Copy stem_file to dest_path and embed tempo/key info a DAW can
     actually use: an ACID chunk (what FL Studio/Logic/Cubase/Reaper/etc.
     read on import) plus basic ID3-in-WAV tags for players/taggers. Returns
@@ -366,6 +394,16 @@ def _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label)
             engine.write_acid_chunk(str(dest_path), numeric_bpm, key if key in _VALID_KEY_NAMES else None)
         except Exception as acid_err:
             logging.error(f"ACID chunk write failed for {dest_path.name}: {acid_err}")
+
+        # Only when the caller has a real beat_anchor (the analysis-time
+        # phase offset) -- without it, markers would silently assume the
+        # grid starts at sample 0, which is wrong for anything with a
+        # pickup/intro before the first beat.
+        if beat_anchor is not None:
+            try:
+                engine.write_cue_markers(str(dest_path), numeric_bpm, float(beat_anchor))
+            except Exception as cue_err:
+                logging.error(f"Cue markers write failed for {dest_path.name}: {cue_err}")
 
     try:
         from mutagen.wave import WAVE
@@ -480,7 +518,22 @@ def process_stems():
         add_log_message(f"🔊 Separating stems from processed song...", slot)
         import os
         use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
-        stem_dict = engine.separate_stems([str(current_input)], use_multi_engine=use_multi_engine)[0]
+
+        # Separation is by far the longest part of this endpoint (minutes, vs.
+        # seconds for beatmatch/transpose), so map its internal stage
+        # boundaries onto the 50-70% band instead of holding the bar still
+        # there for the whole call.
+        last_reported_label = None
+
+        def _on_separation_progress(fraction, label):
+            nonlocal last_reported_label
+            _set_slot_state(slot, progress=50 + round(fraction * 20), current_step=label)
+            if label != last_reported_label:
+                add_log_message(f"  {label}", slot)
+                last_reported_label = label
+
+        stem_dict = engine.separate_stems([str(current_input)], use_multi_engine=use_multi_engine,
+                                           progress_callback=_on_separation_progress)[0]
 
         # Copy processed stems to serve directory
         stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamp
@@ -706,6 +759,16 @@ def render_final_mix():
                     logging.info(f"✅ Wrote ACID chunk: {final_wav.name} (BPM: {numeric_bpm}, Key: {key})")
                 except Exception as acid_err:
                     logging.error(f"ACID chunk write failed: {acid_err}", exc_info=True)
+
+                # Song 1 (slot 0) is the render's timeline reference -- its own
+                # beat_offset is always 0 -- so its beat_anchor is the correct
+                # phase for the final mix's markers.
+                if beat_anchors[0] is not None:
+                    try:
+                        engine.write_cue_markers(str(final_wav), numeric_bpm, float(beat_anchors[0]))
+                        logging.info(f"✅ Wrote beat markers: {final_wav.name}")
+                    except Exception as cue_err:
+                        logging.error(f"Cue markers write failed: {cue_err}", exc_info=True)
             else:
                 logging.warning(f"No numeric BPM available ('{bpm_label}') -- skipping ACID chunk")
 
@@ -801,7 +864,8 @@ def download_stems_zip():
                         if stem_file.exists():
                             wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
                             dest_path = Path(temp_dir) / wav_name
-                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem)
+                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem,
+                                          beat_anchor=meta.get('beat_anchor'))
                             zip_file.write(str(dest_path), f"original/{wav_name}")
                             logging.debug(f"  ✓ original/{wav_name}")
 
@@ -814,7 +878,8 @@ def download_stems_zip():
                         if stem_file.exists():
                             wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
                             dest_path = Path(temp_dir) / f"processed_{wav_name}"
-                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem)
+                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem,
+                                          beat_anchor=meta.get('beat_anchor'))
                             zip_file.write(str(dest_path), f"processed/{wav_name}")
                             logging.debug(f"  ✓ processed/{wav_name}")
 
@@ -844,7 +909,7 @@ def download_stems_zip():
 @app.route('/api/download-unaligned-stems', methods=['POST'])
 def download_unaligned_stems():
     """On-demand only: separate + download the stems of the ORIGINAL
-    (pre-beatgrid-alignment) WAV for songs where 'Align beatgrid first' was
+    (pre-beatgrid-alignment) WAV for songs where 'Align beatgrid' was
     used. Not run automatically -- Demucs separation is expensive and most
     users downloading the (already generated) aligned stems won't need it."""
     data = request.json or {}

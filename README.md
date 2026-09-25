@@ -54,10 +54,9 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
   - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
   - **MDX23C DrumSep** (SOTA) — ML-based kick and snare isolation
   - **Frequency-based filtering** — hi-hat and tom (fallback, no ML model)
-- **Optional HiFi++ GAN Restoration** — artifact removal and quality enhancement:
-  - Instrument-aware expert routing (vocals/drums/bass/guitar/piano/other)
-  - CPJKU Music Source Restoration (multi-stage GAN pipeline)
-  - Graceful fallback to spectral filtering
+- **Denoise + De-Reverb Restoration** — artifact removal and quality enhancement:
+  - Mel-Band Roformer denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR), applied to every stem
+  - Graceful fallback to spectral filtering if these models can't load
 - **BPM & Key Detection** — Essentia (`RhythmExtractor2013` for tempo/beat positions, `KeyExtractor` for key/scale) analyzes each uploaded song
 - **Two Alignment Modes on Upload** — for each song you choose:
   - **Process as-is** — keep the song's natural timing
@@ -104,7 +103,7 @@ When you upload an MP3 file:
 3. **Multi-Engine Stem Separation** (3-stage pipeline, ~14-20 min):
    - **Stage 1 (Parallel):** Mel-Band RoFormer extracts vocals (12.6 dB SDR) + Demucs htdemucs_6s separates 6 stems (9.5 dB SDR)
    - **Stage 2:** MDX23C DrumSep isolates kick/snare from drums stem (SOTA ML) + frequency filtering for hi-hat/tom
-   - **Stage 3 (Optional):** HiFi++ GAN restoration removes artifacts and enhances quality
+   - **Stage 3:** Denoise + de-reverb restoration removes artifacts and enhances quality
 4. **Result:** 9 professional stems (7 ML-separated + 2 frequency-filtered)
 5. **Real-Time Logging** — unified log window shows all processing steps (uploading, analyzing, stage 1-3 progress)
 6. Results are displayed and ready for mixing
@@ -229,7 +228,7 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
   - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
   - **MDX23C DrumSep** (SOTA) — kick, snare from drums stem
   - **Frequency filtering** — hi-hat, tom (fallback)
-  - **HiFi++ GAN** (CPJKU) — optional artifact removal and quality enhancement
+  - **Denoise + De-Reverb** (Mel-Band Roformer, 27.99 / 19.17 dB SDR) — artifact removal and quality enhancement
 - **Essentia** — BPM/beat-grid detection (`RhythmExtractor2013`) and key detection (`KeyExtractor`)
 - **FFmpeg** — tempo-stretching, pitch-shifting, spectral filtering, final mix rendering
 - **RubberBand** — per-beat beatgrid warping (align/snap modes) and optional higher-quality time-stretching (Pass 2+)

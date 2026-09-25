@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 class MashupEngine:
     """Build FFmpeg mixes with multi-engine stem separation: Mel-Band RoFormer Karaoke
     (lead/backing vocals), Demucs htdemucs_6s (bass/guitar/piano/other/drums),
-    MDX23C DrumSep (kick/snare/hihat/tom), HiFi++ GAN (restoration)."""
+    MDX23C DrumSep (kick/snare/hihat/tom), denoise + de-reverb (restoration)."""
 
     STEM_NAMES = ("vocals", "drums", "bass", "other")
     FINAL_STEM_NAMES = (
@@ -72,15 +72,20 @@ class MashupEngine:
         self.ffplay = "ffplay"
         self.stems_dir = BASE_DIR / "separated_stems"
 
-    def separate_stems(self, songs, use_multi_engine=False, use_restoration=True):
+    def separate_stems(self, songs, use_multi_engine=False, use_restoration=True, progress_callback=None):
         """Stem separation with optional multi-engine mode.
 
         Args:
             songs: List of audio file paths
-            use_multi_engine: If True, use advanced Karaoke + Demucs-6s + DrumSep + HiFi++
-                             pipeline (9 stems). If False, use legacy Demucs-only (7 stems)
-                             for backward compatibility.
-            use_restoration: If True and use_multi_engine=True, apply HiFi++ GAN restoration.
+            use_multi_engine: If True, use advanced Karaoke + Demucs-6s + DrumSep + ML
+                             restoration pipeline (9 stems). If False, use legacy
+                             Demucs-only (7 stems) for backward compatibility.
+            use_restoration: If True and use_multi_engine=True, apply denoise + de-reverb restoration.
+            progress_callback: Optional callable(fraction, label) invoked at each internal
+                             stage boundary. fraction is 0.0-1.0 across all `songs` combined;
+                             label is a short human-readable description of the stage just
+                             starting. Lets a caller surface real-time progress instead of a
+                             single stall for the whole (multi-minute) separation call.
 
         Returns:
             List of dicts mapping stem names to file paths.
@@ -88,7 +93,8 @@ class MashupEngine:
         import logging
 
         if use_multi_engine:
-            return self.separate_stems_multi_engine(songs, use_restoration=use_restoration)
+            return self.separate_stems_multi_engine(songs, use_restoration=use_restoration,
+                                                      progress_callback=progress_callback)
 
         # Legacy Demucs-only mode
         if not shutil.which("demucs"):
@@ -102,7 +108,13 @@ class MashupEngine:
 
         self.stems_dir.mkdir(exist_ok=True)
         results = []
-        for song in songs:
+        song_count = len(songs)
+        for song_idx, song in enumerate(songs):
+            def report(local_frac, label):
+                if progress_callback:
+                    progress_callback((song_idx + local_frac) / song_count, label)
+
+            report(0.0, "Running Demucs separation...")
             song_hash = hashlib.sha1(str(Path(song).resolve()).encode("utf-8")).hexdigest()[:16]
             song_out_dir = self.stems_dir / song_hash
             command = [sys.executable, "-m", "demucs", "--out", str(song_out_dir), song]
@@ -121,6 +133,7 @@ class MashupEngine:
             if missing:
                 raise RuntimeError(f"Demucs did not create all expected stems for {Path(song).name}: {', '.join(missing)}")
 
+            report(0.85, "Splitting drums (kick/snare/hihat/tom)...")
             try:
                 logging.info(f"🥁 Splitting drums for {Path(song).name}...")
                 drum_splits = self.split_drums(stems['drums'], str(folder))
@@ -146,6 +159,7 @@ class MashupEngine:
 
             self._conform_stem_lengths(stems)
             results.append(stems)
+            report(1.0, "Stems ready")
         return results
 
     def _get_duration(self, path):
@@ -776,6 +790,73 @@ class MashupEngine:
         with open(wav_path, 'wb') as f:
             f.write(new_data)
 
+    def write_cue_markers(self, wav_path, bpm, beat_anchor=0.0):
+        """Append a WAV 'cue ' chunk (+ 'LIST'/'adtl' labels) with one marker
+        per beat, evenly spaced at 60/bpm from beat_anchor across the whole
+        file. This is the actual convention FL Studio (and Sound Forge, Adobe
+        Audition, REX/Recycle-style slicers, ...) read as visible markers on
+        import -- distinct from the ACID chunk above, which only lets a DAW
+        *compute* a grid from tempo/beat-count rather than showing one.
+        Mutates wav_path in place. Assumes a single uncompressed 'data' chunk
+        (true for every WAV this app produces).
+        """
+        import struct
+        import soundfile as sf
+
+        with open(wav_path, 'rb') as f:
+            data = f.read()
+        if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+            raise ValueError(f"{wav_path} is not a valid WAV file")
+
+        info = sf.info(str(wav_path))
+        sample_rate = info.samplerate
+        duration = info.duration
+        interval = 60.0 / bpm
+
+        # Walk back from the anchor to the start of the file so the very
+        # first beat gets a marker too, not just ones at/after beat_anchor.
+        t = beat_anchor % interval
+        beat_times = []
+        while t < duration:
+            beat_times.append(t)
+            t += interval
+
+        if not beat_times:
+            return
+
+        cue_points = b''
+        labels = b''
+        for i, beat_t in enumerate(beat_times):
+            cue_id = i + 1
+            sample_pos = int(round(beat_t * sample_rate))
+            # dwName, dwPosition, fccChunk, dwChunkStart, dwBlockStart, dwSampleOffset --
+            # chunkStart/blockStart are 0 since there's only one 'data' chunk and PCM
+            # samples are addressed directly (no compressed-block indirection).
+            cue_points += struct.pack('<II4sIII', cue_id, sample_pos, b'data', 0, 0, sample_pos)
+
+            label_text = f"Beat {cue_id}".encode('ascii') + b'\x00'
+            labl_payload = struct.pack('<I', cue_id) + label_text
+            if len(labl_payload) % 2:
+                labl_payload += b'\x00'
+            labels += b'labl' + struct.pack('<I', len(labl_payload)) + labl_payload
+
+        cue_payload = struct.pack('<I', len(beat_times)) + cue_points
+        cue_chunk = b'cue ' + struct.pack('<I', len(cue_payload)) + cue_payload
+        if len(cue_payload) % 2:
+            cue_chunk += b'\x00'
+
+        adtl_payload = b'adtl' + labels
+        list_chunk = b'LIST' + struct.pack('<I', len(adtl_payload)) + adtl_payload
+        if len(adtl_payload) % 2:
+            list_chunk += b'\x00'
+
+        new_data = data + cue_chunk + list_chunk
+        new_riff_size = len(new_data) - 8
+        new_data = new_data[:4] + struct.pack('<I', new_riff_size) + new_data[8:]
+
+        with open(wav_path, 'wb') as f:
+            f.write(new_data)
+
     def time_stretch_audio(self, input_path, output_path, target_bpm, source_bpm=None):
         """Time-stretch audio to exact target BPM with multi-pass verification.
         Tries RubberBand (commercial quality) first, falls back to FFmpeg atempo.
@@ -1393,11 +1474,11 @@ class MashupEngine:
             logging.error(f"Drum split failed for {drum_stem_path}: {e}", exc_info=True)
             raise
 
-    def separate_stems_multi_engine(self, songs, use_restoration=True):
+    def separate_stems_multi_engine(self, songs, use_restoration=True, progress_callback=None):
         """Advanced multi-engine stem separation: Mel-Band Roformer Karaoke (vocals) +
         Demucs htdemucs_6s (bass/guitar/piano/other/drums) + MDX23C DrumSep
         (kick/snare, ML) + frequency-split (hihat/tom, approximate) + optional
-        HiFi++ GAN artifact restoration.
+        denoise + de-reverb artifact restoration.
 
         Every stem is derived straight from the full song: the Karaoke model and
         htdemucs_6s both run directly against the original/processed WAV, in
@@ -1419,7 +1500,12 @@ class MashupEngine:
         import threading
 
         results = []
+        song_count = len(songs)
         for song_idx, song in enumerate(songs):
+            def report(local_frac, label):
+                if progress_callback:
+                    progress_callback((song_idx + local_frac) / song_count, label)
+
             logging.info(f"\n{'='*60}")
             logging.info(f"🎵 Processing Song {song_idx + 1}/{len(songs)}: {Path(song).name}")
             logging.info(f"{'='*60}")
@@ -1429,6 +1515,7 @@ class MashupEngine:
             song_out_dir.mkdir(exist_ok=True, parents=True)
 
             # STAGE 1: Parallel extraction, both straight from the full song
+            report(0.0, "Stage 1: extracting vocals + separating instruments...")
             logging.info(f"📊 [STAGE 1] Parallel vocal + multi-instrument extraction...")
 
             vocals_path = None
@@ -1477,12 +1564,14 @@ class MashupEngine:
             # docstring above). Kick/snare come from DrumSep (real ML separation);
             # hihat/tom come from bandpass filtering the same drum stem, since no
             # ML model for those exists in the registry.
+            report(0.55, "Stage 2: splitting drums (kick/snare/hihat/tom)...")
             logging.info(f"🥁 [STAGE 2] Kick/snare (MDX23C DrumSep) + hihat/tom (frequency split)...")
             drums_stem = demucs_stems['drums']
             kick_snare = self._split_drums_mdx23c(drums_stem, str(song_out_dir))
             hihat_tom = self.split_drums(drums_stem, str(song_out_dir))
 
             # STAGE 3: Assemble final stem structure
+            report(0.75, "Stage 3: assembling stems...")
             logging.info(f"🔧 [STAGE 3] Assembling final stem structure...")
             final_stems = {
                 'vocals': vocals_path,
@@ -1500,17 +1589,19 @@ class MashupEngine:
             if missing:
                 raise RuntimeError(f"Multi-engine separation did not produce: {missing}")
 
-            # STAGE 4: Optional HiFi++ GAN restoration
+            # STAGE 4: Optional denoise + de-reverb restoration
             if use_restoration:
-                logging.info(f"✨ [STAGE 4] HiFi++ GAN restoration...")
+                report(0.8, "Stage 4: denoise + de-reverb restoration...")
+                logging.info(f"✨ [STAGE 4] Denoise + de-reverb restoration...")
                 try:
                     final_stems = self._apply_hifi_restoration(final_stems, str(song_out_dir))
                     logging.info(f"  ✅ Restoration complete")
                 except Exception as e:
-                    logging.warning(f"  ⚠️  HiFi++ restoration skipped: {e}")
+                    logging.warning(f"  ⚠️  Restoration skipped: {e}")
 
             self._conform_stem_lengths(final_stems)
             results.append(final_stems)
+            report(1.0, "Stems ready")
             logging.info(f"✅ Song {song_idx + 1} complete: 9 stems ready\n")
 
         return results
@@ -1647,87 +1738,85 @@ class MashupEngine:
             raise RuntimeError(f"Drum splitting failed: {str(e)[-500:]}")
 
     def _apply_hifi_restoration(self, stems, output_dir):
-        """Apply HiFi++ GAN restoration to all stems for artifact removal.
+        """Apply ML-based restoration (denoise + de-reverb) to all stems for
+        artifact removal.
 
-        HiFi++ is a multi-stage GAN framework that:
-        - Detects and removes codec/compression artifacts
-        - Restores high-frequency content
-        - Per-stem quality optimization
+        This used to call the CPJKU "music-source-restoration" project (a
+        HiFi++ GAN). That repo has no setup.py/pyproject.toml (not
+        pip-installable at all) and doesn't even contain the module this
+        code imported (restoration.mixture_inference / create_mixture_system
+        never existed there) -- so that path always raised ImportError and
+        silently fell back to spectral filtering, no matter what was
+        installed. Replaced with audio-separator's own denoise + de-reverb
+        Mel-Band Roformer models: same download/inference infrastructure
+        already proven for vocals/drum separation above, with real published
+        checkpoints and measured SDR (27.99 dB denoise, 19.17 dB de-reverb).
 
-        Requires: pip install https://github.com/CPJKU/music-source-restoration
-        If not available, falls back to spectral filtering.
+        Falls back to spectral filtering only if these models can't be
+        loaded (e.g. no internet for the first-time checkpoint download).
         """
         import logging
 
-        # Try HiFi++ GAN first, fall back to spectral filtering
         try:
-            return self._apply_hifi_gan(stems, output_dir)
+            return self._apply_ml_restoration(stems, output_dir)
         except Exception as e:
-            logging.warning(f"HiFi++ GAN restoration unavailable ({e}), using spectral filtering")
+            logging.warning(f"ML restoration unavailable ({e}), using spectral filtering")
             return self._apply_spectral_restoration(stems, output_dir)
 
-    def _apply_hifi_gan(self, stems, output_dir):
-        """Apply HiFi++ GAN using CPJKU Music Source Restoration.
-
-        Multi-stage pipeline:
-        1. BS-RoFormer detection
-        2. HiFi++ GAN waveform restoration
-        3. Per-stem quality assessment
+    def _apply_ml_restoration(self, stems, output_dir):
+        """Denoise, then de-reverb, every stem via audio-separator's
+        highest-SDR general-purpose models for each. Not vocal-specific, so
+        applying the same two models to every stem (including drums) is
+        valid, though drum transients are the least tested case.
         """
         import logging
-        import torch
-        import torchaudio
 
         try:
-            from restoration.mixture_inference import create_mixture_system
-            from pathlib import Path as PathlibPath
+            from audio_separator.separator import Separator
         except ImportError:
             raise RuntimeError(
-                "HiFi++ GAN requires music-source-restoration. Install with:\n"
-                "pip install git+https://github.com/CPJKU/music-source-restoration"
+                "ML restoration requires: pip install audio-separator onnxruntime\n"
+                "Models download automatically on first use."
             )
+
+        restore_dir = Path(output_dir) / "restoration"
+        restore_dir.mkdir(exist_ok=True, parents=True)
+
+        # Loaded once and reused across every stem below -- reloading a
+        # checkpoint per stem would multiply model-load time (up to ~1 min
+        # for the de-reverb model) by however many stems there are.
+        denoiser = Separator(output_dir=str(restore_dir), output_format="WAV")
+        denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
+        dereverber = Separator(output_dir=str(restore_dir), output_format="WAV")
+        dereverber.load_model(model_filename="dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
+
+        def _resolve(output_files, marker):
+            for f in output_files:
+                resolved = f if Path(f).is_absolute() else str(restore_dir / f)
+                if marker in Path(resolved).stem.lower():
+                    return resolved
+            return None
 
         restored = {}
-        logging.info("Initializing HiFi++ GAN restoration...")
-
-        # Create mixture-of-experts system (routes to best expert per instrument)
-        try:
-            system = create_mixture_system(
-                checkpoints=None,  # Uses default pre-trained checkpoints
-                routing_strategy="weighted",  # Weighted average of experts
-                device="cuda" if torch.cuda.is_available() else "cpu"
-            )
-        except Exception as e:
-            raise RuntimeError(f"Could not initialize HiFi++ GAN: {e}")
-
         for stem_name, stem_path in stems.items():
             if not stem_path or not Path(stem_path).is_file():
                 restored[stem_name] = stem_path
                 continue
 
             try:
-                restored_path = str(Path(stem_path).parent / f"{Path(stem_path).stem}_restored.wav")
+                denoised_path = _resolve(denoiser.separate(stem_path), 'dry')
+                if not denoised_path:
+                    raise RuntimeError("denoise model didn't produce a 'dry' output")
 
-                # Load stem audio
-                audio, sr = torchaudio.load(str(stem_path))
-                if sr != 44100:
-                    audio = torchaudio.transforms.Resample(sr, 44100)(audio)
+                dereverbed_path = _resolve(dereverber.separate(denoised_path), 'noreverb')
+                if not dereverbed_path:
+                    raise RuntimeError("de-reverb model didn't produce a 'noreverb' output")
 
-                # Restore with HiFi++ (instrument-aware expert selection)
-                with torch.no_grad():
-                    restored_audio = system.restore_stem(
-                        audio,
-                        instrument=self._stem_to_instrument(stem_name)
-                    )
-
-                # Save restored stem
-                torchaudio.save(restored_path, restored_audio, 44100)
-
-                restored[stem_name] = restored_path
-                logging.info(f"    ✓ HiFi++ GAN restored: {stem_name}")
+                restored[stem_name] = dereverbed_path
+                logging.info(f"    ✓ Denoise + de-reverb restored: {stem_name}")
 
             except Exception as e:
-                logging.warning(f"    ⚠️  HiFi++ restoration failed for {stem_name}: {e}")
+                logging.warning(f"    ⚠️  ML restoration failed for {stem_name}: {e}")
                 restored[stem_name] = stem_path
 
         return restored
@@ -1736,7 +1825,7 @@ class MashupEngine:
         """Fallback spectral restoration (no ML model required).
 
         Uses FFmpeg spectral filtering to remove shimmer/artifacts.
-        Quality lower than HiFi++ GAN but no dependencies.
+        Quality lower than the ML denoise/de-reverb models but no model downloads required.
         """
         import logging
 
@@ -1769,19 +1858,3 @@ class MashupEngine:
                 restored[stem_name] = stem_path
 
         return restored
-
-    @staticmethod
-    def _stem_to_instrument(stem_name):
-        """Map stem name to instrument label for HiFi++ expert routing."""
-        instrument_map = {
-            'vocals': 'vocals',
-            'kick': 'drums',
-            'snare': 'drums',
-            'hihat': 'drums',
-            'tom': 'drums',
-            'bass': 'bass',
-            'guitar': 'guitar',
-            'piano': 'piano',
-            'other': 'other',
-        }
-        return instrument_map.get(stem_name, 'other')

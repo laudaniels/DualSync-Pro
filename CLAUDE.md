@@ -70,10 +70,10 @@ not a full mix, so kick/snare runs on Demucs' `drums` output.
 2. **Stage 2** — from Demucs' `drums` output:
    - **MDX23C DrumSep** (SOTA): kick, snare (ML-based)
    - **Frequency-band filtering**: hihat, tom (fallback, no model)
-3. **Stage 3 (Optional)** — all 9 stems:
-   - **HiFi++ GAN** (CPJKU): artifact removal, quality enhancement
-   - Instrument-aware expert routing (vocals/drums/bass/guitar/piano/other)
-   - Graceful fallback to spectral filtering
+3. **Stage 3** — all 9 stems:
+   - **Denoise + de-reverb** (audio-separator Mel-Band Roformer models,
+     27.99 / 19.17 dB SDR): artifact removal, quality enhancement
+   - Graceful fallback to spectral filtering if these models can't load
 
 **Output (9 stems, 7 ML-separated + 2 filtered):**
 - `vocals` — Mel-Band RoFormer (12.6 dB SDR)
@@ -84,20 +84,31 @@ not a full mix, so kick/snare runs on Demucs' `drums` output.
 **Model Details:**
 - **Vocal Model:** `vocals_mel_band_roformer.ckpt` (highest quality in audio-separator registry)
 - **Drum ML:** `drumsep_5stems_mdx23c_jarredou.ckpt` (5-stem capable, we use kick+snare)
-- **Restoration:** CPJKU Music Source Restoration (mixture-of-experts, instrument-aware)
+- **Restoration:** `denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt` (27.99 dB SDR)
+  then `dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt` (19.17 dB SDR), both from
+  the audio-separator registry -- applied to every stem, in that order
 
 **Requirements:**
 ```bash
 pip install audio-separator>=0.17.0
 pip install onnxruntime   # required by audio-separator
-# Optional: HiFi++ GAN for production quality
-pip install git+https://github.com/CPJKU/music-source-restoration
 ```
+Both restoration models download automatically on first use, same as the
+vocal/drum models above -- no separate install step.
+
+**Past known issue (fixed):** this stage used to call the CPJKU
+"music-source-restoration" project (a HiFi++ GAN) via
+`restoration.mixture_inference.create_mixture_system` -- a module that never
+existed in that repo, which also has no setup.py/pyproject.toml (not
+pip-installable at all, just a training codebase). That import always failed
+and silently fell back to spectral filtering, regardless of what was
+installed. Replaced with the denoise + de-reverb models above, which are
+real, tested, and use infrastructure already proven in this pipeline.
 
 **Performance:** ~14-20 min per track (quality prioritized over speed)
 - Stage 1 (parallel vocals + drums): ~8-10 min
 - Stage 2 (drum splitting + filtering): ~2-3 min  
-- Stage 3 (HiFi++ GAN restoration): ~4-7 min (optional)
+- Stage 3 (denoise + de-reverb restoration): ~4-7 min
 
 ## Features & Components
 
@@ -109,10 +120,10 @@ pip install git+https://github.com/CPJKU/music-source-restoration
 - **Frequency filtering** → hihat, tom (no ML model exists)
 
 **Restoration:**
-- **HiFi++ GAN** (CPJKU Music Source Restoration) → artifact removal
-  - Mixture-of-Experts with instrument-aware routing
-  - Fallback to spectral filtering if GAN unavailable
-  - Optional: `pip install git+https://github.com/CPJKU/music-source-restoration`
+- **Denoise + de-reverb** (audio-separator Mel-Band Roformer models) → artifact removal
+  - Denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR), applied to every stem
+  - Fallback to spectral filtering if these models can't load
+  - No separate install -- downloads automatically via audio-separator, same as the vocal/drum models
 
 ### UI Features
 **Waveform Preview Thumbnails:**
@@ -145,7 +156,7 @@ pip install git+https://github.com/CPJKU/music-source-restoration
 - Stem separation pipeline: ~14-20 min per track (quality prioritized)
   - Stage 1 (parallel): ~8-10 min
   - Stage 2 (drum splitting): ~2-3 min
-  - Stage 3 (HiFi++ GAN): ~4-7 min (optional)
+  - Stage 3 (denoise + de-reverb): ~4-7 min
 - All generated audio goes under `Audio/` (git-ignored): uploads/aligned WAVs,
   `Audio/stems/<timestamp>/`, `Audio/renders/`, and download ZIPs
 - Separation results are cached in `separated_stems/<hash>/` (git-ignored);

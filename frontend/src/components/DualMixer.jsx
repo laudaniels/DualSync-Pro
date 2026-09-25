@@ -28,7 +28,13 @@ export default function DualMixer() {
   const [beatmatchedStems, setBeatmatchedStems] = useState([null, null]);
   const [beatmatchStatus, setBeatmatchStatus] = useState([null, null]);
   const [processingProgress, setProcessingProgress] = useState(0); // 0-100
+  const [processingStepLabel, setProcessingStepLabel] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+  // Per-slot {progress, current_step, status} from /api/process-status, polled
+  // while either song is on its initial upload->separate pass -- lets the
+  // "waiting for the other song" bar below show real progress instead of an
+  // indeterminate spinner.
+  const [initialLoadSlots, setInitialLoadSlots] = useState({});
   const [transposingProgress, setTransposingProgress] = useState(0); // 0-100
   const [isTransposing, setIsTransposing] = useState(false);
   const [lastProcessedBpm, setLastProcessedBpm] = useState(null); // Track last processed BPM
@@ -39,8 +45,6 @@ export default function DualMixer() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [audioStats, setAudioStats] = useState({ file_count: 0, total_size_formatted: '0 MB' });
-  const [processingLogs, setProcessingLogs] = useState([]);
-  const logsEndRef = useRef(null);
   const currentProcessingSlotRef = useRef(0); // Which slot handleProcessAllChanges is currently on
 
   const beatSnapTimeoutRef = useRef(null); // Debounce for magnetic snap visual feedback
@@ -131,7 +135,9 @@ export default function DualMixer() {
     };
   }, [barOffsetDisplay]);
 
-  // Poll for processing logs while loading
+  // Poll per-slot progress while either song is on its initial upload/separate
+  // pass -- feeds the progress bars in each SongMixer's loading view (and the
+  // shared "waiting for the other song" bar below).
   React.useEffect(() => {
     if (!loading[0] && !loading[1]) return;
 
@@ -139,32 +145,16 @@ export default function DualMixer() {
       try {
         const response = await fetch('/api/process-status');
         const data = await response.json();
-        if (data.logs && data.logs.length > 0) {
-          setProcessingLogs(data.logs);
+        if (data.slots) {
+          setInitialLoadSlots(data.slots);
         }
       } catch (err) {
-        console.error('Log fetch error:', err);
+        console.error('Process-status fetch error:', err);
       }
     }, 300);
 
     return () => clearInterval(interval);
   }, [loading]);
-
-  // Auto-scroll logs to latest message -- but keep the view on the song
-  // panels themselves (uploading/waiting/choosing) rather than being pulled
-  // down to the growing log, until Song 2 is actually being processed
-  // (loading[1]). Before that, Song 2 may just be waiting for Song 1 to
-  // finish so all 3 processing choices can be shown together.
-  React.useEffect(() => {
-    if (logsEndRef.current && loading[1]) {
-      // block: 'end' aligns the BOTTOM of the log panel to the viewport's
-      // bottom edge -- the default ('start') aligns logsEndRef's top to the
-      // viewport's top instead, which (since it's a zero-height marker right
-      // after the last log line) pushes the whole log list above it clean
-      // off-screen.
-      logsEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
-    }
-  }, [processingLogs, loading]);
 
   // Helper: Generate filename with BPM labels
   const generateBpmLabel = (meta, isProcessed = false) => {
@@ -752,6 +742,9 @@ export default function DualMixer() {
           const combined = ((completedSlots * 100) + slotState.progress) / totalSlots;
           setProcessingProgress(combined);
         }
+        if (slotState?.current_step) {
+          setProcessingStepLabel(slotState.current_step);
+        }
       } catch (e) {
         // Silent - API might not have data yet
       }
@@ -777,6 +770,7 @@ export default function DualMixer() {
       setTimeout(() => {
         setIsProcessing(false);
         setProcessingProgress(0);
+        setProcessingStepLabel('');
       }, 500);
     }
   };
@@ -898,6 +892,12 @@ export default function DualMixer() {
   const keyRecommendations = getKeyRecommendationsList();
   const ownCompatibility = getOwnCompatibility();
   const song1Ready = !!stems[0] && metadata[0]?.bpm != null && metadata[0]?.beat_anchor != null;
+  // Don't reveal either song's volume sliders until BOTH are ready -- so they
+  // open together, instead of Song 1's mixer popping in while Song 2 is still
+  // a spinner (or vice versa).
+  const bothStemsReady = !!stems[0] && !!stems[1];
+  const waitingOnSlot = !stems[0] ? 0 : !stems[1] ? 1 : null;
+  const showWaitingBar = waitingOnSlot !== null && (!!stems[0] || !!stems[1]);
 
   return (
     <div className="dual-mixer">
@@ -916,6 +916,8 @@ export default function DualMixer() {
               slot={slot}
               metadata={metadata[slot]}
               hasStems={!!stems[slot]}
+              revealVolumes={bothStemsReady}
+              loadProgress={initialLoadSlots[slot]}
               loading={loading[slot]}
               editingBpm={editingBpm[slot]}
               editingKey={editingKey[slot]}
@@ -941,6 +943,39 @@ export default function DualMixer() {
             />
           ))}
         </div>
+
+        {/* Shared progress bar while one song is done and the other is still
+            separating -- keeps both volume panels from opening lopsided. */}
+        {showWaitingBar && (
+          <div style={{ margin: '10px 0 20px' }}>
+            <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '6px', textAlign: 'center' }}>
+              ⏳ Waiting for Song {waitingOnSlot + 1}
+              {initialLoadSlots[waitingOnSlot]?.current_step ? `: ${initialLoadSlots[waitingOnSlot].current_step}` : '...'}
+            </div>
+            <div style={{
+              background: 'rgba(99, 102, 241, 0.1)',
+              border: '1px solid #6366f1',
+              borderRadius: '4px',
+              overflow: 'hidden',
+              height: '24px'
+            }}>
+              <div style={{
+                width: `${initialLoadSlots[waitingOnSlot]?.progress ?? 0}%`,
+                height: '100%',
+                background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                transition: 'width 0.3s ease',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: '#fff',
+                fontSize: '12px',
+                fontWeight: 'bold'
+              }}>
+                {Math.round(initialLoadSlots[waitingOnSlot]?.progress ?? 0)}%
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Waveform Stem Selector - Center Section */}
         {stems[0] && stems[1] && (
@@ -977,33 +1012,6 @@ export default function DualMixer() {
                 </label>
               ))}
             </div>
-          </div>
-        )}
-
-        {/* Unified Processing Log */}
-        {(loading[0] || loading[1] || isProcessing) && processingLogs.length > 0 && (
-          <div style={{
-            background: 'rgba(139, 92, 246, 0.1)',
-            border: '1px solid rgba(139, 92, 246, 0.3)',
-            borderRadius: '8px',
-            padding: '15px',
-            marginTop: '20px',
-            marginBottom: '20px',
-            maxHeight: '250px',
-            overflowY: 'auto',
-            fontFamily: 'monospace',
-            fontSize: '12px',
-            color: '#aaa'
-          }}>
-            <div style={{ color: '#8b5cf6', marginBottom: '10px', fontWeight: 'bold' }}>
-              📋 Processing Log
-            </div>
-            {processingLogs.map((log, i) => (
-              <div key={i} style={{ marginBottom: '3px', color: '#ddd' }}>
-                {log}
-              </div>
-            ))}
-            <div ref={logsEndRef} />
           </div>
         )}
 
@@ -1252,6 +1260,11 @@ export default function DualMixer() {
             {/* Processing Progress Bar */}
             {isProcessing && (
               <>
+                {processingStepLabel && (
+                  <div style={{ fontSize: '12px', color: '#94a3b8', margin: '6px 0 4px' }}>
+                    {processingStepLabel}
+                  </div>
+                )}
                 <div style={{
                   margin: '10px 0',
                   background: 'rgba(99, 102, 241, 0.1)',
@@ -1450,7 +1463,8 @@ export default function DualMixer() {
                   const metadataList = metadata.map((m, i) => m ? {
                     filename: m.filename,
                     bpm: getCurrentBpm(i) ?? generateBpmLabel(m, false),
-                    key: getCurrentKey(i) ?? m.key
+                    key: getCurrentKey(i) ?? m.key,
+                    beat_anchor: m.beat_anchor
                   } : null);
 
                   handleDownload('original', '/api/download-stems-zip', {
@@ -1524,11 +1538,24 @@ export default function DualMixer() {
                       alert('No stems to download');
                       return;
                     }
-                    const metadataList = metadata.map(m => m ? {
-                      filename: m.filename,
-                      bpm: generateBpmLabel(m, true),
-                      key: targetKey || m.key
-                    } : null);
+                    const metadataList = metadata.map(m => {
+                      if (!m) return null;
+                      // These stems were beatmatched to the target BPM, which
+                      // uniformly time-stretches the whole file -- the
+                      // originally-detected anchor's absolute position must be
+                      // scaled by the same ratio, or its markers land off-beat
+                      // (same formula already used for the Waveform beat grid).
+                      const currentBpm = m.currentBpm ?? m.detectedBpm ?? m.bpm;
+                      const scaledAnchor = (m.beat_anchor != null && m.detectedBpm && currentBpm)
+                        ? m.beat_anchor * (m.detectedBpm / currentBpm)
+                        : m.beat_anchor;
+                      return {
+                        filename: m.filename,
+                        bpm: generateBpmLabel(m, true),
+                        key: targetKey || m.key,
+                        beat_anchor: scaledAnchor
+                      };
+                    });
 
                     handleDownload('processed', '/api/download-stems-zip', {
                       timestamps,

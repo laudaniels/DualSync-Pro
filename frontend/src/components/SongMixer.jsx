@@ -14,6 +14,8 @@ function SongMixer({
   slot,
   metadata,
   hasStems,
+  revealVolumes,
+  loadProgress,
   loading,
   editingBpm,
   editingKey,
@@ -209,10 +211,38 @@ function SongMixer({
               <div className="loader">
                 <div className="spinner"></div>
                 <p>
-                  {processingStage === 'align' ? 'Aligning beatgrid...'
+                  {loadProgress?.current_step || (
+                    processingStage === 'align' ? 'Aligning beatgrid...'
                     : processingStage === 'snap' ? 'Snapping beat grid to Song 1...'
-                    : 'Separating stems... (this may take a minute)'}
+                    : 'Separating stems... (this may take a minute)'
+                  )}
                 </p>
+                {loadProgress?.progress != null && (
+                  <div style={{ width: '80%' }}>
+                    <div style={{
+                      background: 'rgba(99, 102, 241, 0.15)',
+                      border: '1px solid #6366f1',
+                      borderRadius: '4px',
+                      overflow: 'hidden',
+                      height: '20px'
+                    }}>
+                      <div style={{
+                        width: `${loadProgress.progress}%`,
+                        height: '100%',
+                        background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                        transition: 'width 0.3s ease',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: '#fff',
+                        fontSize: '11px',
+                        fontWeight: 'bold'
+                      }}>
+                        {Math.round(loadProgress.progress)}%
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             ) : waitingForSong1 ? (
               <div className="loader">
@@ -256,7 +286,7 @@ function SongMixer({
                         width: '100%'
                       }}
                     >
-                      2️⃣ Align beatgrid first
+                      2️⃣ Align beatgrid
                     </button>
                     <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#999' }}>Correct internal timing drift (vinyl rip, live recording)</p>
                   </div>
@@ -290,8 +320,14 @@ function SongMixer({
             onStemsLoaded={(file) => onFileDropped(file, slot)}
             loading={loading}
             loadingLabel="Converting to WAV..."
+            progress={loadProgress?.progress}
+            stepLabel={loadProgress?.current_step}
           />
         )
+      ) : !revealVolumes ? (
+        <div className="stem-controls" style={{ textAlign: 'center', padding: '30px 0', color: '#999', fontSize: '13px' }}>
+          ✅ Stems ready — waiting for the other song to finish...
+        </div>
       ) : (
         <div className="stem-controls">
           <h4>🎚️ Volumes {!audioReady && <span style={{ fontWeight: 'normal', fontSize: '11px', color: '#999' }}>(⏳ preparing audio...)</span>}</h4>
