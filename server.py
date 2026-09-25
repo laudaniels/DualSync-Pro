@@ -188,8 +188,9 @@ def process_song():
         add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
 
         # Check if multi-engine mode is enabled (via env var or config)
+        # DEFAULT: true (9-stem multi-engine) -- set to 'false' to use legacy 7-stem Demucs-only
         import os
-        use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
+        use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
 
         if use_multi_engine:
             add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep + HiFi++)...", slot)
@@ -478,7 +479,7 @@ def process_stems():
         _set_slot_state(slot, progress=50, current_step=_processing_state['steps'][3])
         add_log_message(f"🔊 Separating stems from processed song...", slot)
         import os
-        use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
+        use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
         stem_dict = engine.separate_stems([str(current_input)], use_multi_engine=use_multi_engine)[0]
 
         # Copy processed stems to serve directory
@@ -881,8 +882,9 @@ def download_unaligned_stems():
                 logging.info(f"Separating unaligned original for slot {slot}: {song_name}")
 
                 # Use multi-engine if enabled (same setting as main processing)
+                # DEFAULT: true (9-stem multi-engine)
                 import os
-                use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'false').lower() == 'true'
+                use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
                 stem_dict = engine.separate_stems([str(wav_path)], use_multi_engine=use_multi_engine)[0]
 
                 for stem_name, stem_path in stem_dict.items():
