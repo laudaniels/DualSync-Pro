@@ -1352,7 +1352,7 @@ export default function DualMixer() {
             )}
 
             <p style={{ margin: '0 0 12px 0', fontSize: '11px', color: '#888' }}>
-              Ranked by harmonic compatibility (circle-of-fifths distance), not raw semitone distance -- a smaller shift isn't always the more natural-sounding one.
+              Ranked by semitone distance first (0, ±1, ±2...), then by harmonic compatibility. Smaller shifts are preferred.
             </p>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '15px' }}>
               {keyRecommendations.length === 0 ? (

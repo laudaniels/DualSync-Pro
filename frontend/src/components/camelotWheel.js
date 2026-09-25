@@ -72,11 +72,20 @@ const TIER_BY_SCORE = {
   4: { label: 'Ok', emoji: '🆗' }
 };
 
-// Rank every candidate absolute key (0-11) by how big a circle-of-fifths
-// stretch it is for the more-distant of the two songs, and return up to
-// `limit` of the best, each labeled from "Very good" down to "Ok".
-// Candidates scoring worse than 4 fifths for either song are dropped
-// entirely rather than padded in, since they aren't a good harmonic match.
+// Semitone distance (shortest path, -6 to +6)
+export function semitoneDifference(key1, key2) {
+  const pc1 = keyNameToPitchClass(key1);
+  const pc2 = keyNameToPitchClass(key2);
+  if (pc1 < 0 || pc2 < 0) return 0;
+  let diff = (pc2 - pc1) % 12;
+  if (diff > 6) diff -= 12;
+  return diff;
+}
+
+// Rank every candidate absolute key (0-11) by harmonic compatibility
+// (circle-of-fifths distance) as a SECONDARY sort, with PRIMARY sort
+// being semitone distance (users expect smaller pitch shifts first).
+// Returns up to `limit` of the best candidates, labeled by quality.
 export function getKeyRecommendations(song1Key, song1Scale, song2Key, song2Scale, limit = 5) {
   const pc1 = keyNameToPitchClass(song1Key);
   const pc2 = keyNameToPitchClass(song2Key);
@@ -85,26 +94,35 @@ export function getKeyRecommendations(song1Key, song1Scale, song2Key, song2Scale
   const candidates = KEYS.map((candidateKey, pcX) => {
     const dist1 = fifthsDistance(pc1, pcX);
     const dist2 = fifthsDistance(pc2, pcX);
-    const score = Math.max(dist1, dist2);
+    const harmonicScore = Math.max(dist1, dist2);  // Camelot-based ranking (secondary)
+    const semitone = semitoneDifference(song2Key, candidateKey);  // Song 2's pitch shift (primary)
     const sameMode = !!song1Scale && !!song2Scale && song1Scale === song2Scale;
     return {
       key: candidateKey,
-      score,
+      harmonicScore,
+      semitone,
       dist1,
       dist2,
       combinedDist: dist1 + dist2,
       sameMode,
       camelot1: camelotCode(candidateKey, song1Scale),
       camelot2: camelotCode(candidateKey, song2Scale),
-      ...TIER_BY_SCORE[score]
+      // Tier by semitone distance first, then harmonic score as tiebreaker
+      ...TIER_BY_SCORE[Math.min(harmonicScore, 4)]
     };
-  }).filter(c => c.score <= 4);
+  }).filter(c => c.harmonicScore <= 4);
 
-  candidates.sort((a, b) =>
-    a.score - b.score ||
-    (a.sameMode === b.sameMode ? 0 : a.sameMode ? -1 : 1) ||
-    a.combinedDist - b.combinedDist
-  );
+  // PRIMARY: sort by absolute semitone distance (0, 1, 2, etc.)
+  // SECONDARY: if same semitone distance, sort by harmonic score (Camelot wheel)
+  // TERTIARY: if same harmonic score, prefer same mode, then combined distance
+  candidates.sort((a, b) => {
+    const aSemitone = Math.abs(a.semitone);
+    const bSemitone = Math.abs(b.semitone);
+    return aSemitone - bSemitone ||
+      a.harmonicScore - b.harmonicScore ||
+      (a.sameMode === b.sameMode ? 0 : a.sameMode ? -1 : 1) ||
+      a.combinedDist - b.combinedDist;
+  });
 
   return candidates.slice(0, limit);
 }
