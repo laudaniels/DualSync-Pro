@@ -2,17 +2,16 @@
 
 ## Project Status
 
-**Active Development:** Flask API + React web interface  
-**Frozen:** Desktop app (Tkinter) as of v1.0 — see `archive/app_gui.py`
+**Active Development:** Flask API + React web interface
 
-The web interface is the primary application. The desktop version is no longer maintained.
+The web interface is the only application. (An early Tkinter desktop version
+was dropped and is not in this repository.)
 
 ## Core Files
 
 - **`server.py`** — Flask backend API (active)
 - **`frontend/`** — React web interface (active)
 - **`mashup_engine.py`** — Core audio processing engine (shared)
-- **`archive/app_gui.py`** — Old Tkinter desktop app (frozen, archived)
 
 ## Running the App
 
@@ -147,8 +146,10 @@ pip install git+https://github.com/CPJKU/music-source-restoration
   - Stage 1 (parallel): ~8-10 min
   - Stage 2 (drum splitting): ~2-3 min
   - Stage 3 (HiFi++ GAN): ~4-7 min (optional)
-- Presets are JSON files stored in `presets/` directory
-- All audio output goes to timestamped files in project root
+- All generated audio goes under `Audio/` (git-ignored): uploads/aligned WAVs,
+  `Audio/stems/<timestamp>/`, `Audio/renders/`, and download ZIPs
+- Separation results are cached in `separated_stems/<hash>/` (git-ignored);
+  `/api/cleanup` only clears `Audio/`, not this cache
 - Requires system FFmpeg installation
 - Beat/BPM detection uses Essentia (`RhythmExtractor2013`); madmom was tried
   first historically but doesn't install in this project's environment

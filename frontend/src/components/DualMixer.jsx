@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import Waveform from './Waveform';
 import SongMixer from './SongMixer';
 import { stemNames, stemLabels, orderStems } from './stemConstants';
-import { getKeyRecommendations, camelotCode, camelotDistanceBetween } from './camelotWheel';
+import { getKeyRecommendations, camelotDistanceBetween, formatKey, formatTargetKey } from './camelotWheel';
 import { DualStemPlayer } from '../audio/DualStemPlayer';
 import '../styles/DualMixer.css';
 
@@ -923,6 +923,7 @@ export default function DualMixer() {
               overrideKey={overrideKey[slot]}
               effectiveBpm={getEffectiveBpm(slot)}
               effectiveKey={getEffectiveKey(slot)}
+              scale={getEffectiveScale(slot)}
               volumes={volumes[slot]}
               stemNames={stems[slot] ? orderStems(Object.keys(stems[slot])) : []}
               audioReady={audioReady[slot]}
@@ -1011,7 +1012,7 @@ export default function DualMixer() {
           <div className="playback-section">
             {/* Now playing: the actual current bpm/key of the loaded stems */}
             <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '10px' }}>
-              📦 Now playing: Song 1 [{getCurrentKey(0)} {getCurrentBpm(0)} BPM] + Song 2 [{getCurrentKey(1)} {getCurrentBpm(1)} BPM]
+              📦 Now playing: Song 1 [{formatKey(getCurrentKey(0), getEffectiveScale(0))} {getCurrentBpm(0)} BPM] + Song 2 [{formatKey(getCurrentKey(1), getEffectiveScale(1))} {getCurrentBpm(1)} BPM]
             </div>
             <div className="playback-controls">
               <button
@@ -1224,7 +1225,7 @@ export default function DualMixer() {
                 }}
               >
                 <option value="" style={{ background: '#1a1f3a', color: '#fff' }}>No transposition</option>
-                {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{k}</option>)}
+                {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{formatTargetKey(k, [0, 1].filter(slot => stems[slot]).map(getEffectiveScale))}</option>)}
               </select>
             </div>
 
@@ -1310,7 +1311,7 @@ export default function DualMixer() {
                       <div key={slot} style={{ color: '#aaa' }}>
                         <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong>
                         <br />
-                        {sourceBpm} → {targetBpmForSlot} BPM {sourceKey && targetKeyForSlot && `| ${sourceKey} → ${targetKeyForSlot}`} <span style={{ marginLeft: '8px' }}>{statusEmoji} {status === 'processing' ? 'Processing...' : status === 'done' ? 'Ready' : 'Failed'}</span>
+                        {sourceBpm} → {targetBpmForSlot} BPM {sourceKey && targetKeyForSlot && `| ${formatKey(sourceKey, getEffectiveScale(slot))} → ${formatKey(targetKeyForSlot, getEffectiveScale(slot))}`} <span style={{ marginLeft: '8px' }}>{statusEmoji} {status === 'processing' ? 'Processing...' : status === 'done' ? 'Ready' : 'Failed'}</span>
                       </div>
                     );
                   })}
@@ -1346,7 +1347,7 @@ export default function DualMixer() {
                 fontSize: '12px',
                 color: '#86efac'
               }}>
-                ✅ No change needed -- Song 1 [{camelotCode(getEffectiveKey(0), getEffectiveScale(0))}] and Song 2 [{camelotCode(getEffectiveKey(1), getEffectiveScale(1))}] are already
+                ✅ No change needed -- Song 1 [{formatKey(getEffectiveKey(0), getEffectiveScale(0))}] and Song 2 [{formatKey(getEffectiveKey(1), getEffectiveScale(1))}] are already
                 {ownCompatibility === 0 ? ' in the same key.' : ' a compatible pair (relative or adjacent on the Camelot wheel).'}
               </div>
             )}
@@ -1378,13 +1379,12 @@ export default function DualMixer() {
                     opacity: isLocked ? 0.5 : 1
                   }}
                 >
-                  <span>{rec.emoji} <strong>{rec.key}</strong> <span style={{ color: '#999' }}>({rec.label})</span></span>
+                  <span>{rec.emoji} <strong>{formatTargetKey(rec.key, [0, 1].filter(slot => stems[slot]).map(getEffectiveScale))}</strong> <span style={{ color: '#999' }}>({rec.label})</span></span>
                   <span style={{ color: '#999', fontSize: '11px' }}>
                     {[0, 1].filter(slot => stems[slot]).map(slot => {
                       const shift = getSemitoneShift(getEffectiveKey(slot), rec.key);
                       const sign = shift > 0 ? '+' : '';
-                      const camelot = slot === 0 ? rec.camelot1 : rec.camelot2;
-                      return `Song ${slot + 1}: ${camelot ?? '?'} (${sign}${shift} st)`;
+                      return `Song ${slot + 1}: ${formatKey(rec.key, getEffectiveScale(slot))} (${sign}${shift} st)`;
                     }).join('  ·  ')}
                   </span>
                 </button>
@@ -1412,7 +1412,7 @@ export default function DualMixer() {
                     <strong style={{ color: '#8b5cf6' }}>{metadata[slot]?.filename?.replace(/\.[^/.]+$/, '')}</strong><br/>
                     {targetBpm && `${sourceBpm} → ${targetBpm} BPM`}
                     {targetBpm && targetKey && ' | '}
-                    {targetKey && `${sourceKey} → ${targetKey} ${keyDirection}${keyShiftLabel}`}
+                    {targetKey && `${formatKey(sourceKey, getEffectiveScale(slot))} → ${formatKey(targetKey, getEffectiveScale(slot))} ${keyDirection}${keyShiftLabel}`}
                   </div>
                 );
               })}

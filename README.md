@@ -220,6 +220,7 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
   - `GET /api/download-file/<filename>` — download single audio file
   - `GET /api/audio/<path>` — serve individual audio files
   - `GET /api/audio-stats` — audio level/statistics for a file
+  - `POST /api/split-drums` — split a drums stem into kick/snare/hihat/tom
   - `POST /api/cleanup` — delete all generated audio files (used by "Clean and Reset")
 
 ### Audio Processing Core (Python)
@@ -246,13 +247,14 @@ DualSync-Pro/
 │   │   └── App.jsx
 │   ├── vite.config.js
 │   └── package.json
-├── server.py                        # Flask REST API endpoints
+├── server.py                     # Flask REST API endpoints
 ├── mashup_engine.py              # Audio processing core
 ├── requirements.txt              # Python dependencies
+├── separated_stems/[hash]/       # Stem-separation cache (git-ignored)
 └── Audio/                        # Generated stems/mixes (git-ignored)
-    ├── stems/[timestamp]/        # Original stems per upload
-    ├── processed/[timestamp]/    # Beatmatched stems per session
-    └── ...
+    ├── stems/[timestamp]/        # Stems per processed song
+    ├── renders/                  # Final mixes
+    └── ...                       # Uploaded/aligned WAVs, download ZIPs
 ```
 
 ---

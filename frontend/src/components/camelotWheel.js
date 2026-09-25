@@ -33,6 +33,28 @@ export function camelotCode(keyName, scale) {
   return `${number}${mode === 'minor' ? 'A' : 'B'}`;
 }
 
+// Display label combining standard and Camelot notation, e.g.
+// formatKey('A', 'minor') -> 'Am · 8A', formatKey('C', 'major') -> 'C · 8B'.
+// When the mode wasn't detected, both possible Camelot codes are shown
+// ('C · 8B/5A') rather than silently assuming major like camelotCode does.
+export function formatKey(keyName, scale) {
+  if (keyName == null || keyName === '') return '';
+  if (keyNameToPitchClass(keyName) < 0) return keyName;
+  if (scale === 'minor') return `${keyName}m · ${camelotCode(keyName, 'minor')}`;
+  if (scale === 'major') return `${keyName} · ${camelotCode(keyName, 'major')}`;
+  return `${keyName} · ${camelotCode(keyName, 'major')}/${camelotCode(keyName, 'minor')}`;
+}
+
+// Label for a shared target key that both songs get transposed to. Each
+// song keeps its own mode, so this is only a single formatKey label when
+// both modes agree; otherwise each song's Camelot code is listed.
+export function formatTargetKey(keyName, scales) {
+  const known = scales.filter(Boolean);
+  if (known.length > 0 && known.every(sc => sc === known[0])) return formatKey(keyName, known[0]);
+  if (known.length === 0) return formatKey(keyName, null);
+  return `${keyName} · ${scales.map(sc => sc ? camelotCode(keyName, sc) : '?').join(' / ')}`;
+}
+
 // Circular distance in perfect-fifth steps (0-6) between two pitch classes.
 // Mode-independent: this is the number of Camelot-wheel hops a track has to
 // move to reach the other pitch class, whether it's major or minor.

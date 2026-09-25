@@ -2,6 +2,7 @@ import React from 'react';
 import StemLoader from './StemLoader';
 import WaveformPreview from './WaveformPreview';
 import { stemLabels } from './stemConstants';
+import { formatKey } from './camelotWheel';
 
 const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
@@ -20,6 +21,7 @@ function SongMixer({
   overrideKey,
   effectiveBpm,
   effectiveKey,
+  scale,
   volumes,
   stemNames,
   audioReady,
@@ -46,7 +48,7 @@ function SongMixer({
           <p><strong>{metadata.filename}</strong></p>
           {hasStems && (metadata.detectedBpm || metadata.detectedKey) && (
             <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
-              {metadata.mode === 'snap' ? '🧲 Original' : 'Detected'}: {metadata.detectedBpm} BPM{metadata.detectedBpm && metadata.detectedKey ? ', ' : ''}{metadata.detectedKey}
+              {metadata.mode === 'snap' ? '🧲 Original' : 'Detected'}: {metadata.detectedBpm} BPM{metadata.detectedBpm && metadata.detectedKey ? ', ' : ''}{formatKey(metadata.detectedKey, scale)}
             </p>
           )}
           {hasStems && metadata.bpm && metadata.mode === 'snap' && (
@@ -142,7 +144,7 @@ function SongMixer({
                     }}
                   >
                     <option value="">Clear override</option>
-                    {KEYS.map(k => <option key={k} value={k}>{k}</option>)}
+                    {KEYS.map(k => <option key={k} value={k}>{formatKey(k, scale)}</option>)}
                   </select>
                   <button
                     onClick={() => onToggleEditingKey(slot, false)}
@@ -162,7 +164,7 @@ function SongMixer({
               ) : (
                 <div style={{ display: 'flex', gap: '5px', marginTop: '5px', alignItems: 'center' }}>
                   <span style={{ color: overrideKey !== null ? '#8b5cf6' : '#ccc' }}>
-                    {effectiveKey} {overrideKey !== null ? '(custom)' : '(detected)'}
+                    {formatKey(effectiveKey, scale)} {overrideKey !== null ? '(custom)' : '(detected)'}
                   </span>
                   <button
                     onClick={() => onToggleEditingKey(slot, true)}
