@@ -147,6 +147,7 @@ def process_song():
         # corrected -- None if neither ran or it failed, else {mean_ms, max_ms}
         # for the frontend to display alongside this song's detected info.
         grid_correction = None
+        detected_bpm_before_grid_correction = None
 
         if mode == 'align':
             add_log_message("🎯 Aligning beatgrid (correcting tempo drift)...", slot)
@@ -154,6 +155,7 @@ def process_song():
                 aligned_path = audio_dir / f"aligned_{file_path.stem}.wav"
                 _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.align_beatgrid(str(file_path), str(aligned_path))
                 file_path = aligned_path
+                detected_bpm_before_grid_correction = orig_bpm
                 grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
                 add_log_message(f"✅ Beatgrid aligned (was {orig_bpm:.1f} BPM with drift, mean correction {mean_ms:.1f}ms)", slot)
             except Exception as e:
@@ -171,6 +173,7 @@ def process_song():
                         str(file_path), str(snapped_path), float(reference_bpm), float(reference_anchor)
                     )
                     file_path = snapped_path
+                    detected_bpm_before_grid_correction = orig_bpm
                     grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
                     add_log_message(f"✅ Snapped to reference beat grid (was {orig_bpm:.1f} BPM, mean correction {mean_ms:.1f}ms)", slot)
                 except Exception as e:
@@ -227,6 +230,7 @@ def process_song():
         return jsonify({
             'stems': stems,
             'bpm': round(bpm, 1),
+            'detectedBpm': round(detected_bpm_before_grid_correction, 1) if detected_bpm_before_grid_correction else round(bpm, 1),
             'beat_anchor': beat_anchor,
             'key': key_name,
             'scale': scale,
@@ -238,7 +242,8 @@ def process_song():
             # reintroduce MP3-decode/WAV timing mismatches.
             'source_wav_filename': file_path.name,
             'timestamp': timestamp,
-            'grid_correction': grid_correction
+            'grid_correction': grid_correction,
+            'mode': mode
         })
     except Exception as e:
         logging.error(f"Stem separation failed: {e}", exc_info=True)

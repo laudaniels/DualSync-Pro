@@ -46,7 +46,17 @@ function SongMixer({
           <p><strong>{metadata.filename}</strong></p>
           {hasStems && (metadata.detectedBpm || metadata.detectedKey) && (
             <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
-              Initial: {metadata.detectedBpm} BPM{metadata.detectedBpm && metadata.detectedKey ? ', ' : ''}{metadata.detectedKey}
+              {metadata.mode === 'snap' ? '🧲 Original' : 'Detected'}: {metadata.detectedBpm} BPM{metadata.detectedBpm && metadata.detectedKey ? ', ' : ''}{metadata.detectedKey}
+            </p>
+          )}
+          {hasStems && metadata.bpm && metadata.mode === 'snap' && (
+            <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
+              🧲 Snapped to: {metadata.bpm} BPM
+            </p>
+          )}
+          {hasStems && metadata.bpm && metadata.mode === 'align' && metadata.detectedBpm && metadata.bpm !== metadata.detectedBpm && (
+            <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
+              🎯 Aligned to: {metadata.bpm} BPM
             </p>
           )}
           {hasStems && metadata.gridCorrection && (
