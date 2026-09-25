@@ -1,5 +1,6 @@
 import React from 'react';
 import StemLoader from './StemLoader';
+import WaveformPreview from './WaveformPreview';
 import { stemLabels } from './stemConstants';
 
 const KEYS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -272,6 +273,16 @@ function SongMixer({
           {(stemNames || []).map(stem => (
             <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
               <label style={{ minWidth: '80px' }}>{stemLabels[stem] || stem}</label>
+              <div style={{ width: '120px', height: '40px' }}>
+                {metadata?.stems?.[stem] && (
+                  <WaveformPreview
+                    stemPath={metadata.stems[stem]}
+                    stemName={stem}
+                    width={120}
+                    height={40}
+                  />
+                )}
+              </div>
               <input
                 type="range"
                 min="0"
