@@ -210,53 +210,66 @@ function SongMixer({
             ) : (
               <>
                 <p><strong>How should this song be processed?</strong></p>
-                <button
-                  onClick={() => onChooseMode(slot, 'as_is')}
-                  style={{
-                    background: '#6366f1',
-                    color: '#fff',
-                    border: 'none',
-                    padding: '14px 24px',
-                    borderRadius: '8px',
-                    cursor: 'pointer',
-                    fontSize: '14px',
-                    width: '80%'
-                  }}
-                >
-                  1️⃣ Process as is
-                </button>
-                <button
-                  onClick={() => onChooseMode(slot, 'align')}
-                  style={{
-                    background: 'transparent',
-                    color: '#6366f1',
-                    border: '2px solid #6366f1',
-                    padding: '14px 24px',
-                    borderRadius: '8px',
-                    cursor: 'pointer',
-                    fontSize: '14px',
-                    width: '80%'
-                  }}
-                >
-                  2️⃣ Align beatgrid first
-                </button>
-                {canSnapToSong1 && (
-                  <button
-                    onClick={() => onChooseMode(slot, 'snap')}
-                    style={{
-                      background: 'transparent',
-                      color: '#22c55e',
-                      border: '2px solid #22c55e',
-                      padding: '14px 24px',
-                      borderRadius: '8px',
-                      cursor: 'pointer',
-                      fontSize: '14px',
-                      width: '80%'
-                    }}
-                  >
-                    3️⃣ 🧲 Snap beat grid to Song 1
-                  </button>
-                )}
+                <div style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '14px', alignItems: 'center' }}>
+                  <div style={{ width: '80%' }}>
+                    <button
+                      onClick={() => onChooseMode(slot, 'as_is')}
+                      style={{
+                        background: '#6366f1',
+                        color: '#fff',
+                        border: 'none',
+                        padding: '14px 24px',
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        fontSize: '14px',
+                        width: '100%'
+                      }}
+                    >
+                      1️⃣ Process as is
+                    </button>
+                    <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#999' }}>Keep original timing, no correction</p>
+                  </div>
+
+                  <div style={{ width: '80%' }}>
+                    <button
+                      onClick={() => onChooseMode(slot, 'align')}
+                      style={{
+                        background: 'transparent',
+                        color: '#6366f1',
+                        border: '2px solid #6366f1',
+                        padding: '14px 24px',
+                        borderRadius: '8px',
+                        cursor: 'pointer',
+                        fontSize: '14px',
+                        width: '100%'
+                      }}
+                    >
+                      2️⃣ Align beatgrid first
+                    </button>
+                    <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#999' }}>Correct internal timing drift (vinyl rip, live recording)</p>
+                  </div>
+
+                  {canSnapToSong1 && (
+                    <div style={{ width: '80%' }}>
+                      <button
+                        onClick={() => onChooseMode(slot, 'snap')}
+                        style={{
+                          background: 'transparent',
+                          color: '#22c55e',
+                          border: '2px solid #22c55e',
+                          padding: '14px 24px',
+                          borderRadius: '8px',
+                          cursor: 'pointer',
+                          fontSize: '14px',
+                          width: '100%'
+                        }}
+                      >
+                        3️⃣ 🧲 Snap beat grid to Song 1
+                      </button>
+                      <p style={{ margin: '4px 0 0 0', fontSize: '11px', color: '#999' }}>Lock to Song 1's beat grid (fastest sync)</p>
+                    </div>
+                  )}
+                </div>
               </>
             )}
           </div>
