@@ -1593,8 +1593,18 @@ class MashupEngine:
             if use_restoration:
                 report(0.8, "Stage 4: denoise + de-reverb restoration...")
                 logging.info(f"✨ [STAGE 4] Denoise + de-reverb restoration...")
+
+                def _restoration_progress(fraction, label):
+                    # Restoration is the last, per-stem-slow part of this
+                    # stage -- without this, the bar sits frozen at 0.8 (78%
+                    # after server.py's mapping) for however long it takes to
+                    # denoise+de-reverb all 9 stems, looking exactly like a
+                    # stall even though every stem really is being processed.
+                    report(0.8 + fraction * 0.18, label)
+
                 try:
-                    final_stems = self._apply_hifi_restoration(final_stems, str(song_out_dir))
+                    final_stems = self._apply_hifi_restoration(final_stems, str(song_out_dir),
+                                                                 progress_callback=_restoration_progress)
                     logging.info(f"  ✅ Restoration complete")
                 except Exception as e:
                     logging.warning(f"  ⚠️  Restoration skipped: {e}")
@@ -1737,7 +1747,7 @@ class MashupEngine:
             logging.error(f"MDX23C DrumSep failed: {e}")
             raise RuntimeError(f"Drum splitting failed: {str(e)[-500:]}")
 
-    def _apply_hifi_restoration(self, stems, output_dir):
+    def _apply_hifi_restoration(self, stems, output_dir, progress_callback=None):
         """Apply ML-based restoration (denoise + de-reverb) to all stems for
         artifact removal.
 
@@ -1754,16 +1764,21 @@ class MashupEngine:
 
         Falls back to spectral filtering only if these models can't be
         loaded (e.g. no internet for the first-time checkpoint download).
+
+        progress_callback(fraction, label), if given, is invoked once per
+        stem (fraction 0.0-1.0 across all stems) -- this stage processes
+        every stem one at a time and can otherwise take minutes with no
+        visible movement at all.
         """
         import logging
 
         try:
-            return self._apply_ml_restoration(stems, output_dir)
+            return self._apply_ml_restoration(stems, output_dir, progress_callback=progress_callback)
         except Exception as e:
             logging.warning(f"ML restoration unavailable ({e}), using spectral filtering")
-            return self._apply_spectral_restoration(stems, output_dir)
+            return self._apply_spectral_restoration(stems, output_dir, progress_callback=progress_callback)
 
-    def _apply_ml_restoration(self, stems, output_dir):
+    def _apply_ml_restoration(self, stems, output_dir, progress_callback=None):
         """Denoise, then de-reverb, every stem via audio-separator's
         highest-SDR general-purpose models for each. Not vocal-specific, so
         applying the same two models to every stem (including drums) is
@@ -1798,7 +1813,12 @@ class MashupEngine:
             return None
 
         restored = {}
-        for stem_name, stem_path in stems.items():
+        stem_items = list(stems.items())
+        total = len(stem_items)
+        for i, (stem_name, stem_path) in enumerate(stem_items):
+            if progress_callback:
+                progress_callback(i / total, f"Denoise + de-reverb: {stem_name} ({i + 1}/{total})")
+
             if not stem_path or not Path(stem_path).is_file():
                 restored[stem_name] = stem_path
                 continue
@@ -1819,9 +1839,11 @@ class MashupEngine:
                 logging.warning(f"    ⚠️  ML restoration failed for {stem_name}: {e}")
                 restored[stem_name] = stem_path
 
+        if progress_callback:
+            progress_callback(1.0, "Denoise + de-reverb complete")
         return restored
 
-    def _apply_spectral_restoration(self, stems, output_dir):
+    def _apply_spectral_restoration(self, stems, output_dir, progress_callback=None):
         """Fallback spectral restoration (no ML model required).
 
         Uses FFmpeg spectral filtering to remove shimmer/artifacts.
@@ -1830,7 +1852,12 @@ class MashupEngine:
         import logging
 
         restored = {}
-        for stem_name, stem_path in stems.items():
+        stem_items = list(stems.items())
+        total = len(stem_items)
+        for i, (stem_name, stem_path) in enumerate(stem_items):
+            if progress_callback:
+                progress_callback(i / total, f"Spectral restoration: {stem_name} ({i + 1}/{total})")
+
             if not stem_path or not Path(stem_path).is_file():
                 restored[stem_name] = stem_path
                 continue
@@ -1857,4 +1884,6 @@ class MashupEngine:
                 logging.debug(f"Spectral filtering skipped for {stem_name}: {e}")
                 restored[stem_name] = stem_path
 
+        if progress_callback:
+            progress_callback(1.0, "Spectral restoration complete")
         return restored
