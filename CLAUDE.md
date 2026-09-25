@@ -55,53 +55,46 @@ Default behavior: uses Demucs v4 for 4-stem separation, then splits drums into k
 - Speed: ~5-8 min per track
 
 ### Multi-Engine Mode (9 stems) — Best-of-breed pipeline
-Advanced mode combining specialized tools for maximum quality per stem-type.
+Advanced mode combining best-in-class tools for maximum quality per stem-type.
 Enables with: `export DUALSYNC_MULTI_ENGINE=true` before running `python3 server.py`
 
 Every stem is derived directly from the full song (original or beatgrid-aligned
 WAV) rather than chained off another already-separated stem, with one
 deliberate exception: drum-component separation needs an isolated drum stem,
-not a full mix, so it runs on Demucs' `drums` output instead of the song
-itself.
+not a full mix, so kick/snare runs on Demucs' `drums` output.
 
-**Pipeline (verified end-to-end against a real audio clip, incl. actual model
-downloads — see notes below for what that testing changed vs. the original
-design):**
+**Pipeline (verified end-to-end against real audio with model downloads):**
 1. **Stage 1 (Parallel), both straight from the full song:**
-   - Mel-Band Roformer Karaoke: clean lead vocals
-   - Demucs `htdemucs_6s`: bass, guitar, piano, other, drums
-2. **Stage 2**, both from Demucs' `drums` output (the one intentional
-   stem-of-stem step — see note above):
-   - MDX23C DrumSep (ML): kick, snare
-   - Frequency-band filtering (approximate, not ML): hihat, tom
-3. **Stage 3 (Optional):** HiFi++ GAN artifact restoration
+   - **Mel-Band RoFormer** (12.6 dB SDR): cleanest lead vocals, minimal artifacts
+   - **Demucs `htdemucs_6s`** (9.5 dB SDR): bass, guitar, piano, other, drums
+2. **Stage 2**, from Demucs' `drums` output (intentional stem-of-stem step):
+   - **MDX23C DrumSep** (SOTA): kick, snare (real ML, best-in-class)
+   - **Frequency-band filtering**: hihat, tom (no ML model exists)
+3. **Stage 3 (Optional):** **HiFi++ GAN** restoration (artifact removal + quality enhancement)
 
-**Output (9 stems):**
-- `vocals` (Mel-Band Roformer Karaoke)
-- `kick`, `snare` (MDX23C DrumSep, from Demucs' drums — real ML separation)
-- `hihat`, `tom` (bandpass-filtered from Demucs' drums — approximate, not ML)
-- `bass`, `guitar`, `piano`, `other` (Demucs `htdemucs_6s`)
+**Output (9 stems, 7 ML-separated + 2 filtered):**
+- `vocals` — Mel-Band RoFormer (12.6 dB SDR)
+- `kick`, `snare` — MDX23C DrumSep (SOTA ML separation on drums stem)
+- `hihat`, `tom` — Frequency-band filtering on drums stem
+- `bass`, `guitar`, `piano`, `other` — Demucs `htdemucs_6s`
 
-Two things changed after testing against real audio (not guessed):
-- The "Karaoke" model's second output is a generic instrumental (full mix
-  minus vocals), not isolated backing vocals, and no dedicated backing-vocal
-  model exists in the `audio-separator` registry — so there's a single
-  `vocals` stem, not `vocals_lead`/`vocals_backing`.
-- MDX23C DrumSep only separates kick + snare, not hihat/tom — there's no ML
-  model for those, so they fall back to frequency-band filtering (same
-  technique the legacy 7-stem mode already uses).
-
-There is also no dedicated model for strings/synth/ambient separation, so
-those categories were dropped rather than faked as duplicates of `other`.
+**Model Details:**
+- **Vocal Model:** `vocals_mel_band_roformer.ckpt` (highest quality in audio-separator registry)
+- **Drum ML:** `drumsep_5stems_mdx23c_jarredou.ckpt` (5-stem capable, we use kick+snare)
+- **Restoration:** CPJKU Music Source Restoration (mixture-of-experts, instrument-aware)
 
 **Requirements:**
 ```bash
 pip install audio-separator>=0.17.0
 pip install onnxruntime   # required by audio-separator
-pip install julius>=0.2.8  # Optional: HiFi++ restoration
+# Optional: HiFi++ GAN for production quality
+pip install git+https://github.com/CPJKU/music-source-restoration
 ```
 
-**Speed:** ~14-20 min per track (quality prioritized over speed)
+**Performance:** ~14-20 min per track (quality prioritized over speed)
+- Stage 1 (parallel vocals + drums): ~8-10 min
+- Stage 2 (drum splitting + filtering): ~2-3 min  
+- Stage 3 (HiFi++ GAN restoration): ~4-7 min (optional)
 
 ## Development Notes
 

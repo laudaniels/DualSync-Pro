@@ -15,8 +15,9 @@ waitress
 audio-separator>=0.17.0
 onnxruntime  # required by audio-separator; use onnxruntime-gpu instead for GPU inference
 
-# Optional: HiFi++ GAN restoration for artifact removal
-julius>=0.2.8
+# HiFi++ GAN restoration for artifact removal (CPJKU Music Source Restoration)
+# For production quality: pip install git+https://github.com/CPJKU/music-source-restoration
+# Falls back to spectral filtering if not available
 
 # Note: Madmom removed (doesn't install here -- pkg_resources incompatibility).
 #       Essentia's RhythmExtractor2013 replaces it for all beat/BPM detection.
