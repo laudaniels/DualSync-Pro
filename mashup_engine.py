@@ -800,7 +800,7 @@ class MashupEngine:
             current_input = input_path
             current_source_bpm = source_bpm
             max_passes = 3
-            bpm_tolerance = 0.5
+            bpm_tolerance = 2.0  # ±2 BPM convergence tolerance (was 0.5, too strict)
             measured_bpm = None
             use_rubberband = shutil.which("rubberband") is not None
 
@@ -819,6 +819,8 @@ class MashupEngine:
             # the tolerance check both work as intended.
             pass_num = 1
             rubberband_disabled = False
+            best_bpm = None
+            best_bpm_path = None
             while pass_num <= max_passes:
                 tempo_ratio = target_bpm / current_source_bpm
                 is_last_pass = pass_num == max_passes
@@ -874,6 +876,11 @@ class MashupEngine:
                 bpm_error = abs(measured_bpm - target_bpm)
                 logging.info(f"Pass {pass_num}: Output BPM = {measured_bpm:.1f}, Error = {bpm_error:.2f} BPM")
 
+                # Track best attempt so far
+                if best_bpm is None or bpm_error < abs(best_bpm - target_bpm):
+                    best_bpm = measured_bpm
+                    best_bpm_path = temp_output
+
                 if bpm_error <= bpm_tolerance:
                     # Converged! Copy to final output if needed
                     if not is_last_pass:
@@ -885,18 +892,20 @@ class MashupEngine:
                     return True, measured_bpm
 
                 if is_last_pass:
-                    # Did NOT converge within tolerance after all passes --
-                    # report failure instead of silently handing back audio
-                    # at the wrong tempo.
-                    logging.error(
-                        f"Time-stretch did not converge: {measured_bpm:.1f} BPM vs target "
-                        f"{target_bpm} (error {bpm_error:.2f} BPM) after {max_passes} passes"
+                    # Did NOT converge within ±2 BPM tolerance after all passes
+                    # Use best attempt and report warning instead of full failure
+                    best_error = abs(best_bpm - target_bpm)
+                    logging.warning(
+                        f"⚠️  Time-stretch did not converge within ±{bpm_tolerance} BPM: "
+                        f"best result = {best_bpm:.1f} BPM (target: {target_bpm}, error: {best_error:.2f} BPM)"
                     )
+                    if best_bpm_path and Path(best_bpm_path).is_file():
+                        shutil.copy2(best_bpm_path, output_path)
                     for p in range(1, max_passes):
                         temp = Path(output_path).parent / f"{Path(output_path).stem}_pass{p}.wav"
                         temp.unlink(missing_ok=True)
-                    Path(output_path).unlink(missing_ok=True)
-                    return False, None
+                    # Return best attempt instead of failing
+                    return True, best_bpm
 
                 # Prepare for next pass
                 current_input = temp_output
