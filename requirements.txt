@@ -15,7 +15,12 @@ waitress
 # restoration (Mel-Band Roformer denoise + de-reverb) -- same package, models
 # download automatically on first use.
 audio-separator>=0.17.0
-onnxruntime  # required by audio-separator; use onnxruntime-gpu instead for GPU inference
+onnxruntime  # required by audio-separator
+# Tested onnxruntime-gpu[cuda,cudnn] here: CUDAExecutionProvider does activate,
+# but wall-clock time per stem was identical to CPU (bottleneck isn't the
+# model's compute), and its bundled nvidia-cudnn-cu12 clashes with this
+# project's nvidia-cudnn-cu13 (PyTorch) on the same installed file paths --
+# installing/uninstalling it broke PyTorch's own CUDA import. Not worth it.
 
 # Note: Madmom removed (doesn't install here -- pkg_resources incompatibility).
 #       Essentia's RhythmExtractor2013 replaces it for all beat/BPM detection.

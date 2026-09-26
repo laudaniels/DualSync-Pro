@@ -13,8 +13,12 @@ export default function DualMixer() {
   const [error, setError] = useState('');
   const [playing, setPlaying] = useState(false);
   const [audioReady, setAudioReady] = useState([false, false]); // All 7 stems fetched+decoded for that slot
-  const [pendingSong, setPendingSong] = useState([null, null]); // { wavFilename, filename } after upload+convert, awaiting the as_is/align choice
-  const [processingStage, setProcessingStage] = useState([null, null]); // 'converting' | 'separating' | null -- purely cosmetic, for the loading label
+  // { wavFilename, filename } after upload+convert -- kept around even past
+  // the as_is/align/snap choice (never nulled out again), since 'as is'
+  // real separation (see runSeparationAsIs) reuses it. Once metadata[slot]
+  // has a bpm (analyzed), the UI stops consulting this for what to render.
+  const [pendingSong, setPendingSong] = useState([null, null]);
+  const [processingStage, setProcessingStage] = useState([null, null]); // 'converting' | 'as_is'/'align'/'snap' (analyzing) | 'separating' | null -- purely cosmetic, for the loading label
   const playerRef = useRef(null);
   if (playerRef.current === null) playerRef.current = new DualStemPlayer();
   const [editingBpm, setEditingBpm] = useState([false, false]);
@@ -226,20 +230,24 @@ export default function DualMixer() {
     }
   }, []);
 
-  // Step 2: the user picked 'as_is' or 'align' for the converted WAV -- run
-  // the (optional) beatgrid alignment, BPM/key analysis, and stem separation.
+  // Step 2 (fast, seconds not minutes): the user picked 'as_is'/'align'/'snap'
+  // for the converted WAV -- run that (optional) beatgrid alignment, then BPM
+  // and key detection. Deliberately stops there: no stems yet. That lets the
+  // detected BPM/Key (and any manual override) be shown before the user picks
+  // 'process as is' vs a shared target BPM/Key for both songs, instead of only
+  // finding out after the multi-minute separation has already run -- see
+  // handleStartProcessing below for what actually kicks off separation.
   const handleChooseMode = useCallback(async (slot, mode) => {
     const pending = pendingSong[slot];
     if (!pending) return;
 
     setLoading(prev => { const updated = [...prev]; updated[slot] = true; return updated; });
-    setPendingSong(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
     setError('');
     setProcessingStage(prev => { const updated = [...prev]; updated[slot] = mode; return updated; });
 
     try {
-      console.log(`🔊 Processing Song ${slot + 1} (mode: ${mode})...`);
-      const response = await fetch('/api/process-song', {
+      console.log(`🔍 Analyzing Song ${slot + 1} (mode: ${mode})...`);
+      const response = await fetch('/api/analyze-song', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -257,20 +265,13 @@ export default function DualMixer() {
       if (!response.ok) throw new Error(`Server error: ${response.status}`);
 
       const data = await response.json();
-      console.log(`✅ Song ${slot + 1} stems:`, data);
-
-      setStems(prevStems => {
-        const newStems = [...prevStems];
-        newStems[slot] = data.stems;
-        console.log(`✅ Song ${slot + 1} stems loaded. State:`, { stems: newStems, song1: !!newStems[0], song2: !!newStems[1] });
-        return newStems;
-      });
+      console.log(`✅ Song ${slot + 1} analyzed:`, data);
 
       setMetadata(prevMetadata => {
         const newMetadata = [...prevMetadata];
         newMetadata[slot] = {
           ...data,
-          timestamp: data.timestamp || Date.now().toString(),
+          filename: pending.filename,
           mode,
           sourceWavFilename: data.source_wav_filename,
           unalignedWavFilename: mode === 'align' ? pending.wavFilename : null,
@@ -286,40 +287,16 @@ export default function DualMixer() {
           // can't. Needed for Camelot-wheel-aware key recommendations.
           detectedScale: data.scale,
           // What's actually loaded/playing right now -- starts the same as
-          // detected, updated after each successful reprocess (see
-          // processStems below) via getCurrentBpm/Key.
+          // detected, updated after each successful (re)process (see
+          // runSeparationWithTarget/processStems) via getCurrentBpm/Key.
           currentBpm: data.bpm,
           currentKey: data.key
         };
         return newMetadata;
       });
-
-      // Fetch + decode every stem into an AudioBuffer up front, so Play can
-      // just schedule already-in-memory buffers instead of relying on 14
-      // concurrent streaming connections (browsers cap that at 6 per origin).
-      console.log(`🎵 Song ${slot + 1} stems received:`, Object.keys(data.stems));
-      setAudioReady(prev => { const updated = [...prev]; updated[slot] = false; return updated; });
-      await Promise.all(Object.entries(data.stems).map(async ([stemName, url]) => {
-        try {
-          await playerRef.current.loadStem(slot, stemName, url);
-          console.log(`✅ Decoded ${stemName} for Song ${slot + 1}: ${url}`);
-        } catch (err) {
-          console.error(`❌ Could not load ${stemName} for Song ${slot + 1}:`, err);
-        }
-      }));
-      setAudioReady(prev => {
-        const updated = [...prev];
-        updated[slot] = playerRef.current.isSlotReady(slot, Object.keys(data.stems));
-        return updated;
-      });
-
-      // Refresh stats
-      fetchStats();
     } catch (err) {
       console.error(`❌ Error:`, err);
-      setError(`Error processing Song ${slot + 1}: ${err.message}`);
-      // Restore the pending choice so the user can retry without re-uploading
-      setPendingSong(prev => { const updated = [...prev]; updated[slot] = pending; return updated; });
+      setError(`Error analyzing Song ${slot + 1}: ${err.message}`);
     } finally {
       setLoading(prevLoading => {
         const updated = [...prevLoading];
@@ -328,7 +305,168 @@ export default function DualMixer() {
       });
       setProcessingStage(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
     }
-  }, [pendingSong, fetchStats, metadata]);
+  }, [pendingSong, metadata]);
+
+  // Shared by both real-separation paths below: fetch + decode every stem
+  // into an AudioBuffer up front, so Play can just schedule already-in-memory
+  // buffers instead of relying on many concurrent streaming connections
+  // (browsers cap that at 6 per origin).
+  const decodeStemsForSlot = async (slot, stemsByName) => {
+    setAudioReady(prev => { const updated = [...prev]; updated[slot] = false; return updated; });
+    await Promise.all(Object.entries(stemsByName).map(async ([stemName, url]) => {
+      try {
+        await playerRef.current.loadStem(slot, stemName, url);
+      } catch (err) {
+        console.error(`❌ Could not load ${stemName} for Song ${slot + 1}:`, err);
+      }
+    }));
+    setAudioReady(prev => {
+      const updated = [...prev];
+      updated[slot] = playerRef.current.isSlotReady(slot, Object.keys(stemsByName));
+      return updated;
+    });
+  };
+
+  // Step 3a: 'process as is' -- separate stems from the already-aligned WAV
+  // /api/analyze-song produced, at each song's own natural BPM/Key. mode is
+  // always 'as_is' here since the alignment itself already happened.
+  const runSeparationAsIs = async (slot) => {
+    const meta = metadata[slot];
+    const response = await fetch('/api/process-song', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        wav_filename: meta.sourceWavFilename,
+        filename: meta.filename,
+        slot,
+        mode: 'as_is'
+      })
+    });
+    if (!response.ok) throw new Error(`Server error: ${response.status}`);
+    const data = await response.json();
+
+    setStems(prev => { const updated = [...prev]; updated[slot] = data.stems; return updated; });
+    setMetadata(prev => {
+      const updated = [...prev];
+      updated[slot] = { ...updated[slot], timestamp: data.timestamp || Date.now().toString() };
+      return updated;
+    });
+    await decodeStemsForSlot(slot, data.stems);
+  };
+
+  // Step 3b: a shared target BPM and/or Key was set for both songs --
+  // beatmatch/transpose the already-aligned full song, THEN separate stems
+  // from that (cheaper and phase-cleaner than transposing 9 stems
+  // individually) -- exactly what /api/process-stems already does for the
+  // post-mixer "Process All Changes" reprocess below, reused here so the
+  // very first separation can land directly on the requested target.
+  const runSeparationWithTarget = async (slot) => {
+    const meta = metadata[slot];
+    const sourceBpm = getEffectiveBpm(slot);
+    const sourceKey = getEffectiveKey(slot);
+    const timestamp = Date.now().toString();
+
+    const response = await fetch('/api/process-stems', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source_bpm: targetBpm ? sourceBpm : null,
+        target_bpm: targetBpm || null,
+        source_key: targetKey ? sourceKey : null,
+        target_key: targetKey || null,
+        timestamp,
+        filename: meta.filename,
+        source_wav_filename: meta.sourceWavFilename,
+        slot
+      })
+    });
+    if (!response.ok) throw new Error(`Server error: ${response.status}`);
+    const data = await response.json();
+    if (!data.processed_stems) throw new Error(data.error || 'Processing failed');
+
+    setStems(prev => { const updated = [...prev]; updated[slot] = data.processed_stems; return updated; });
+    setMetadata(prev => {
+      const updated = [...prev];
+      updated[slot] = {
+        ...updated[slot],
+        timestamp,
+        ...(data.measured_bpm && { measured_bpm: data.measured_bpm, currentBpm: data.measured_bpm }),
+        ...(data.measured_key && { currentKey: data.measured_key })
+      };
+      return updated;
+    });
+    await decodeStemsForSlot(slot, data.processed_stems);
+  };
+
+  // The joint choice, made once both songs are analyzed: 'process as is' vs
+  // a shared target BPM/Key for both. Either way, this is what actually
+  // kicks off the (slow) stem separation -- the volume/mixer view only
+  // appears once both songs have stems (see revealVolumes/bothStemsReady).
+  // Both songs separate in PARALLEL (the backend already runs each request
+  // on its own thread -- see server.py's waitress server -- so there's no
+  // reason to make the user wait for one before starting the other).
+  const handleStartProcessing = async (useTarget) => {
+    setIsProcessing(true);
+    setProcessingProgress(0);
+    setProcessingStepLabel('');
+
+    const slotsToProcess = [0, 1].filter(slot => metadata[slot]?.bpm != null && !stems[slot]);
+    if (slotsToProcess.length === 0) return;
+
+    const progressInterval = setInterval(async () => {
+      try {
+        const res = await fetch('/api/process-status');
+        const data = await res.json();
+        const slotStates = slotsToProcess.map(slot => data.slots?.[slot]);
+        const avgProgress = slotStates.reduce((sum, s) => sum + (s?.progress ?? 0), 0) / slotsToProcess.length;
+        setProcessingProgress(avgProgress);
+
+        const label = slotsToProcess.length > 1
+          ? slotsToProcess
+              .map((slot, i) => slotStates[i]?.current_step && `Song ${slot + 1}: ${slotStates[i].current_step}`)
+              .filter(Boolean)
+              .join('  |  ')
+          : (slotStates[0]?.current_step || '');
+        if (label) setProcessingStepLabel(label);
+      } catch (e) {
+        // Silent - API might not have data yet
+      }
+    }, 500);
+
+    const runSlot = async (slot) => {
+      setLoading(prev => { const u = [...prev]; u[slot] = true; return u; });
+      setProcessingStage(prev => { const u = [...prev]; u[slot] = 'separating'; return u; });
+      try {
+        if (useTarget && (targetBpm || targetKey)) {
+          await runSeparationWithTarget(slot);
+        } else {
+          await runSeparationAsIs(slot);
+        }
+      } catch (err) {
+        console.error(`❌ Error separating Song ${slot + 1}:`, err);
+        setError(`Error processing Song ${slot + 1}: ${err.message}`);
+      } finally {
+        setLoading(prev => { const u = [...prev]; u[slot] = false; return u; });
+        setProcessingStage(prev => { const u = [...prev]; u[slot] = null; return u; });
+      }
+    };
+
+    try {
+      await Promise.all(slotsToProcess.map(runSlot));
+      if (useTarget) {
+        if (targetBpm) setLastProcessedBpm(targetBpm);
+        if (targetKey) setLastProcessedKey(targetKey);
+      }
+      fetchStats();
+    } finally {
+      clearInterval(progressInterval);
+      setTimeout(() => {
+        setIsProcessing(false);
+        setProcessingProgress(0);
+        setProcessingStepLabel('');
+      }, 500);
+    }
+  };
 
 
   // Play/pause both songs. All 14 stems are already fully decoded into
@@ -483,7 +621,7 @@ export default function DualMixer() {
   const getKeyRecommendationsList = () => {
     const key0 = getEffectiveKey(0);
     const key1 = getEffectiveKey(1);
-    if (!key0 || !key1 || !stems[0] || !stems[1]) return [];
+    if (!key0 || !key1 || metadata[0]?.bpm == null || metadata[1]?.bpm == null) return [];
     return getKeyRecommendations(key0, getEffectiveScale(0), key1, getEffectiveScale(1), 5);
   };
 
@@ -495,7 +633,7 @@ export default function DualMixer() {
   const getOwnCompatibility = () => {
     const key0 = getEffectiveKey(0);
     const key1 = getEffectiveKey(1);
-    if (!key0 || !key1 || !stems[0] || !stems[1]) return null;
+    if (!key0 || !key1 || metadata[0]?.bpm == null || metadata[1]?.bpm == null) return null;
     return camelotDistanceBetween(key0, getEffectiveScale(0), key1, getEffectiveScale(1));
   };
 
@@ -806,7 +944,7 @@ export default function DualMixer() {
   // GUI back to its just-loaded state, so starting over with two new songs
   // never has to contend with leftover state from the previous pair
   // (target bpm/key, overrides, volumes, beat offset, drift-correction
-  // stats, waveform selection, logs -- all of it).
+  // stats, waveform selection -- all of it).
   const handleCleanup = async () => {
     if (!confirm('🗑️ Clean and reset: delete all generated audio files and start over? This cannot be undone.')) return;
 
@@ -851,7 +989,6 @@ export default function DualMixer() {
         setPlaying(false);
         setCurrentTime(0);
         setDuration(0);
-        setProcessingLogs([]);
 
         // Beat offset & live drift correction
         setBarOffset(0);
@@ -891,7 +1028,13 @@ export default function DualMixer() {
   const originalStemsLabel = allSlotsAligned ? 'Aligned Stems' : anySlotAligned ? 'Original/Aligned Stems' : 'Original Stems';
   const keyRecommendations = getKeyRecommendationsList();
   const ownCompatibility = getOwnCompatibility();
-  const song1Ready = !!stems[0] && metadata[0]?.bpm != null && metadata[0]?.beat_anchor != null;
+  // Song 1's bpm/beat_anchor are known as soon as it's analyzed (seconds),
+  // not only once it's fully separated (minutes) -- so Song 2 can offer
+  // 'snap to Song 1' well before Song 1's stems exist.
+  const song1Ready = metadata[0]?.bpm != null && metadata[0]?.beat_anchor != null;
+  // Both songs analyzed (bpm/key known) -- enough to make the 'process as
+  // is' vs 'target BPM/Key' choice below, even before either has stems.
+  const bothAnalyzed = metadata[0]?.bpm != null && metadata[1]?.bpm != null;
   // Don't reveal either song's volume sliders until BOTH are ready -- so they
   // open together, instead of Song 1's mixer popping in while Song 2 is still
   // a spinner (or vice versa).
@@ -1167,8 +1310,13 @@ export default function DualMixer() {
           </div>
         ) : null}
 
-        {/* Processing Section: BPM & Key */}
-        {stems[0] || stems[1] ? (
+        {/* Processing Section: BPM & Key -- shown once each song's BPM/Key
+            is known (analyzed), whether or not stems have been separated
+            yet. Before separation, this is the joint 'process as is' vs
+            'target BPM/Key for both songs' choice that actually kicks off
+            separation; after, the same target inputs are reused to
+            reprocess already-separated stems. */}
+        {(stems[0] || stems[1] || metadata[0]?.bpm != null || metadata[1]?.bpm != null) ? (
           <div style={{
             background: 'rgba(99, 102, 241, 0.05)',
             border: '1px solid rgba(99, 102, 241, 0.2)',
@@ -1180,7 +1328,9 @@ export default function DualMixer() {
               ⚙️ Processing (BPM & Key)
             </label>
             <p style={{ margin: '0 0 15px 0', fontSize: '11px', color: '#888' }}>
-              ℹ️ Each time you process, it starts fresh from the originally detected BPM/Key (not from the last processed result) -- so the target you set here is always an absolute destination, not an additional shift.
+              {bothStemsReady
+                ? 'ℹ️ Each time you process, it starts fresh from the originally detected BPM/Key (not from the last processed result) -- so the target you set here is always an absolute destination, not an additional shift.'
+                : 'ℹ️ Leave both blank and click "Process as is" to keep each song at its own detected BPM/Key, or set a shared target below to beatmatch/transpose both songs to it before separating.'}
             </p>
 
             {/* BPM Input */}
@@ -1193,7 +1343,7 @@ export default function DualMixer() {
                 value={targetBpm || ''}
                 onChange={(e) => handleTargetBpmChange(e.target.value)}
                 placeholder="Enter target BPM"
-                disabled={isLocked || !stems[0] || !stems[1]}
+                disabled={isLocked || !bothAnalyzed}
                 style={{
                   width: '100%',
                   padding: '8px',
@@ -1203,8 +1353,8 @@ export default function DualMixer() {
                   borderRadius: '6px',
                   fontSize: '14px',
                   boxSizing: 'border-box',
-                  opacity: (isLocked || !stems[0] || !stems[1]) ? 0.5 : 1,
-                  cursor: (isLocked || !stems[0] || !stems[1]) ? 'not-allowed' : 'text'
+                  opacity: (isLocked || !bothAnalyzed) ? 0.5 : 1,
+                  cursor: (isLocked || !bothAnalyzed) ? 'not-allowed' : 'text'
                 }}
               />
             </div>
@@ -1217,7 +1367,7 @@ export default function DualMixer() {
               <select
                 value={targetKey || ''}
                 onChange={(e) => handleTargetKeyChange(e.target.value)}
-                disabled={isLocked || !stems[0] || !stems[1]}
+                disabled={isLocked || !bothAnalyzed}
                 style={{
                   width: '100%',
                   padding: '8px',
@@ -1228,34 +1378,60 @@ export default function DualMixer() {
                   fontSize: '14px',
                   boxSizing: 'border-box',
                   colorScheme: 'dark',
-                  opacity: (isLocked || !stems[0] || !stems[1]) ? 0.5 : 1,
-                  cursor: (isLocked || !stems[0] || !stems[1]) ? 'not-allowed' : 'pointer'
+                  opacity: (isLocked || !bothAnalyzed) ? 0.5 : 1,
+                  cursor: (isLocked || !bothAnalyzed) ? 'not-allowed' : 'pointer'
                 }}
               >
                 <option value="" style={{ background: '#1a1f3a', color: '#fff' }}>No transposition</option>
-                {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{formatTargetKey(k, [0, 1].filter(slot => stems[slot]).map(getEffectiveScale))}</option>)}
+                {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{formatTargetKey(k, [0, 1].filter(slot => metadata[slot]?.bpm != null).map(getEffectiveScale))}</option>)}
               </select>
             </div>
 
-            {/* Unified Process Button */}
-            <button
-              onClick={handleProcessAllChanges}
-              disabled={isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)}
-              style={{
-                width: '100%',
-                padding: '10px 16px',
-                background: (isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)) ? '#444' : '#6366f1',
-                border: 'none',
-                color: '#fff',
-                borderRadius: '6px',
-                cursor: (isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)) ? 'not-allowed' : 'pointer',
-                fontWeight: 'bold',
-                fontSize: '14px',
-                opacity: (isLocked || !stems[0] || !stems[1] || (!bpmChanged && !keyChanged)) ? 0.5 : 1
-              }}
-            >
-              🎯 Process All Changes
-            </button>
+            {/* Action button(s) -- before the first separation, a clear
+                as-is/target choice; after, the existing reprocess button. */}
+            {bothStemsReady ? (
+              <button
+                onClick={handleProcessAllChanges}
+                disabled={isLocked || (!bpmChanged && !keyChanged)}
+                style={{
+                  width: '100%',
+                  padding: '10px 16px',
+                  background: (isLocked || (!bpmChanged && !keyChanged)) ? '#444' : '#6366f1',
+                  border: 'none',
+                  color: '#fff',
+                  borderRadius: '6px',
+                  cursor: (isLocked || (!bpmChanged && !keyChanged)) ? 'not-allowed' : 'pointer',
+                  fontWeight: 'bold',
+                  fontSize: '14px',
+                  opacity: (isLocked || (!bpmChanged && !keyChanged)) ? 0.5 : 1
+                }}
+              >
+                🎯 Process All Changes
+              </button>
+            ) : (
+              <button
+                onClick={() => handleStartProcessing(!!(targetBpm || targetKey))}
+                disabled={isLocked || !bothAnalyzed}
+                style={{
+                  width: '100%',
+                  padding: '10px 16px',
+                  background: (isLocked || !bothAnalyzed) ? '#444' : '#6366f1',
+                  border: 'none',
+                  color: '#fff',
+                  borderRadius: '6px',
+                  cursor: (isLocked || !bothAnalyzed) ? 'not-allowed' : 'pointer',
+                  fontWeight: 'bold',
+                  fontSize: '14px',
+                  opacity: (isLocked || !bothAnalyzed) ? 0.5 : 1
+                }}
+              >
+                {(targetBpm || targetKey) ? (
+                  <>🎯 Process with Target{targetBpm ? ` BPM ${targetBpm}` : ''}{targetBpm && targetKey ? ' and' : ''}{targetKey ? ` Key ${formatTargetKey(targetKey, [0, 1].filter(slot => metadata[slot]?.bpm != null).map(getEffectiveScale))}` : ''}</>
+                ) : (
+                  <>🚀 Process as is</>
+                )}
+              </button>
+            )}
 
             {/* Processing Progress Bar */}
             {isProcessing && (
@@ -1334,11 +1510,12 @@ export default function DualMixer() {
           </div>
         ) : null}
 
-        {/* Processing Status & Recommendations -- shown as soon as this
-            processing window is available (both songs have stems), not only
-            after a target BPM/key has already been picked, so the
-            recommendation can actually inform that choice. */}
-        {stems[0] && stems[1] && (
+        {/* Processing Status & Recommendations -- shown as soon as both
+            songs are analyzed (bpm/key known), whether or not stems have
+            been separated yet, and not only after a target BPM/key has
+            already been picked, so the recommendation can actually inform
+            that choice. */}
+        {bothAnalyzed && (
           <div style={{
             background: 'rgba(99, 102, 241, 0.05)',
             border: '1px solid rgba(99, 102, 241, 0.2)',
@@ -1392,9 +1569,9 @@ export default function DualMixer() {
                     opacity: isLocked ? 0.5 : 1
                   }}
                 >
-                  <span>{rec.emoji} <strong>{formatTargetKey(rec.key, [0, 1].filter(slot => stems[slot]).map(getEffectiveScale))}</strong> <span style={{ color: '#999' }}>({rec.label})</span></span>
+                  <span>{rec.emoji} <strong>{formatTargetKey(rec.key, [0, 1].filter(slot => metadata[slot]?.bpm != null).map(getEffectiveScale))}</strong> <span style={{ color: '#999' }}>({rec.label})</span></span>
                   <span style={{ color: '#999', fontSize: '11px' }}>
-                    {[0, 1].filter(slot => stems[slot]).map(slot => {
+                    {[0, 1].filter(slot => metadata[slot]?.bpm != null).map(slot => {
                       const shift = getSemitoneShift(getEffectiveKey(slot), rec.key);
                       const sign = shift > 0 ? '+' : '';
                       return `Song ${slot + 1}: ${formatKey(rec.key, getEffectiveScale(slot))} (${sign}${shift} st)`;
@@ -1413,7 +1590,7 @@ export default function DualMixer() {
               borderRadius: '6px'
             }}>
               {[0, 1].map(slot => {
-                if (!stems[slot]) return null;
+                if (metadata[slot]?.bpm == null) return null;
                 const sourceBpm = getEffectiveBpm(slot);
                 const sourceKey = getEffectiveKey(slot);
                 const keyShift = targetKey ? getSemitoneShift(sourceKey, targetKey) : 0;

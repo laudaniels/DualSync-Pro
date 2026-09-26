@@ -120,19 +120,134 @@ def upload_audio():
         return jsonify({'error': f'Upload failed: {str(e)}'}), 500
 
 
-@app.route('/api/process-song', methods=['POST'])
-def process_song():
-    """Step 2: the user has chosen 'as_is' or 'align' for the WAV produced
-    by /api/upload-audio -- run that (optional) beatgrid alignment, then BPM
-    and key detection, then Demucs stem separation."""
+def _align_and_analyze(engine, file_path, mode, slot, reference_bpm=None, reference_anchor=None):
+    """Shared by /api/analyze-song and /api/process-song: optionally align or
+    snap the WAV's beatgrid, then run BPM+key analysis. Returns (file_path,
+    bpm, beat_anchor, key_name, scale, grid_correction,
+    detected_bpm_before_grid_correction) -- file_path is the aligned/snapped
+    copy if mode called for one, otherwise the input unchanged.
+
+    How much the initial beat-grid step (align or snap) actually corrected --
+    grid_correction is None if neither ran or it failed, else {mean_ms,
+    max_ms} for the frontend to display alongside this song's detected info.
+    """
+    audio_dir = BASE_DIR / 'Audio'
+    grid_correction = None
+    detected_bpm_before_grid_correction = None
+
+    if mode == 'align':
+        _set_slot_state(slot, progress=15, current_step='🎯 Aligning beatgrid')
+        add_log_message("🎯 Aligning beatgrid (correcting tempo drift)...", slot)
+        try:
+            aligned_path = audio_dir / f"aligned_{file_path.stem}.wav"
+            _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.align_beatgrid(str(file_path), str(aligned_path))
+            file_path = aligned_path
+            detected_bpm_before_grid_correction = orig_bpm
+            grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
+            add_log_message(f"✅ Beatgrid aligned (was {orig_bpm:.1f} BPM with drift, mean correction {mean_ms:.1f}ms)", slot)
+        except Exception as e:
+            logging.error(f"Beatgrid alignment failed: {e}", exc_info=True)
+            add_log_message(f"⚠️ Beatgrid alignment failed, continuing without it: {e}", slot)
+
+    elif mode == 'snap':
+        if not reference_bpm or reference_anchor is None:
+            add_log_message("⚠️ Snap beat requested but no reference song info was provided, continuing without it", slot)
+        else:
+            _set_slot_state(slot, progress=15, current_step='🧲 Snapping beat grid to Song 1')
+            add_log_message(f"🧲 Snapping beat grid to the other song ({reference_bpm:.1f} BPM)...", slot)
+            try:
+                snapped_path = audio_dir / f"snapped_{file_path.stem}.wav"
+                _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.snap_to_reference(
+                    str(file_path), str(snapped_path), float(reference_bpm), float(reference_anchor)
+                )
+                file_path = snapped_path
+                detected_bpm_before_grid_correction = orig_bpm
+                grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
+                add_log_message(f"✅ Snapped to reference beat grid (was {orig_bpm:.1f} BPM, mean correction {mean_ms:.1f}ms)", slot)
+            except Exception as e:
+                logging.error(f"Beat-grid snap failed: {e}", exc_info=True)
+                add_log_message(f"⚠️ Beat-grid snap failed, continuing without it: {e}", slot)
+
+    # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
+    _set_slot_state(slot, progress=25, current_step='🔍 Analyzing BPM and Key')
+    add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...", slot)
+    bpm, beat_anchor, key, scale = engine.analyze_track_and_key(str(file_path))
+    key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
+
+    add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
+
+    return file_path, bpm, beat_anchor, key_name, scale, grid_correction, detected_bpm_before_grid_correction
+
+
+@app.route('/api/analyze-song', methods=['POST'])
+def analyze_song():
+    """Step 2 (fast): the user has chosen 'as_is'/'align'/'snap' for the WAV
+    produced by /api/upload-audio -- run that (optional) beatgrid alignment,
+    then BPM and key detection. Deliberately stops there (seconds, not
+    minutes) so the frontend can show real detected BPM/Key -- and let the
+    user override them -- before committing to the (much slower) stem
+    separation in /api/process-song or /api/process-stems."""
     data = request.json or {}
     wav_filename = data.get('wav_filename')
     filename = data.get('filename', wav_filename)
     slot = data.get('slot')
     mode = data.get('mode', 'as_is')
-    # Only used for mode == 'snap': the OTHER song's already-known bpm/beat
-    # anchor to warp this one onto (see /api/upload-audio's normalize step --
-    # this runs on that same normalized WAV, before separation).
+    reference_bpm = data.get('reference_bpm')
+    reference_anchor = data.get('reference_anchor')
+
+    if not wav_filename:
+        return jsonify({'error': 'Missing wav_filename'}), 400
+
+    try:
+        audio_dir = BASE_DIR / 'Audio'
+        file_path = audio_dir / wav_filename
+        if not file_path.exists():
+            return jsonify({'error': f'Uploaded WAV not found: {wav_filename}'}), 400
+
+        from mashup_engine import MashupEngine
+        engine = MashupEngine()
+
+        _set_slot_state(slot, status='processing', progress=5, current_step='📥 Loading original file')
+
+        file_path, bpm, beat_anchor, key_name, scale, grid_correction, detected_bpm_before_grid_correction = \
+            _align_and_analyze(engine, file_path, mode, slot, reference_bpm, reference_anchor)
+
+        _set_slot_state(slot, progress=100, current_step='✅ Analysis complete', status='success')
+
+        return jsonify({
+            'bpm': round(bpm, 1),
+            'detectedBpm': round(detected_bpm_before_grid_correction, 1) if detected_bpm_before_grid_correction else round(bpm, 1),
+            'beat_anchor': beat_anchor,
+            'key': key_name,
+            'scale': scale,
+            'filename': filename,
+            # The WAV that was ACTUALLY analyzed (the aligned/snapped copy if
+            # mode called for one, otherwise the plain converted WAV) --
+            # /api/process-song and /api/process-stems must both separate
+            # from THIS file, not the raw original upload, or they'll ignore
+            # the alignment entirely and can reintroduce MP3-decode/WAV
+            # timing mismatches.
+            'source_wav_filename': file_path.name,
+            'grid_correction': grid_correction,
+            'mode': mode
+        })
+    except Exception as e:
+        logging.error(f"Song analysis failed: {e}", exc_info=True)
+        _set_slot_state(slot, progress=0, status='error')
+        return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
+
+
+@app.route('/api/process-song', methods=['POST'])
+def process_song():
+    """Step 3: separate stems from a WAV that /api/analyze-song has already
+    aligned/snapped and analyzed -- mode is always 'as_is' here since that
+    part of the work is already done and baked into wav_filename; this only
+    re-derives BPM/key (cheap) and then runs the (slow) stem separation."""
+    data = request.json or {}
+    wav_filename = data.get('wav_filename')
+    filename = data.get('filename', wav_filename)
+    slot = data.get('slot')
+    mode = data.get('mode', 'as_is')
     reference_bpm = data.get('reference_bpm')
     reference_anchor = data.get('reference_anchor')
 
@@ -153,52 +268,8 @@ def process_song():
 
         _set_slot_state(slot, status='processing', progress=5, current_step='📥 Loading original file')
 
-        # How much the initial beat-grid step (align or snap) actually
-        # corrected -- None if neither ran or it failed, else {mean_ms, max_ms}
-        # for the frontend to display alongside this song's detected info.
-        grid_correction = None
-        detected_bpm_before_grid_correction = None
-
-        if mode == 'align':
-            _set_slot_state(slot, progress=15, current_step='🎯 Aligning beatgrid')
-            add_log_message("🎯 Aligning beatgrid (correcting tempo drift)...", slot)
-            try:
-                aligned_path = audio_dir / f"aligned_{file_path.stem}.wav"
-                _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.align_beatgrid(str(file_path), str(aligned_path))
-                file_path = aligned_path
-                detected_bpm_before_grid_correction = orig_bpm
-                grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
-                add_log_message(f"✅ Beatgrid aligned (was {orig_bpm:.1f} BPM with drift, mean correction {mean_ms:.1f}ms)", slot)
-            except Exception as e:
-                logging.error(f"Beatgrid alignment failed: {e}", exc_info=True)
-                add_log_message(f"⚠️ Beatgrid alignment failed, continuing without it: {e}", slot)
-
-        elif mode == 'snap':
-            if not reference_bpm or reference_anchor is None:
-                add_log_message("⚠️ Snap beat requested but no reference song info was provided, continuing without it", slot)
-            else:
-                _set_slot_state(slot, progress=15, current_step='🧲 Snapping beat grid to Song 1')
-                add_log_message(f"🧲 Snapping beat grid to the other song ({reference_bpm:.1f} BPM)...", slot)
-                try:
-                    snapped_path = audio_dir / f"snapped_{file_path.stem}.wav"
-                    _, orig_bpm, _orig_anchor, mean_ms, max_ms = engine.snap_to_reference(
-                        str(file_path), str(snapped_path), float(reference_bpm), float(reference_anchor)
-                    )
-                    file_path = snapped_path
-                    detected_bpm_before_grid_correction = orig_bpm
-                    grid_correction = {'mean_ms': round(mean_ms, 1), 'max_ms': round(max_ms, 1)}
-                    add_log_message(f"✅ Snapped to reference beat grid (was {orig_bpm:.1f} BPM, mean correction {mean_ms:.1f}ms)", slot)
-                except Exception as e:
-                    logging.error(f"Beat-grid snap failed: {e}", exc_info=True)
-                    add_log_message(f"⚠️ Beat-grid snap failed, continuing without it: {e}", slot)
-
-        # Get BPM and key (combined single-pass analysis with 5-pass BPM strategy)
-        _set_slot_state(slot, progress=25, current_step='🔍 Analyzing BPM and Key')
-        add_log_message("🔍 Analyzing BPM and Key (5-pass detection)...", slot)
-        bpm, beat_anchor, key, scale = engine.analyze_track_and_key(str(file_path))
-        key_name = engine._key_to_note(key) if key >= 0 else "Unknown"
-
-        add_log_message(f"✅ Detected: {bpm:.1f} BPM, {key_name} key", slot)
+        file_path, bpm, beat_anchor, key_name, scale, grid_correction, detected_bpm_before_grid_correction = \
+            _align_and_analyze(engine, file_path, mode, slot, reference_bpm, reference_anchor)
 
         # Check if multi-engine mode is enabled (via env var or config)
         # DEFAULT: true (9-stem multi-engine) -- set to 'false' to use legacy 7-stem Demucs-only

@@ -40,6 +40,14 @@ function SongMixer({
   onVolumeChange
 }) {
   const songName = metadata?.filename?.replace(/\.[^/.]+$/, '') || `Song ${slot + 1}`;
+  // BPM/Key already known from the fast analyze step, whether or not stems
+  // exist yet -- drives showing the detected-info block and (pre-stems)
+  // which "not ready yet" sub-state to render below.
+  const analyzed = metadata?.bpm != null;
+  // True only while THIS song's real (slow) stem separation is actually in
+  // flight, as opposed to the earlier fast align/analyze call -- both set
+  // `loading`, so `processingStage` disambiguates which one is running.
+  const separating = loading && processingStage === 'separating';
 
   return (
     <div className="song-mixer">
@@ -48,27 +56,27 @@ function SongMixer({
       {metadata && (
         <div className="metadata">
           <p><strong>{metadata.filename}</strong></p>
-          {hasStems && (metadata.detectedBpm || metadata.detectedKey) && (
+          {(metadata.detectedBpm || metadata.detectedKey) && (
             <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
               {metadata.mode === 'snap' ? '🧲 Original' : 'Detected'}: {metadata.detectedBpm} BPM{metadata.detectedBpm && metadata.detectedKey ? ', ' : ''}{formatKey(metadata.detectedKey, scale)}
             </p>
           )}
-          {hasStems && metadata.bpm && metadata.mode === 'snap' && (
+          {metadata.bpm && metadata.mode === 'snap' && (
             <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
               🧲 Snapped to: {metadata.bpm} BPM
             </p>
           )}
-          {hasStems && metadata.bpm && metadata.mode === 'align' && metadata.detectedBpm && metadata.bpm !== metadata.detectedBpm && (
+          {metadata.bpm && metadata.mode === 'align' && metadata.detectedBpm && metadata.bpm !== metadata.detectedBpm && (
             <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
               🎯 Aligned to: {metadata.bpm} BPM
             </p>
           )}
-          {hasStems && metadata.gridCorrection && (
+          {metadata.gridCorrection && (
             <p style={{ margin: '2px 0 0 0', fontSize: '11px', color: '#888' }}>
               {metadata.mode === 'snap' ? '🧲 Snap' : '🎯 Alignment'} corrected: {metadata.gridCorrection.mean_ms}ms avg (max {metadata.gridCorrection.max_ms}ms)
             </p>
           )}
-          {hasStems && (
+          {metadata.bpm != null && (
           <div style={{ marginTop: '10px', display: 'flex', gap: '20px', fontSize: '13px' }}>
             {/* BPM Override */}
             <div style={{ flex: 1 }}>
@@ -137,16 +145,17 @@ function SongMixer({
                     onChange={(e) => onKeyOverride(slot, e.target.value)}
                     style={{
                       flex: 1,
-                      background: 'rgba(99, 102, 241, 0.2)',
+                      background: '#1a1f3a',
                       border: '1px solid #6366f1',
                       color: '#fff',
                       padding: '4px 8px',
                       borderRadius: '4px',
-                      fontSize: '12px'
+                      fontSize: '12px',
+                      colorScheme: 'dark'
                     }}
                   >
-                    <option value="">Clear override</option>
-                    {KEYS.map(k => <option key={k} value={k}>{formatKey(k, scale)}</option>)}
+                    <option value="" style={{ background: '#1a1f3a', color: '#fff' }}>Clear override</option>
+                    {KEYS.map(k => <option key={k} value={k} style={{ background: '#1a1f3a', color: '#fff' }}>{formatKey(k, scale)}</option>)}
                   </select>
                   <button
                     onClick={() => onToggleEditingKey(slot, false)}
@@ -191,7 +200,35 @@ function SongMixer({
       )}
 
       {!hasStems ? (
-        pendingSong ? (
+        analyzed ? (
+          <div className="stem-loader" style={{
+            border: '6px solid #7c3aed',
+            borderRadius: '16px',
+            padding: '50px 40px',
+            textAlign: 'center',
+            background: 'rgba(124, 58, 237, 0.45)',
+            width: '100%',
+            minHeight: '350px',
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxSizing: 'border-box',
+            gap: '16px'
+          }}>
+            {separating ? (
+              <div className="loader">
+                <div className="spinner"></div>
+                <p>{loadProgress?.current_step || 'Separating stems... (this may take a while)'}</p>
+                <p style={{ fontSize: '11px', color: '#999' }}>See the progress bar below the process button</p>
+              </div>
+            ) : (
+              <p style={{ color: '#ccc', fontSize: '13px' }}>
+                ✅ Analyzed — choose "process as is" or a target BPM/Key below to start processing
+              </p>
+            )}
+          </div>
+        ) : pendingSong ? (
           <div className="stem-loader" style={{
             border: '6px solid #7c3aed',
             borderRadius: '16px',
@@ -214,7 +251,7 @@ function SongMixer({
                   {loadProgress?.current_step || (
                     processingStage === 'align' ? 'Aligning beatgrid...'
                     : processingStage === 'snap' ? 'Snapping beat grid to Song 1...'
-                    : 'Separating stems... (this may take a minute)'
+                    : 'Analyzing BPM and Key...'
                   )}
                 </p>
                 {loadProgress?.progress != null && (

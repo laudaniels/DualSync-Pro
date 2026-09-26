@@ -1,10 +1,59 @@
 import hashlib
+import logging
 import shutil
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# audio-separator's own default (/tmp/audio-separator-models/) isn't
+# persistent -- on this box /tmp gets cleared across restarts, silently
+# forcing a ~3 GB re-download of all 4 models (karaoke, DrumSep, denoise,
+# de-reverb) on the very next run, with no progress reporting for that time.
+# Caching under the user's home directory instead survives restarts.
+AUDIO_SEPARATOR_MODEL_DIR = Path.home() / ".cache" / "audio-separator-models"
+
+
+class _AudioSeparatorLogBridge(logging.Handler):
+    """Turns audio-separator's own phase-transition log lines (model load
+    start, separation start) into progress_callback updates, tagged with
+    `prefix` -- so a call site can get "loading model..."/"separating
+    audio..." status for free by wrapping a call in
+    _report_audio_separator_progress(), instead of audio-separator needing
+    to expose a callback of its own (it doesn't)."""
+
+    def __init__(self, prefix, callback):
+        super().__init__(level=logging.INFO)
+        self._prefix = prefix
+        self._callback = callback
+
+    def emit(self, record):
+        if not self._callback:
+            return
+        message = record.getMessage()
+        if message.startswith("Loading model"):
+            self._callback(f"{self._prefix}: loading model (downloading on first use)...")
+        elif message.startswith("Starting separation process"):
+            self._callback(f"{self._prefix}: separating audio...")
+
+
+@contextmanager
+def _report_audio_separator_progress(prefix, callback):
+    """While the wrapped audio_separator call runs, forward its own log
+    lines as progress updates. Safe to nest around a single synchronous
+    call -- each audio_separator call this project makes runs to completion
+    on its own thread, so there's no cross-talk between the karaoke vocals
+    call (running in parallel with the separate Demucs subprocess) and
+    everything else, which runs sequentially."""
+    logger = logging.getLogger("audio_separator.separator.separator")
+    handler = _AudioSeparatorLogBridge(prefix, callback)
+    logger.addHandler(handler)
+    try:
+        yield
+    finally:
+        logger.removeHandler(handler)
 
 
 class MashupEngine:
@@ -1524,11 +1573,40 @@ class MashupEngine:
             vocals_lock = threading.Lock()
             demucs_lock = threading.Lock()
 
+            # Demucs is the slower of the two (minutes vs. ~tens of seconds
+            # for vocals once its model is cached), so its own real percentage
+            # -- parsed straight from its progress bar -- drives the Stage 1
+            # progress fraction; vocals only contributes descriptive text,
+            # since audio-separator doesn't expose a percentage of its own.
+            stage1_lock = threading.Lock()
+            stage1_status = {'vocals': 'Vocals: starting...', 'instruments_frac': 0.0,
+                              'instruments_label': 'starting...'}
+
+            def _report_stage1():
+                with stage1_lock:
+                    frac = stage1_status['instruments_frac']
+                    combined = (f"Stage 1: {stage1_status['instruments_label']} "
+                                f"| {stage1_status['vocals']}")
+                report(frac * 0.55, combined)
+
+            def _set_vocals_status(label):
+                with stage1_lock:
+                    stage1_status['vocals'] = label
+                _report_stage1()
+
+            def _set_instruments_status(frac, label):
+                with stage1_lock:
+                    stage1_status['instruments_frac'] = frac
+                    stage1_status['instruments_label'] = label
+                _report_stage1()
+
             def extract_vocals():
                 nonlocal vocals_path
                 try:
                     logging.info(f"  🎤 Mel-Band Roformer Karaoke: extracting vocals...")
-                    v = self._separate_vocals_karaoke(str(song), str(song_out_dir))
+                    with _report_audio_separator_progress("Vocals", _set_vocals_status):
+                        v = self._separate_vocals_karaoke(str(song), str(song_out_dir))
+                    _set_vocals_status("Vocals: done")
                     with vocals_lock:
                         vocals_path = v
                     logging.info(f"  ✅ Vocals extracted")
@@ -1541,7 +1619,9 @@ class MashupEngine:
                 nonlocal demucs_stems
                 try:
                     logging.info(f"  🎼 Demucs htdemucs_6s: extracting bass/guitar/piano/other/drums...")
-                    stems = self._separate_stems_demucs6s(str(song), str(song_out_dir))
+                    stems = self._separate_stems_demucs6s(str(song), str(song_out_dir),
+                                                           progress_callback=_set_instruments_status)
+                    _set_instruments_status(1.0, "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s): done")
                     with demucs_lock:
                         demucs_stems = stems
                     logging.info(f"  ✅ 6-stem separation complete")
@@ -1567,7 +1647,9 @@ class MashupEngine:
             report(0.55, "Stage 2: splitting drums (kick/snare/hihat/tom)...")
             logging.info(f"🥁 [STAGE 2] Kick/snare (MDX23C DrumSep) + hihat/tom (frequency split)...")
             drums_stem = demucs_stems['drums']
-            kick_snare = self._split_drums_mdx23c(drums_stem, str(song_out_dir))
+            with _report_audio_separator_progress(
+                    "Kick/snare (DrumSep)", lambda label: report(0.6, f"Stage 2: {label}")):
+                kick_snare = self._split_drums_mdx23c(drums_stem, str(song_out_dir))
             hihat_tom = self.split_drums(drums_stem, str(song_out_dir))
 
             # STAGE 3: Assemble final stem structure
@@ -1645,7 +1727,7 @@ class MashupEngine:
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         try:
-            separator = Separator(output_dir=str(output_dir_path), output_format="WAV")
+            separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
             separator.load_model(model_filename="mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt")
 
             logging.info(f"  Separating vocals from {Path(audio_path).name}...")
@@ -1664,20 +1746,59 @@ class MashupEngine:
             logging.error(f"Karaoke vocal separation failed: {e}")
             raise RuntimeError(f"Vocal extraction failed: {str(e)[-500:]}")
 
-    def _separate_stems_demucs6s(self, audio_path, output_dir):
+    def _separate_stems_demucs6s(self, audio_path, output_dir, progress_callback=None):
         """Separate bass/guitar/piano/other/drums directly from the full song using
         Demucs' htdemucs_6s model (also outputs a 'vocals' stem, unused here --
-        the Karaoke model supplies our (higher-quality) vocals instead)."""
+        the Karaoke model supplies our (higher-quality) vocals instead).
+
+        progress_callback(fraction, label), if given, is fed straight from
+        Demucs' own tqdm progress bar on stderr (e.g. " 42%|...") -- this call
+        alone is the majority of Stage 1's multi-minute runtime, so without
+        it the bar sits frozen the entire time Demucs is actually working.
+        """
         import logging
+        import re
+        import threading
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         command = [sys.executable, "-m", "demucs", "-n", "htdemucs_6s",
                    "--out", str(output_dir_path), audio_path]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=3600)
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "Demucs failed without an error message."
+        label = "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s)..."
+        percent_re = re.compile(r"(\d+)%\|")
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, bufsize=1)
+
+        stdout_lines, stderr_lines = [], []
+
+        def _watch(stream, sink, parse_progress):
+            for line in stream:
+                sink.append(line)
+                if parse_progress and progress_callback:
+                    match = percent_re.search(line)
+                    if match:
+                        progress_callback(int(match.group(1)) / 100.0, label)
+
+        watchers = [
+            threading.Thread(target=_watch, args=(process.stdout, stdout_lines, False), daemon=True),
+            threading.Thread(target=_watch, args=(process.stderr, stderr_lines, True), daemon=True),
+        ]
+        for w in watchers:
+            w.start()
+
+        try:
+            process.wait(timeout=3600)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise RuntimeError(f"Demucs htdemucs_6s timed out separating {Path(audio_path).name}")
+        for w in watchers:
+            w.join(timeout=5)
+
+        if process.returncode != 0:
+            detail = "".join(stderr_lines).strip() or "".join(stdout_lines).strip() or "Demucs failed without an error message."
             raise RuntimeError(f"Demucs htdemucs_6s could not separate {Path(audio_path).name}:\n{detail[-1200:]}")
 
         song_folder = Path(audio_path).stem
@@ -1718,7 +1839,7 @@ class MashupEngine:
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         try:
-            separator = Separator(output_dir=str(output_dir_path), output_format="WAV")
+            separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
             separator.load_model(model_filename="MDX23C-DrumSep-aufr33-jarredou.ckpt")
 
             logging.info(f"  Splitting kick/snare from {Path(drums_path).name}...")
@@ -1800,10 +1921,12 @@ class MashupEngine:
         # Loaded once and reused across every stem below -- reloading a
         # checkpoint per stem would multiply model-load time (up to ~1 min
         # for the de-reverb model) by however many stems there are.
-        denoiser = Separator(output_dir=str(restore_dir), output_format="WAV")
-        denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
-        dereverber = Separator(output_dir=str(restore_dir), output_format="WAV")
-        dereverber.load_model(model_filename="dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
+        with _report_audio_separator_progress(
+                "Restoration", lambda label: progress_callback(0.0, label) if progress_callback else None):
+            denoiser = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+            denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
+            dereverber = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+            dereverber.load_model(model_filename="dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
 
         def _resolve(output_files, marker):
             for f in output_files:
