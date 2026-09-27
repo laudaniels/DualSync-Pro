@@ -20,10 +20,11 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 - **Dual-song mixer** — load two MP3s into independent slots with synchronized playback
 - **HTML5 audio synchronization** — first song's timeline controls both songs for seamless mixing
 - **Independent stem volumes** — control 9 stems separately for each song (0-100% sliders):
-  - **Vocals** (Mel-Band RoFormer AI, 12.6 dB SDR)
+  - **Vocals** (ensemble of two AI models, averaged — see Audio Analysis & Processing below)
   - **Drums:** Kick, Snare (MDX23C ML), Hi-Hat, Tom (frequency filtering)
   - **Instruments:** Bass, Guitar, Piano (Demucs 6-stem AI, 9.5 dB SDR)
   - **Other** (residual instruments)
+  - **Per-stem restoration toggle** (vocals only) — apply denoise + de-reverb on demand from a checkbox next to that slider; testing showed the models hurt non-vocal stems rather than helping
 - **Waveform Preview Thumbnails** — visual waveform for each stem in the mixer to quickly verify audio content
 - **Crossfader** — blend between Song 1 and Song 2 in real-time
 - **Beat Offset Control with Magnetic Snap** — manually align Song 2's beat grid, up to 32 bars:
@@ -34,7 +35,7 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
   - Visual offset indicator on waveform display, with a zoom range large enough to see the full 32-bar offset
 - **Live Beat-Grid Drift Correction** — a strength slider (0-100%) continuously nudges Song 2's playback rate to cancel out timing drift during playback, with a live readout of the instantaneous correction (ms) and cumulative beats realigned so far
 - **Multi-Stem Waveform Visualization** — advanced beat alignment tool:
-  - Select any combination of 7 stems to display (vocals, kick, snare, hi-hat, tom, bass, other)
+  - Select any combination of 9 stems to display (vocals, kick, snare, hi-hat, tom, bass, guitar, piano, other)
   - Color-coded waveforms for each stem (purple, indigo, pink, orange, green, blue, gray)
   - Display both Song 1 and Song 2 simultaneously for each stem
   - Stem selection checkboxes (paused-only to prevent accidental changes)
@@ -50,19 +51,22 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 
 ### Audio Analysis & Processing
 - **Multi-Engine Stem Separation (9 stems)** — best-in-class models for maximum quality:
-  - **Mel-Band RoFormer** (12.6 dB SDR) — cleanest lead vocals
+  - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged sample-by-sample) — cleanest lead vocals; a listening test showed the average beats either model alone (a known technique, UVR's "Ensemble Mode": different architectures make different mistakes, averaging smooths those out)
   - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
   - **MDX23C DrumSep** (SOTA) — ML-based kick and snare isolation
   - **Frequency-based filtering** — hi-hat and tom (fallback, no ML model)
-- **Denoise + De-Reverb Restoration** — artifact removal and quality enhancement:
-  - Mel-Band Roformer denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR), applied to every stem
+- **Denoise + De-Reverb Restoration (opt-in per stem)** — artifact removal and quality enhancement:
+  - Mel-Band Roformer denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR)
+  - Not run during separation (it was costing every song several minutes whether or not it helped) — toggle it per stem from a checkbox next to that stem's volume slider instead
+  - Vocals only in the UI: these models are trained for vocal cleanup, and testing showed they measurably hurt non-vocal stems (e.g. guitar measured ~11 dB quieter) rather than helping
   - Graceful fallback to spectral filtering if these models can't load
-- **BPM & Key Detection** — Essentia (`RhythmExtractor2013` for tempo/beat positions, `KeyExtractor` for key/scale) analyzes each uploaded song
+- **BPM & Key Detection** — Essentia (`RhythmExtractor2013` for tempo/beat positions, `KeyExtractor` for key/scale) analyzes each uploaded song in seconds, before any (slow) stem separation happens
 - **Two Alignment Modes on Upload** — for each song you choose:
   - **Process as-is** — keep the song's natural timing
   - **Align beatgrid** — correct internal timing drift by warping the song's own beats onto a perfectly even grid (via RubberBand `--timemap`)
   - **Snap beat grid to Song 1** (Song 2 only, once Song 1 is ready) — warp Song 2's actual beat times directly onto Song 1's actual beat times, so both tracks share one true beatgrid without relying on live drift correction
   - Both alignment modes report how much correction was applied (average/max milliseconds moved per beat)
+  - This step, and the BPM/Key analysis, are fast (seconds) and happen before you decide whether to separate as-is or target a shared BPM/Key (see "How It Works" below)
 - **Beatmatching with Verification** — align Song 2 to Song 1 (or both to target BPM) with automatic multi-pass correction
   - Pass 1: FFmpeg tempo-stretching (stable baseline)
   - Pass 2+: Optional RubberBand for higher quality (if available)
@@ -74,20 +78,19 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 - **Lossless WAV with DAW-readable tempo/key metadata** — every exported file is a WAV carrying a Sonic Foundry **ACID chunk** (the convention FL Studio, Logic, Cubase, Reaper, Reason, Sound Forge, and Samplitude all read to auto-detect a sample's tempo and root key on import), plus standard ID3 tags (title, artist, BPM, key)
 - **Measured BPM in filenames** — actual output BPM shown in filenames (not target)
 - **Smart naming convention:**
-  - Original stems: `songname-[detected-bpm]-[key]-[stem].wav`
-  - Processed stems: `songname-[measured-bpm]-[key]-[stem].wav`
+  - `songname-[bpm]-[key]-[stem].wav`
   - Manual BPM override: `songname-[target]-manual-[measured]-[key]-[stem].wav`
-- **18+ downloadable files** (all as tagged WAV with verified output BPM, ACID chunks for DAW auto-detect):
-  - **Original stems:** Song 1 & Song 2 (9 stems each: vocals, kick, snare, hi-hat, tom, bass, guitar, piano, other)
-  - **Beatgrid-aligned stems:** Optional pre-alignment backup (on-demand)
-  - **Processed stems:** Beatmatched + transposed (9 stems with verified output BPM)
-  - **Final mix:** All stems combined with volume settings + crossfader (fully lossless)
-- **ZIP archives** — organized downloads with accurate naming
+- **"Download Stems"** — one ZIP with one folder per song, named with its current BPM/Key, containing every stem that song generated:
+  - The 9 main stems, at whatever their current state is (as-is, or beatmatched/transposed to a target — a song only ever has one current state, so there's no separate "original" vs "processed" download)
+  - **Bonus/reference stems, included for free** since they're already generated as byproducts and not thrown away: the vocal ensemble's two individual models' own vocals + instrumental outputs, and Demucs' own (unused) vocals stem
+  - The pre-restoration backup for any stem you've toggled restoration on
+- **Beatgrid-Aligned Stems** — optional pre-alignment backup (on-demand), separately
+- **Final Mix** — all stems combined with volume settings + crossfader (fully lossless)
 
 ### User Experience
-- **Explicit Process buttons** — Process BPM and Process Key buttons only enabled when values change from last processed state
+- **One adaptive Process button** — reads "Process as is" or "Process with Target BPM/Key" depending on whether a target is set; post-separation it becomes "Process All Changes", enabled only once BPM/Key actually changed from the last processed state
 - **Real-time progress indication** — animated progress bars during beatmatching and key transposition
-- **Processing state display** — visual feedback showing which stems version is currently being used
+- **Processing state display** — "Now playing" line shows each song's current BPM/Key while mixing
 - **Drag-and-drop upload** — intuitive file loading with visual feedback
 - **Responsive design** — works on desktop browsers
 - **Locked controls during processing** — all mixing controls disabled while beatmatching or transposition is in progress
@@ -98,17 +101,11 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 
 ### 1. Upload & Analyze
 When you upload an MP3 file:
-1. **Upload & Convert** — the file is converted to WAV and Essentia detects its BPM, beat grid, and key
+1. **Upload & Convert** — the file is converted to WAV
 2. **Choose a mode** — Process as-is, Align beatgrid, or (for Song 2, once Song 1 is ready) Snap beat grid to Song 1
-3. **Multi-Engine Stem Separation** (3-stage pipeline, ~14-20 min):
-   - **Stage 1 (Parallel):** Mel-Band RoFormer extracts vocals (12.6 dB SDR) + Demucs htdemucs_6s separates 6 stems (9.5 dB SDR)
-   - **Stage 2:** MDX23C DrumSep isolates kick/snare from drums stem (SOTA ML) + frequency filtering for hi-hat/tom
-   - **Stage 3:** Denoise + de-reverb restoration removes artifacts and enhances quality
-4. **Result:** 9 professional stems (7 ML-separated + 2 frequency-filtered)
-5. **Real-Time Logging** — unified log window shows all processing steps (uploading, analyzing, stage 1-3 progress)
-6. Results are displayed and ready for mixing
+3. **Fast analysis** (seconds, not minutes) — the chosen alignment step runs, then Essentia detects BPM, beat grid, and key. No stem separation yet: this is deliberately a separate, fast step so you see real detected values (and can override them) before committing to the slow part below
 
-Both songs are processed in parallel (independent uploads).
+Both songs are analyzed independently and in parallel (independent uploads).
 
 ![Initial processing — Song 1](docs/images/02-initial-processing-song1.png)
 *Figure 2 — Song 1 during initial upload/processing, with its alignment-mode choice.*
@@ -116,31 +113,31 @@ Both songs are processed in parallel (independent uploads).
 ![Initial processing — Song 2](docs/images/03-initial-processing-song2.png)
 *Figure 3 — Song 2 during initial upload/processing, including the "Snap beat grid to Song 1" option once Song 1 is ready.*
 
-### 2. Prepare for Mixing
-Before mixing, you can:
-- **Override detected BPM** — manually enter a target BPM if auto-detection is wrong
+### 2. Choose How to Process
+Once **both** songs are analyzed, you can:
+- **Override detected BPM** — manually enter a value if auto-detection is wrong
 - **Override detected Key** — manually select a different key from dropdown
 - **Pick a recommended key** — the Camelot Wheel panel ranks up to 5 harmonically compatible keys for both songs together, or tells you no change is needed
 
-### 3. Process & Beatmatch
-When you click **"Process All Changes"** button (BPM + Key):
-1. **Full Song Processing** — process the complete song (all stems together) for tempo and pitch
-2. **Beatmatching (if BPM changed):**
-   - Pass 1 — FFmpeg applies initial tempo-stretching
-   - Verification — Librosa re-analyzes output BPM
-   - Convergence Check — if output is within ±10 BPM of target, done; otherwise continue
-   - Pass 2+ — Optional RubberBand processing for refinement (if available)
-3. **Transposition (if Key changed):**
-   - Pitch-shift processed song to match target key using FFmpeg asetrate
-4. **Re-Separation** — Multi-engine pipeline re-separates the processed song into 9 stems using same best-in-class models
-5. **Stem Copying** — All processed stems copied to server with auto-scroll logs showing progress
-6. **Real-Time Logging** — unified log window shows all steps: loading, beatmatching, transposing, multi-engine separation, copying
-7. Progress bar animates during processing, actual processing state updates when complete
+Then click one button, which reads either:
+- **"Process as is"** (no target BPM/Key set) — each song keeps its own detected BPM/Key
+- **"Process with Target BPM/Key"** (once you've set one or both) — both songs are beatmatched/transposed to the same shared target before separating
 
-The **"Process All Changes" button is enabled** only when BPM or Key has changed from last processed value.
+### 3. Stem Separation
+Clicking that button kicks off the (slow) part for **both songs in parallel**:
+1. If a target was set: beatmatch/transpose the full song first (cheaper and phase-cleaner than processing 9 separated stems individually)
+2. **Multi-Engine Stem Separation** (parallel GPU pipeline, ~10-15 min total):
+   - **Stage 1 (parallel):** vocal-model ensemble extracts vocals + Demucs htdemucs_6s separates 6 stems
+   - **Stage 2:** MDX23C DrumSep isolates kick/snare from the drums stem + frequency filtering for hi-hat/tom
+   - **Stage 3:** stems assembled (no restoration here — that's opt-in per stem afterward, see Audio Analysis & Processing above)
+3. **Result:** 9 professional stems (7 ML-separated + 2 frequency-filtered), plus a handful of bonus/reference stems kept as free byproducts (see Downloads & Exports)
+4. **Real-Time Logging** — unified log window shows every stage as it happens for both songs
+5. The volume/mixer view only appears once **both** songs have finished separating
+
+Set a new target and click the button again any time afterward (now labeled "Process All Changes") to reprocess the already-separated stems to a different BPM/Key — it always starts fresh from the originally-detected values, not from wherever the last reprocess left off.
 
 ### 4. Mix in Real-Time
-(Previously step 5) After processing:
+After processing:
 - **Advanced Beat Alignment:**
   - **Magnetic Snap Beat Offset** — drag slider (0-32 bars, 0.05 bar fine-tune increments):
     - Slider automatically snaps to the nearest whole bar
@@ -172,10 +169,8 @@ The **"Process All Changes" button is enabled** only when BPM or Key has changed
 
 ### 5. Download
 Download your results:
-- **Original Stems** — 9 stems at auto-detected BPM/Key (before beatmatching)
-  - Vocals, Kick, Snare, Hi-Hat, Tom, Bass, Guitar, Piano, Other
-- **Processed Stems** — 9 stems beatmatched + transposed with verified output BPM
-- **Beatgrid-Aligned Stems** (optional) — pre-alignment backup if you used beatgrid correction
+- **"Download Stems"** — one ZIP, one folder per song (named with its current BPM/Key), containing every stem that song has right now: the 9 main stems (Vocals, Kick, Snare, Hi-Hat, Tom, Bass, Guitar, Piano, Other) plus the bonus/reference byproducts (see Downloads & Exports above) plus any restoration backups
+- **Beatgrid-Aligned Stems** (optional) — pre-alignment backup if you used beatgrid correction, downloaded separately
 - **Final Mix** — all stems combined with your volume settings and crossfader position
 
 All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable) plus ID3 tags (TITLE, BPM, KEY).
@@ -183,7 +178,7 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 ![Processing and download section](docs/images/06-processing-and-download.png)
 *Figure 6 — The processing progress bar and download buttons for stems and the final mix.*
 
-- **Clean and Reset** — once you're done, one button deletes the generated audio files on the server and resets the whole UI so you can start over with new songs
+- **Clean and Reset** — one button deletes the generated audio files (and the separation cache) on the server, and resets the whole UI so you can start over with new songs
 
 ---
 
@@ -210,25 +205,27 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 - **Real-Time Processing Logs** — unified log system with streaming updates
 - **API Endpoints:**
   - `POST /api/upload-audio` — upload a song and convert it to WAV
-  - `POST /api/process-song` — run the chosen mode (as-is / align beatgrid / snap to Song 1), analyze BPM/key, separate into 9 stems (multi-engine pipeline)
+  - `POST /api/analyze-song` — fast (seconds): run the chosen mode's align/snap step, then analyze BPM/key — no separation yet
+  - `POST /api/process-song` — separate stems from an already-analyzed WAV at its own detected BPM/Key ("process as is")
+  - `POST /api/process-stems` — beatmatch/transpose the full song to a shared target BPM/Key, then separate — used both for the very first separation (if a target was set) and to reprocess later
+  - `POST /api/restore-stem` — apply or revert denoise + de-reverb restoration for one stem on demand (vocals only in the UI)
   - `GET /api/process-status` — returns current processing progress (0-100%), current stage, and real-time log messages
-  - `POST /api/process-stems` — process full song (beatmatch + transpose) then re-separate into 9 stems (via multi-engine pipeline)
   - `POST /api/render-final-mix` — mix all 9 stems into the final lossless WAV, with an ACID chunk + ID3 tags
-  - `POST /api/download-stems-zip` — download original or processed 9 stems as tagged WAV in a ZIP
+  - `POST /api/download-stems-zip` — download every generated stem for both songs as tagged WAV in a ZIP, one folder per song
   - `POST /api/download-unaligned-stems` — download the pre-alignment 9 stems as tagged WAV in a ZIP
   - `GET /api/download-file/<filename>` — download single audio file
   - `GET /api/audio/<path>` — serve individual audio files
   - `GET /api/audio-stats` — audio level/statistics for a file
   - `POST /api/split-drums` — split a drums stem into kick/snare/hihat/tom
-  - `POST /api/cleanup` — delete all generated audio files (used by "Clean and Reset")
+  - `POST /api/cleanup` — delete all generated audio files and the stem-separation cache (used by "Clean and Reset")
 
 ### Audio Processing Core (Python)
 - **Multi-Engine Stem Separation Pipeline (9 stems):**
-  - **Mel-Band RoFormer** (12.6 dB SDR) — lead vocals
+  - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged) — lead vocals
   - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
   - **MDX23C DrumSep** (SOTA) — kick, snare from drums stem
   - **Frequency filtering** — hi-hat, tom (fallback)
-  - **Denoise + De-Reverb** (Mel-Band Roformer, 27.99 / 19.17 dB SDR) — artifact removal and quality enhancement
+  - **Denoise + De-Reverb** (Mel-Band Roformer, 27.99 / 19.17 dB SDR) — opt-in per stem (vocals only), applied on demand rather than during separation
 - **Essentia** — BPM/beat-grid detection (`RhythmExtractor2013`) and key detection (`KeyExtractor`)
 - **FFmpeg** — tempo-stretching, pitch-shifting, spectral filtering, final mix rendering
 - **RubberBand** — per-beat beatgrid warping (align/snap modes) and optional higher-quality time-stretching (Pass 2+)
@@ -264,7 +261,7 @@ DualSync-Pro/
 - **Python 3.10+** (3.12+ recommended)
 - **Node.js 16+** (for React frontend)
 - **FFmpeg** (for audio processing)
-- **Internet connection** (first run downloads Demucs AI model ~500MB)
+- **Internet connection** (first run downloads Demucs ~500MB, plus the audio-separator vocal/drum/restoration models ~3GB — both cached persistently afterward)
 
 ### Clone the Repository
 
@@ -301,7 +298,8 @@ This installs:
 - Flask & Flask-CORS (web server)
 - Librosa (BPM detection)
 - Essentia (key detection fallback)
-- Demucs (stem separation)
+- Demucs (bass/guitar/piano/other/drums separation)
+- audio-separator + onnxruntime (vocal-model ensemble, DrumSep, denoise + de-reverb restoration)
 - Mutagen (FLAC metadata)
 - (Optional) RubberBand for higher-quality time-stretching
 
@@ -430,39 +428,36 @@ pip install -r requirements.txt --no-build-isolation
 ## Basic Workflow
 
 1. **Upload Song 1** — drag-and-drop MP3 or click upload area
-   - Real-time log shows: uploading → analyzing → separating → splitting drums
-   - Automatic stem separation (4 stems from Demucs)
-   - Automatic drum splitting (4→7 stems with kick/snare/hihat/tom)
-   - BPM (5-pass detection) and key auto-detected
-2. **Upload Song 2** — same as Song 1
-   - Parallel processing (doesn't wait for Song 1)
-3. **Choose alignment mode per song** — process as-is, align beatgrid, or (Song 2) snap to Song 1
+2. **Upload Song 2** — same as Song 1 (independent, doesn't wait for Song 1)
+3. **Choose alignment mode per song** — process as-is, align beatgrid, or (Song 2, once Song 1 is analyzed) snap to Song 1
+   - This triggers the fast analysis step (seconds): BPM (5-pass detection) and key auto-detected, no separation yet
 4. **Review metadata** — check detected BPM/key for each song, and how much grid correction was applied
 5. **Optional overrides:**
    - Change target BPM (if auto-detection is wrong)
    - Change target key (from dropdown)
    - Pick one of the Camelot Wheel recommended keys
-6. **Click "Process All Changes"** — beatmatch + transpose in one step (animated progress bar + live logs)
-   - Real-time log shows: loading → beatmatching → transposing → separating → copying stems
-   - Wait for completion (progress bar → 100%)
+6. **Once both songs are analyzed, click the button** (reads "Process as is" or "Process with Target BPM/Key", whichever applies) — kicks off stem separation for both songs **in parallel**
+   - Real-time log shows every stage as it happens for both songs
+   - The volume/mixer view appears once both songs have finished
 7. **Mix in real-time:**
-   - Adjust 7 stem volumes independently for each song
+   - Adjust 9 stem volumes independently for each song
+   - Toggle denoise + de-reverb restoration per vocals stem if you want it
    - Use crossfader to blend between songs
    - Fine-tune beat offset (up to 32 bars) and/or enable live drift correction
    - Play/Pause and scrub timeline
-8. **Download:**
-   - Original Stems (ZIP with 14 tagged WAV files: 7 stems × 2 songs at detected BPM/Key)
-   - Processed Stems (ZIP with 7 beatmatched+transposed tagged WAV files per song)
+8. **Reprocess anytime** — set a new target BPM/Key and click the button again (now labeled "Process All Changes") to beatmatch/transpose the already-separated stems
+9. **Download:**
+   - Download Stems (ZIP, one folder per song with every stem it has, including bonus/reference stems)
    - Final Mix (single tagged WAV file with all stems mixed at your volume settings)
-9. **Clean and Reset** — clear generated files and start over
+10. **Clean and Reset** — clear generated files (and the separation cache) and start over
 
 ---
 
 ## Key Concepts
 
 ### BPM Detection & Beatmatching
-- **Detection:** Essentia's `RhythmExtractor2013` analyzes each song's beat positions and BPM
-- **Beatmatching:** FFmpeg tempo-stretching aligns Song 2 to Song 1 (or both to target)
+- **Detection:** Essentia's `RhythmExtractor2013` analyzes each song's beat positions and BPM, in seconds, before any separation
+- **Beatmatching:** FFmpeg tempo-stretching aligns both songs to a shared target BPM
 - **Verification:** Output BPM is measured after each pass; if off by >±10 BPM, another pass is applied
 - **Filenames:** Show actual measured output BPM, not target BPM (e.g., if target=112, output might be 111.8)
 
@@ -477,69 +472,70 @@ pip install -r requirements.txt --no-build-isolation
 - Returns up to 5 ranked suggestions, each showing a quality label/emoji, and the exact Camelot code + semitone shift needed per song
 - Detects when the two songs are already harmonically compatible (same/relative/adjacent Camelot code) and shows a "✅ No change needed" banner instead
 
-### Process Buttons
-- **Process BPM button** — DISABLED until target BPM changes from last processed value
-- **Process Key button** — DISABLED until target key changes from last processed value
+### The Process Button
+- One button, labeled "Process as is" or "Process with Target BPM/Key" depending on whether a target is set — enabled once both songs are analyzed, or (post-separation) once BPM/Key changed from the last processed value
 - **All controls** — locked during processing (can't change volumes, crossfader, etc.)
 
 ---
 
 ## File Naming Examples
 
-### Original Stems (Auto-Detected, 7 Stems with Auto-Split Drums)
+### Main Stems (9-Stem Multi-Engine Mode)
 ```
-Part3-Venus-96-C-vocals.wav          # 96 BPM, Key C
-Part3-Venus-96-C-kick.wav            # Auto-split drum components
+Part3-Venus-96-C-vocals.wav          # 96 BPM, Key C -- vocal-model ensemble
+Part3-Venus-96-C-kick.wav            # MDX23C DrumSep (ML)
 Part3-Venus-96-C-snare.wav
-Part3-Venus-96-C-hihat.wav
+Part3-Venus-96-C-hihat.wav           # Frequency-filtered (no ML model)
 Part3-Venus-96-C-tom.wav
 Part3-Venus-96-C-bass.wav
+Part3-Venus-96-C-guitar.wav
+Part3-Venus-96-C-piano.wav
 Part3-Venus-96-C-other.wav
 ```
+Whatever BPM/Key is shown is the song's **current** state -- its own detected
+values if processed "as is", or the shared target if beatmatched/transposed.
 
-### Processed Stems (Beatmatched, Measured Output, 7 Stems)
+### Bonus/Reference Stems (included in "Download Stems" for free)
 ```
-Part3-Venus-111.8-F-vocals.wav       # Actual measured output: 111.8 BPM, Key F
-Part3-Venus-111.8-F-kick.wav         # All 7 stems after beatmatching + transposition
-Part3-Venus-111.8-F-snare.wav
-Part3-Venus-111.8-F-hihat.wav
-Part3-Venus-111.8-F-tom.wav
-Part3-Venus-111.8-F-bass.wav
-Part3-Venus-111.8-F-other.wav
+Part3-Venus-96-C-extra_vocals_melband_roformer.wav     # one ensemble model alone
+Part3-Venus-96-C-extra_instrumental_melband_roformer.wav
+Part3-Venus-96-C-extra_vocals_bs_roformer.wav           # the other ensemble model alone
+Part3-Venus-96-C-extra_instrumental_bs_roformer.wav
+Part3-Venus-96-C-extra_vocals_demucs.wav                # Demucs' own (unused) vocals
 ```
 
 ### With Manual BPM Override
 ```
 Part3-Venus-112-manual-111.8-measured-F-vocals.wav
 # Target: 112 BPM, Measured output: 111.8 BPM, Key: F
-# (applies to all 7 stems)
 ```
 
 ---
 
 ## Output Directory Structure
 
-All generated files are stored in `Audio/` folder with timestamps:
+All generated files are stored in `Audio/` folder with timestamps (git-ignored),
+plus a separate stem-separation cache:
 
 ```
 Audio/
 ├── stems/
-│   ├── [timestamp]/                    # Original stems per upload
-│   │   ├── Song1_vocals.wav
-│   │   ├── Song1_drums.wav
-│   │   ├── Song1_bass.wav
-│   │   ├── Song1_other.wav
-│   │   ├── Song2_vocals.wav
-│   │   └── ... (Song 2 stems)
-│
-├── processed/
-│   ├── [timestamp]/                    # Beatmatched stems per session
-│   │   ├── vocals_beatmatched_transposed.wav
-│   │   ├── drums_beatmatched_transposed.wav
-│   │   ├── bass_beatmatched_transposed.wav
-│   │   └── other_beatmatched_transposed.wav
-│
-└── [timestamp]_final_mix.wav           # Final stereo mix with ACID chunk + ID3 tags
+│   └── [timestamp]/                          # Every stem for one processed song
+│       ├── vocals.wav                        # 9 main stems ...
+│       ├── kick.wav                          # ... (snare, hihat, tom, bass, guitar, piano, other)
+│       ├── vocals_original.wav               # pre-restoration backup (restore-stem toggle)
+│       ├── vocals_restored.wav               # cached restored version, if ever toggled on
+│       ├── extra_vocals_melband_roformer.wav # bonus/reference stems ...
+│       ├── extra_instrumental_melband_roformer.wav
+│       ├── extra_vocals_bs_roformer.wav
+│       ├── extra_instrumental_bs_roformer.wav
+│       └── extra_vocals_demucs.wav
+├── renders/
+│   └── [timestamp]_final_mix.wav             # Final stereo mix with ACID chunk + ID3 tags
+└── ...                                       # Uploaded/aligned WAVs, download ZIPs
+
+separated_stems/
+└── [hash]/                             # Per-song separation cache (cleared by "Clean and Reset")
 ```
 
 Downloaded files are lossless WAV with embedded metadata:
@@ -556,7 +552,8 @@ See `requirements.txt` for complete Python dependencies. Key packages:
 - **Flask** — REST API server
 - **librosa** — BPM detection and audio analysis
 - **essentia** — BPM, beat-grid, and key detection
-- **demucs** — AI stem separation
+- **demucs** — bass/guitar/piano/other/drums separation
+- **audio-separator** + **onnxruntime** — vocal-model ensemble, DrumSep, denoise + de-reverb restoration
 - **mutagen** — WAV/ID3 metadata tagging
 - **pydub** — audio manipulation (optional)
 
@@ -568,15 +565,16 @@ React frontend requires Node.js 16+ with packages listed in `frontend/package.js
 
 - **Processor:** Modern CPU (Intel i5+ or AMD Ryzen 5+) recommended for real-time mixing
 - **RAM:** 8GB minimum, 16GB recommended (stem separation uses ~2-4GB per song)
-- **Storage:** 50GB+ free space (Demucs model + generated stems/mixes)
+- **Storage:** 50GB+ free space (Demucs + audio-separator models ~3.5GB total, plus generated stems/mixes)
 - **Network:** Internet required for initial Demucs model download (~500MB)
 
 ---
 
 ## Performance Notes
 
-- **First run:** Demucs model downloads (~500MB, 1-2 minutes) and caches locally
-- **Stem separation:** 2-3 minutes per song (depends on length and CPU)
+- **First run:** Demucs (~500MB) and the audio-separator models (vocal ensemble, DrumSep, denoise, de-reverb — ~3GB total) download once and are cached persistently (`~/.cache/audio-separator-models`), so this cost is paid only once, ever, not per song
+- **Analysis:** seconds — BPM/Key detection runs before any separation, so you see real detected values right away
+- **Stem separation:** ~10-15 min per song, running for both songs in parallel (restoration is no longer part of this — it's opt-in per stem afterward)
 - **Beatmatching:** 30 seconds to 2 minutes (depends on convergence)
 - **Real-time mixing:** Smooth 60+ FPS on modern browsers
 - **File downloads:** near-instant, since the final mix is written as lossless WAV directly (no lossy intermediate encode/decode step)
@@ -606,10 +604,18 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-**Last Updated:** 2026-09-13  
+**Last Updated:** 2026-09-27  
 **Current Branch:** main
 
-## Recent Improvements (2026-09-13)
+## Recent Improvements (2026-09-27)
+- ✅ Vocal quality: fixed a long-standing mismatch where the code loaded a lower-quality Karaoke model instead of the documented one, then upgraded further to an ensemble (two models, averaged) after a listening test showed it beats either model alone
+- ✅ Analyze-first flow: BPM/Key detection now runs as its own fast (seconds) step before the slow stem separation, so you see real detected values (and can override them) before choosing "process as is" vs a shared target BPM/Key
+- ✅ Both songs now separate **in parallel** once you make that choice, instead of one after another
+- ✅ Denoise + de-reverb restoration is now opt-in per stem (vocals only) via a checkbox next to the slider, instead of always running on all 9 stems during separation — cuts several minutes off every separation, and testing showed the models were hurting non-vocal stems anyway
+- ✅ "Download Stems" now includes every generated stem in one folder per song (named with its current BPM/Key), including bonus/reference stems that were already being generated and thrown away — no more separate, identical "original" vs "processed" downloads
+- ✅ "Clean and Reset" now also clears the stem-separation cache, not just uploaded/generated audio (downloaded model weights are left alone)
+
+## Earlier Improvements (2026-09-13)
 - ✅ Per-song alignment modes on upload: process as-is, align beatgrid, or snap Song 2's beat grid to Song 1
 - ✅ Camelot Wheel key recommendations (up to 5 ranked suggestions, harmonic-compatibility detection)
 - ✅ Beat offset extended to 32 bars with a properly-scaled magnetic-snap slider and matching waveform zoom
