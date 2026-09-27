@@ -308,8 +308,12 @@ def process_song():
         serve_dir = audio_dir / 'stems'
         serve_dir.mkdir(exist_ok=True)
 
-        # Use timestamp to avoid conflicts
-        timestamp = str(int(time.time() * 1000))
+        # Use timestamp to avoid conflicts -- suffixed with the slot number
+        # since both songs now separate in parallel (see DualMixer.jsx's
+        # handleStartProcessing), so two requests landing in the same
+        # millisecond would otherwise collide on the same directory and
+        # silently overwrite each other's stems.
+        timestamp = f"{int(time.time() * 1000)}_{slot}"
         session_dir = serve_dir / timestamp
         session_dir.mkdir(exist_ok=True)
 

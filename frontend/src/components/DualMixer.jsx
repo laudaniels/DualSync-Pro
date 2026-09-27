@@ -383,7 +383,12 @@ export default function DualMixer() {
     const meta = metadata[slot];
     const sourceBpm = getEffectiveBpm(slot);
     const sourceKey = getEffectiveKey(slot);
-    const timestamp = Date.now().toString();
+    // Suffixed with the slot number: both songs separate in parallel (see
+    // handleStartProcessing), and this runs synchronously up to the fetch
+    // call below, so two slots can easily generate the exact same
+    // Date.now() millisecond -- without the suffix, they'd collide on the
+    // same served directory and end up serving/showing each other's stems.
+    const timestamp = `${Date.now()}_${slot}`;
 
     const response = await fetch('/api/process-stems', {
       method: 'POST',
