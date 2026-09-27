@@ -15,6 +15,7 @@ function SongMixer({
   metadata,
   hasStems,
   revealVolumes,
+  bothAnalyzed,
   loadProgress,
   loading,
   editingBpm,
@@ -25,6 +26,9 @@ function SongMixer({
   effectiveKey,
   scale,
   volumes,
+  restoredStems,
+  restoringStem,
+  playing,
   stemNames,
   audioReady,
   pendingSong,
@@ -37,20 +41,22 @@ function SongMixer({
   onToggleEditingKey,
   onFileDropped,
   onChooseMode,
-  onVolumeChange
+  onVolumeChange,
+  onToggleRestoration
 }) {
   const songName = metadata?.filename?.replace(/\.[^/.]+$/, '') || `Song ${slot + 1}`;
   // BPM/Key already known from the fast analyze step, whether or not stems
   // exist yet -- drives showing the detected-info block and (pre-stems)
   // which "not ready yet" sub-state to render below.
   const analyzed = metadata?.bpm != null;
-  // True only while THIS song's real (slow) stem separation is actually in
-  // flight, as opposed to the earlier fast align/analyze call -- both set
-  // `loading`, so `processingStage` disambiguates which one is running.
-  const separating = loading && processingStage === 'separating';
+  // Once both songs are analyzed and the Processing section takes over
+  // (see the `bothAnalyzed` box below), this card no longer has an upload
+  // box, spinner, or sliders to show -- just the header + detected info --
+  // so its normal fixed min-height would leave a lot of dead space.
+  const collapsed = !hasStems && analyzed && bothAnalyzed;
 
   return (
-    <div className="song-mixer">
+    <div className="song-mixer" style={collapsed ? { minHeight: 0 } : undefined}>
       <h3>{songName}</h3>
 
       {metadata && (
@@ -201,33 +207,33 @@ function SongMixer({
 
       {!hasStems ? (
         analyzed ? (
-          <div className="stem-loader" style={{
-            border: '6px solid #7c3aed',
-            borderRadius: '16px',
-            padding: '50px 40px',
-            textAlign: 'center',
-            background: 'rgba(124, 58, 237, 0.45)',
-            width: '100%',
-            minHeight: '350px',
-            display: 'flex',
-            flexDirection: 'column',
-            alignItems: 'center',
-            justifyContent: 'center',
-            boxSizing: 'border-box',
-            gap: '16px'
-          }}>
-            {separating ? (
-              <div className="loader">
-                <div className="spinner"></div>
-                <p>{loadProgress?.current_step || 'Separating stems... (this may take a while)'}</p>
-                <p style={{ fontSize: '11px', color: '#999' }}>See the progress bar below the process button</p>
-              </div>
-            ) : (
+          // Once both songs are analyzed, the Processing section below is
+          // enabled and becomes the single source of truth (choice, then
+          // combined progress bar) -- this box (and its "waiting"/
+          // "separating" status, whose text can run long and wrap,
+          // jittering the layout) would just be redundant with it, so it's
+          // hidden entirely rather than kept in sync with it.
+          bothAnalyzed ? null : (
+            <div className="stem-loader" style={{
+              border: '6px solid #7c3aed',
+              borderRadius: '16px',
+              padding: '50px 40px',
+              textAlign: 'center',
+              background: 'rgba(124, 58, 237, 0.45)',
+              width: '100%',
+              minHeight: '350px',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxSizing: 'border-box',
+              gap: '16px'
+            }}>
               <p style={{ color: '#ccc', fontSize: '13px' }}>
-                ✅ Analyzed — choose "process as is" or a target BPM/Key below to start processing
+                ✅ Analyzed — waiting for the other song to finish analyzing...
               </p>
-            )}
-          </div>
+            </div>
+          )
         ) : pendingSong ? (
           <div className="stem-loader" style={{
             border: '6px solid #7c3aed',
@@ -381,6 +387,26 @@ function SongMixer({
                   />
                 )}
               </div>
+              <label
+                title="Denoise + de-reverb restoration (can only be toggled while nothing is playing)"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '3px',
+                  fontSize: '11px',
+                  color: '#999',
+                  cursor: (playing || restoringStem?.[`${slot}:${stem}`]) ? 'not-allowed' : 'pointer',
+                  opacity: (playing || restoringStem?.[`${slot}:${stem}`]) ? 0.5 : 1
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!restoredStems?.[stem]}
+                  disabled={playing || !!restoringStem?.[`${slot}:${stem}`]}
+                  onChange={(e) => onToggleRestoration(slot, stem, e.target.checked)}
+                />
+                {restoringStem?.[`${slot}:${stem}`] ? '⏳' : '✨'}
+              </label>
               <input
                 type="range"
                 min="0"

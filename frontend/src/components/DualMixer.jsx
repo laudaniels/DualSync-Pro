@@ -74,6 +74,15 @@ export default function DualMixer() {
     1: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 }
   });
 
+  // Per-slot, per-stem: is denoise + de-reverb restoration currently applied
+  // (see handleToggleRestoration)? Separation itself skips restoration now
+  // -- it's opt-in per stem, toggled from a checkbox next to each slider.
+  const [restoredStems, setRestoredStems] = useState([{}, {}]);
+  // Keyed by `${slot}:${stem}` -- true while a restore/revert call for that
+  // one stem is in flight (restoring can take up to ~a minute the first
+  // time, since it's running real ML models).
+  const [restoringStem, setRestoringStem] = useState({});
+
   // Whichever stems the loaded song(s) actually have -- 7 in legacy mode, 9
   // in multi-engine mode (adds guitar/piano). Falls back to the legacy list
   // before any song has loaded stems, so nothing downstream crashes on an
@@ -425,7 +434,7 @@ export default function DualMixer() {
           ? slotsToProcess
               .map((slot, i) => slotStates[i]?.current_step && `Song ${slot + 1}: ${slotStates[i].current_step}`)
               .filter(Boolean)
-              .join('  |  ')
+              .join('\n')
           : (slotStates[0]?.current_step || '');
         if (label) setProcessingStepLabel(label);
       } catch (e) {
@@ -494,6 +503,37 @@ export default function DualMixer() {
     }));
     playerRef.current.setVolume(slot, stem, value);
   }, []);
+
+  // Apply or revert denoise + de-reverb restoration for one stem, on demand
+  // (separation itself always skips it now -- see server.py). The served
+  // URL doesn't change, only its content does, so the re-fetch below is
+  // cache-busted; the first restore of a stem takes up to ~a minute (real
+  // ML models), reverting or re-toggling back on is fast (already cached).
+  const handleToggleRestoration = async (slot, stem, restore) => {
+    const key = `${slot}:${stem}`;
+    setRestoringStem(prev => ({ ...prev, [key]: true }));
+    try {
+      const response = await fetch('/api/restore-stem', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timestamp: metadata[slot]?.timestamp, stem, restore, slot })
+      });
+      const data = await response.json();
+      if (!response.ok || !data.url) throw new Error(data.error || `Server error: ${response.status}`);
+
+      await playerRef.current.loadStem(slot, stem, `${data.url}?v=${Date.now()}`);
+      setRestoredStems(prev => {
+        const updated = [...prev];
+        updated[slot] = { ...updated[slot], [stem]: restore };
+        return updated;
+      });
+    } catch (err) {
+      console.error(`Restore toggle failed for Song ${slot + 1} ${stem}:`, err);
+      setError(`Could not ${restore ? 'restore' : 'revert'} ${stem}: ${err.message}`);
+    } finally {
+      setRestoringStem(prev => { const updated = { ...prev }; delete updated[key]; return updated; });
+    }
+  };
 
   // Update crossfader
   const handleCrossfaderChange = (value) => {
@@ -1007,6 +1047,8 @@ export default function DualMixer() {
           0: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 },
           1: { vocals: 1.0, kick: 1.0, snare: 1.0, hihat: 1.0, tom: 1.0, bass: 1.0, other: 1.0 }
         });
+        setRestoredStems([{}, {}]);
+        setRestoringStem({});
         setCrossfader(50);
         setDownloadingKey(null);
 
@@ -1060,6 +1102,7 @@ export default function DualMixer() {
               metadata={metadata[slot]}
               hasStems={!!stems[slot]}
               revealVolumes={bothStemsReady}
+              bothAnalyzed={bothAnalyzed}
               loadProgress={initialLoadSlots[slot]}
               loading={loading[slot]}
               editingBpm={editingBpm[slot]}
@@ -1070,6 +1113,9 @@ export default function DualMixer() {
               effectiveKey={getEffectiveKey(slot)}
               scale={getEffectiveScale(slot)}
               volumes={volumes[slot]}
+              restoredStems={restoredStems[slot]}
+              restoringStem={restoringStem}
+              playing={playing}
               stemNames={stems[slot] ? orderStems(Object.keys(stems[slot])) : []}
               audioReady={audioReady[slot]}
               pendingSong={pendingSong[slot]}
@@ -1083,6 +1129,7 @@ export default function DualMixer() {
               onFileDropped={handleFileDropped}
               onChooseMode={handleChooseMode}
               onVolumeChange={handleVolumeChange}
+              onToggleRestoration={handleToggleRestoration}
             />
           ))}
         </div>
@@ -1437,7 +1484,7 @@ export default function DualMixer() {
             {isProcessing && (
               <>
                 {processingStepLabel && (
-                  <div style={{ fontSize: '12px', color: '#94a3b8', margin: '6px 0 4px' }}>
+                  <div style={{ fontSize: '12px', color: '#94a3b8', margin: '6px 0 4px', whiteSpace: 'pre-line' }}>
                     {processingStepLabel}
                   </div>
                 )}

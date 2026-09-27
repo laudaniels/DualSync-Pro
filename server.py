@@ -277,7 +277,7 @@ def process_song():
         use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
 
         if use_multi_engine:
-            add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep + ML restoration)...", slot)
+            add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep)...", slot)
         else:
             add_log_message("🔊 Separating stems using Demucs AI...", slot)
 
@@ -295,7 +295,13 @@ def process_song():
                 add_log_message(f"  {label}", slot)
                 last_reported_label = label
 
+        # Restoration (denoise + de-reverb) is opt-in per stem now, applied
+        # on demand from the mixer via /api/restore-stem -- skipping it here
+        # cuts several minutes off this endpoint, and every stem this
+        # produces is kept as <stem>_original.wav below so that later restore
+        # (and reverting it) never needs to re-separate from scratch.
         stem_dict = engine.separate_stems([str(file_path)], use_multi_engine=use_multi_engine,
+                                           use_restoration=False,
                                            progress_callback=_on_separation_progress)[0]
 
         # Copy stems to a simple location for serving
@@ -312,9 +318,13 @@ def process_song():
         add_log_message("📦 Copying stems to server...", slot)
         for stem_name, stem_path in stem_dict.items():
             if Path(stem_path).exists():
-                # Copy to serve directory
+                # Copy to serve directory, plus an untouched backup that
+                # /api/restore-stem reverts to (the *_original.wav is never
+                # overwritten again; <stem>.wav is whichever version -- as-is
+                # or restored -- is currently "active" and actually served).
                 dest_path = session_dir / f"{stem_name}.wav"
                 shutil.copy2(stem_path, str(dest_path))
+                shutil.copy2(stem_path, str(session_dir / f"{stem_name}_original.wav"))
                 stems[stem_name] = f"/api/audio/{timestamp}/{stem_name}.wav"
                 add_log_message(f"  ✅ {stem_name.capitalize()}", slot)
             else:
@@ -603,7 +613,11 @@ def process_stems():
                 add_log_message(f"  {label}", slot)
                 last_reported_label = label
 
+        # Restoration is opt-in per stem now, applied on demand from the
+        # mixer via /api/restore-stem -- see the matching comment in
+        # /api/process-song.
         stem_dict = engine.separate_stems([str(current_input)], use_multi_engine=use_multi_engine,
+                                           use_restoration=False,
                                            progress_callback=_on_separation_progress)[0]
 
         # Copy processed stems to serve directory
@@ -618,9 +632,12 @@ def process_stems():
         for stem in stem_dict.keys():
             stem_path = stem_dict.get(stem)
             if stem_path and Path(stem_path).exists():
-                # Copy processed stem to serve directory
+                # Copy processed stem to serve directory, plus an untouched
+                # backup for /api/restore-stem to revert to (see
+                # /api/process-song for the full explanation).
                 dest_path = stems_dir / f"{stem}.wav"
                 shutil.copy2(str(stem_path), str(dest_path))
+                shutil.copy2(str(stem_path), str(stems_dir / f"{stem}_original.wav"))
                 processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
                 add_log_message(f"  ✅ {stem.capitalize()}", slot)
             else:
@@ -646,6 +663,77 @@ def process_stems():
         logging.error(f"Process error: {e}", exc_info=True)
         _set_slot_state(slot, progress=0, status='error')
         return jsonify({'error': f'Processing failed: {str(e)}'}), 500
+
+
+@app.route('/api/restore-stem', methods=['POST'])
+def restore_stem():
+    """Apply (or revert) denoise + de-reverb restoration to a single
+    already-separated stem, on demand from the mixer's per-stem checkbox --
+    initial separation skips restoration entirely now (see the
+    use_restoration=False calls above), so this is the only place it
+    actually runs, and only for whichever stem(s) the user opts into.
+
+    The first time a stem is restored, the result is cached alongside it
+    (<stem>_restored.wav) so toggling it off and back on again is instant
+    rather than re-running the ML models."""
+    data = request.json or {}
+    timestamp = data.get('timestamp')
+    stem = data.get('stem')
+    restore = bool(data.get('restore'))
+    slot = data.get('slot', 0)
+
+    if not timestamp or not stem:
+        return jsonify({'error': 'Missing timestamp or stem'}), 400
+
+    try:
+        import shutil
+        from mashup_engine import MashupEngine
+
+        stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamp
+        original_path = stems_dir / f"{stem}_original.wav"
+        active_path = stems_dir / f"{stem}.wav"
+        restored_path = stems_dir / f"{stem}_restored.wav"
+
+        if not original_path.exists():
+            return jsonify({'error': f'No original backup found for "{stem}" -- was this song separated before per-stem restore was added?'}), 400
+
+        if not restore:
+            _set_slot_state(slot, status='processing', progress=50, current_step=f'↩️ Reverting {stem} to original')
+            shutil.copy2(str(original_path), str(active_path))
+            _set_slot_state(slot, progress=100, current_step='✅ Complete', status='success')
+            add_log_message(f"↩️ Reverted {stem} to original", slot)
+            return jsonify({'status': 'success', 'url': f"/api/audio/{timestamp}/{stem}.wav", 'restored': False})
+
+        if restored_path.exists():
+            _set_slot_state(slot, status='processing', progress=50, current_step=f'✨ Applying cached restoration to {stem}')
+            shutil.copy2(str(restored_path), str(active_path))
+            _set_slot_state(slot, progress=100, current_step='✅ Complete', status='success')
+            add_log_message(f"✨ Restored {stem} (cached)", slot)
+            return jsonify({'status': 'success', 'url': f"/api/audio/{timestamp}/{stem}.wav", 'restored': True})
+
+        _set_slot_state(slot, status='processing', progress=10, current_step=f'✨ Restoring {stem}: loading models')
+        add_log_message(f"✨ Restoring {stem} (denoise + de-reverb)...", slot)
+
+        def _on_progress(fraction, label):
+            _set_slot_state(slot, progress=10 + round(fraction * 80), current_step=label)
+
+        engine = MashupEngine()
+        restored = engine._apply_hifi_restoration({stem: str(original_path)}, str(stems_dir),
+                                                    progress_callback=_on_progress)
+        restored_file = restored.get(stem)
+        if not restored_file or not Path(restored_file).exists():
+            raise RuntimeError('Restoration did not produce an output file')
+
+        shutil.copy2(str(restored_file), str(restored_path))
+        shutil.copy2(str(restored_file), str(active_path))
+
+        _set_slot_state(slot, progress=100, current_step='✅ Complete', status='success')
+        add_log_message(f"✨ Restored {stem}", slot)
+        return jsonify({'status': 'success', 'url': f"/api/audio/{timestamp}/{stem}.wav", 'restored': True})
+    except Exception as e:
+        logging.error(f"Stem restoration failed: {e}", exc_info=True)
+        _set_slot_state(slot, progress=0, status='error')
+        return jsonify({'error': f'Restoration failed: {str(e)}'}), 500
 
 
 @app.route('/api/split-drums', methods=['POST'])
