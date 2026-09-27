@@ -1075,11 +1075,9 @@ export default function DualMixer() {
   };
 
   // Whether the "original" stems download is actually aligned stems (or a
-  // mix of both, across the two songs) -- purely for the button label.
+  // Whether the "Unaligned Originals" button should show at all.
   const slotsWithStems = [0, 1].filter(slot => stems[slot]);
   const anySlotAligned = slotsWithStems.some(slot => metadata[slot]?.mode === 'align');
-  const allSlotsAligned = slotsWithStems.length > 0 && slotsWithStems.every(slot => metadata[slot]?.mode === 'align');
-  const originalStemsLabel = allSlotsAligned ? 'Aligned Stems' : anySlotAligned ? 'Original/Aligned Stems' : 'Original Stems';
   const keyRecommendations = getKeyRecommendationsList();
   const ownCompatibility = getOwnCompatibility();
   // Song 1's bpm/beat_anchor are known as soon as it's analyzed (seconds),
@@ -1681,10 +1679,12 @@ export default function DualMixer() {
           }}>
             <h4 style={{ margin: '0 0 15px 0', color: '#6366f1' }}>📥 Downloads</h4>
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', justifyContent: 'center' }}>
-              {/* Download Original (or Aligned, if that's what was actually
-                  separated) Stems -- once a song is processed with 'align',
-                  the stems here ARE the aligned ones; there's no separate
-                  unaligned copy unless the button below is used. */}
+              {/* Download Stems -- every generated stem for both songs, one
+                  folder per song labeled with its current BPM/Key: the 9
+                  main stems, the vocal ensemble's individual-model
+                  byproducts, Demucs' own unused vocals, and restore-toggle
+                  copies if any -- see download_stems_zip's docstring for
+                  the full list and what's deliberately left out. */}
               <button
                 onClick={() => {
                   const timestamps = metadata.map(m => m?.timestamp).filter(Boolean);
@@ -1703,11 +1703,9 @@ export default function DualMixer() {
                     beat_anchor: m.beat_anchor
                   } : null);
 
-                  handleDownload('original', '/api/download-stems-zip', {
+                  handleDownload('stems', '/api/download-stems-zip', {
                     timestamps,
-                    metadata: metadataList,
-                    include_original: true,
-                    include_processed: false
+                    metadata: metadataList
                   });
                 }}
                 disabled={downloadingKey !== null}
@@ -1723,7 +1721,7 @@ export default function DualMixer() {
                   fontWeight: 'bold'
                 }}
               >
-                {downloadingKey === 'original' ? '⏳ Preparing ZIP...' : `📦 ${originalStemsLabel}`}
+                {downloadingKey === 'stems' ? '⏳ Preparing ZIP...' : '📦 Download Stems'}
               </button>
 
               {/* Download Unaligned Originals -- on request only: re-runs
@@ -1762,58 +1760,6 @@ export default function DualMixer() {
                   }}
                 >
                   {downloadingKey === 'unaligned' ? '⏳ Separating + preparing ZIP...' : '📦 Unaligned Originals'}
-                </button>
-              )}
-
-              {/* Download Processed Stems */}
-              {(transposedStems[0] || transposedStems[1] || beatmatchedStems[0] || beatmatchedStems[1]) && (
-                <button
-                  onClick={() => {
-                    const timestamps = metadata.map(m => m?.timestamp).filter(Boolean);
-                    if (!timestamps.length) {
-                      alert('No stems to download');
-                      return;
-                    }
-                    const metadataList = metadata.map(m => {
-                      if (!m) return null;
-                      // These stems were beatmatched to the target BPM, which
-                      // uniformly time-stretches the whole file -- the
-                      // originally-detected anchor's absolute position must be
-                      // scaled by the same ratio, or its markers land off-beat
-                      // (same formula already used for the Waveform beat grid).
-                      const currentBpm = m.currentBpm ?? m.detectedBpm ?? m.bpm;
-                      const scaledAnchor = (m.beat_anchor != null && m.detectedBpm && currentBpm)
-                        ? m.beat_anchor * (m.detectedBpm / currentBpm)
-                        : m.beat_anchor;
-                      return {
-                        filename: m.filename,
-                        bpm: generateBpmLabel(m, true),
-                        key: targetKey || m.key,
-                        beat_anchor: scaledAnchor
-                      };
-                    });
-
-                    handleDownload('processed', '/api/download-stems-zip', {
-                      timestamps,
-                      metadata: metadataList,
-                      include_original: false,
-                      include_processed: true
-                    });
-                  }}
-                  disabled={downloadingKey !== null}
-                  style={{
-                    background: 'rgba(139, 92, 246, 0.2)',
-                    color: '#c4b5fd',
-                    border: '1px solid #8b5cf6',
-                    padding: '10px 16px',
-                    borderRadius: '6px',
-                    cursor: downloadingKey !== null ? 'not-allowed' : 'pointer',
-                    opacity: downloadingKey !== null ? 0.5 : 1,
-                    fontSize: '12px',
-                    fontWeight: 'bold'
-                  }}
-                >
-                  {downloadingKey === 'processed' ? '⏳ Preparing ZIP...' : '📦 Processed Stems'}
                 </button>
               )}
 

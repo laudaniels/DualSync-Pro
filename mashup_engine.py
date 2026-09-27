@@ -1568,6 +1568,7 @@ class MashupEngine:
             logging.info(f"📊 [STAGE 1] Parallel vocal + multi-instrument extraction...")
 
             vocals_path = None
+            vocals_bonus = None
             demucs_stems = None
 
             vocals_lock = threading.Lock()
@@ -1601,14 +1602,15 @@ class MashupEngine:
                 _report_stage1()
 
             def extract_vocals():
-                nonlocal vocals_path
+                nonlocal vocals_path, vocals_bonus
                 try:
                     logging.info(f"  🎤 Vocal model ensemble: extracting vocals...")
                     with _report_audio_separator_progress("Vocals", _set_vocals_status):
-                        v = self._separate_vocals_karaoke(str(song), str(song_out_dir))
+                        v, bonus = self._separate_vocals_karaoke(str(song), str(song_out_dir))
                     _set_vocals_status("Vocals: done")
                     with vocals_lock:
                         vocals_path = v
+                        vocals_bonus = bonus
                     logging.info(f"  ✅ Vocals extracted")
                 except Exception as e:
                     logging.error(f"  ❌ Vocal separation failed: {e}")
@@ -1692,6 +1694,21 @@ class MashupEngine:
                     logging.warning(f"  ⚠️  Restoration skipped: {e}")
 
             self._conform_stem_lengths(final_stems)
+
+            # Bonus/reference stems generated as byproducts above, never
+            # used in the main mix but kept for download rather than thrown
+            # away: the ensemble's own two individual models' vocals +
+            # instrumental outputs, and Demucs' own (unused) vocals stem.
+            # Not conformed to a common length like final_stems above --
+            # these are reference material, not meant for sample-aligned
+            # mixing. Stashed under a dunder key so callers can pop it off
+            # before treating the rest of this dict as real stem paths.
+            bonus_stems = dict(vocals_bonus or {})
+            demucs_vocals = demucs_stems.get('vocals')
+            if demucs_vocals and Path(demucs_vocals).is_file():
+                bonus_stems['vocals_demucs'] = demucs_vocals
+            final_stems['__bonus__'] = bonus_stems
+
             results.append(final_stems)
             report(1.0, "Stems ready")
             logging.info(f"✅ Song {song_idx + 1} complete: 9 stems ready\n")
@@ -1706,7 +1723,13 @@ class MashupEngine:
     # either alone, with BS-Roformer the stronger of the two individually.
     # A known technique (UVR's "Ensemble Mode") -- different architectures
     # make different mistakes, so averaging smooths those out.
-    _ENSEMBLE_VOCAL_MODELS = ["vocals_mel_band_roformer.ckpt", "model_bs_roformer_ep_368_sdr_12.9628.ckpt"]
+    # (bonus-download slug, model filename) -- the slug names the two bonus
+    # "vocals_<slug>"/"instrumental_<slug>" downloads _separate_vocals_karaoke
+    # also produces (see below), alongside the averaged ensemble it returns.
+    _ENSEMBLE_VOCAL_MODELS = [
+        ("melband_roformer", "vocals_mel_band_roformer.ckpt"),
+        ("bs_roformer", "model_bs_roformer_ep_368_sdr_12.9628.ckpt"),
+    ]
 
     def _separate_vocals_karaoke(self, audio_path, output_dir):
         """Extract clean lead vocals as the average of two Mel-Band/BS-RoFormer
@@ -1720,7 +1743,11 @@ class MashupEngine:
         parenthesized "(vocals)" stem marker specifically avoids silently
         picking that wrong file.
 
-        Returns: path to the vocals-only WAV (the averaged ensemble result).
+        Returns (ensemble_path, bonus_stems): the averaged ensemble result
+        (what the pipeline actually uses as 'vocals'), plus a dict of the
+        individual models' own vocals/instrumental outputs -- already
+        computed as a byproduct of the averaging, so kept as bonus
+        downloads (see /api/download-stems-zip) instead of thrown away.
         """
         import logging
         import re
@@ -1753,10 +1780,21 @@ class MashupEngine:
                 raise RuntimeError(
                     f"Could not identify the vocals file among: {[Path(p).name for p in resolved]}"
                 )
-            return vocals_matches[0]
+            # Whichever other output(s) this model produced alongside vocals
+            # (its "(other)"/"(Instrumental)" complement) -- there's normally
+            # just one, but keep this robust to a model with more than two.
+            instrumental_matches = [p for p in resolved if p not in vocals_matches]
+            return vocals_matches[0], (instrumental_matches[0] if instrumental_matches else None)
 
         try:
-            vocals_paths = [_vocals_with_model(m) for m in self._ENSEMBLE_VOCAL_MODELS]
+            bonus_stems = {}
+            vocals_paths = []
+            for slug, model_filename in self._ENSEMBLE_VOCAL_MODELS:
+                vocals_path, instrumental_path = _vocals_with_model(model_filename)
+                vocals_paths.append(vocals_path)
+                bonus_stems[f"vocals_{slug}"] = vocals_path
+                if instrumental_path:
+                    bonus_stems[f"instrumental_{slug}"] = instrumental_path
 
             audio_a, sr_a = sf.read(vocals_paths[0])
             audio_b, sr_b = sf.read(vocals_paths[1])
@@ -1767,7 +1805,7 @@ class MashupEngine:
 
             ensemble_path = str(output_dir_path / f"{Path(audio_path).stem}_(vocals)_ensemble.wav")
             sf.write(ensemble_path, ensemble, sr_a)
-            return ensemble_path
+            return ensemble_path, bonus_stems
         except Exception as e:
             logging.error(f"Vocal separation failed: {e}")
             raise RuntimeError(f"Vocal extraction failed: {str(e)[-500:]}")
@@ -1833,7 +1871,11 @@ class MashupEngine:
             raise RuntimeError(f"Demucs htdemucs_6s finished, but no stem folder was found for {Path(audio_path).name}.")
         folder = candidates[0]
 
-        stems = {name: str(folder / f"{name}.wav") for name in ("drums", "bass", "other", "guitar", "piano")}
+        # 'vocals' is Demucs' own (unused in the main mix -- the ensemble
+        # above supplies the real vocals stem) but kept as a bonus/reference
+        # download rather than thrown away, since it's already sitting right
+        # here for free.
+        stems = {name: str(folder / f"{name}.wav") for name in ("drums", "bass", "other", "guitar", "piano", "vocals")}
         missing = [name for name, path in stems.items() if not Path(path).is_file()]
         if missing:
             raise RuntimeError(f"Demucs htdemucs_6s did not create all expected stems: {', '.join(missing)}")

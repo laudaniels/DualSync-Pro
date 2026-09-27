@@ -26,11 +26,26 @@ Opens at `http://localhost:5000` (requires venv with dependencies installed).
 ### `server.py`
 - Flask backend serving React frontend from `frontend/dist`
 - REST API endpoints for audio processing:
-  - `/api/upload-audio` — upload a song and convert it to WAV
-  - `/api/process-song` — run the chosen mode ("as is" or "align beatgrid"
-    first) then analyze BPM/key and separate stems
-  - `/api/process-status` — real-time processing status
-  - `/api/render` — render mixed audio
+  - `/api/upload-audio` — upload a song, convert to WAV
+  - `/api/analyze-song` — fast (seconds): the chosen mode's align/snap step,
+    then BPM/key analysis -- no separation yet, so the frontend can show
+    detected BPM/Key (and let the user override them) before committing to
+    the slow separation below
+  - `/api/process-song` — separate stems from an already-analyzed WAV at its
+    own detected BPM/Key ("process as is")
+  - `/api/process-stems` — beatmatch/transpose the full song to a shared
+    target BPM/Key, then separate -- used both for the very first
+    separation (if a target was set) and to reprocess already-separated
+    stems later
+  - `/api/restore-stem` — apply or revert denoise + de-reverb restoration
+    for one already-separated stem on demand (vocals only in the UI)
+  - `/api/split-drums`, `/api/render-final-mix` — auxiliary drum-splitting
+    and final-mix rendering
+  - `/api/download-stems-zip`, `/api/download-unaligned-stems`,
+    `/api/download-file/<filename>` — DAW-ready export packages
+  - `/api/audio/<path>`, `/api/audio-stats`, `/api/process-status`,
+    `/api/cleanup`, `/api/health` — serving, stats, progress polling, and
+    cleanup
 - CORS enabled for frontend communication
 
 ### `mashup_engine.py`
@@ -44,6 +59,16 @@ Opens at `http://localhost:5000` (requires venv with dependencies installed).
 - React-based web interface
 - Components for mixer controls, stem management, real-time logs
 - Communicates with Flask API via REST endpoints
+
+**Per-song flow** (`DualMixer.jsx`/`SongMixer.jsx`): upload → pick
+as_is/align/snap (`/api/analyze-song`, seconds) → once **both** songs are
+analyzed, a shared "Process as is" / "Process with Target BPM/Key" button
+(label switches based on whether a target is set) kicks off separation for
+both songs **in parallel** (`/api/process-song` or `/api/process-stems`) →
+the volume/mixer view only appears once both songs have stems
+(`revealVolumes`/`bothStemsReady`). The post-mixer BPM/Key inputs stay
+available afterward to reprocess (`/api/process-stems` again, same button
+group, now labeled "Process All Changes").
 
 ## Stem Separation Modes
 
@@ -168,15 +193,28 @@ of vocals/drums finishes last)
   disabled while playing
 
 ### Download Packages
-**Includes all stems:**
-- `original/` - separated stems (aligned or unaligned)
-- `processed/` - post-mixing versions
-- ACID chunks embedded (BPM/key for DAW auto-detect)
-- Multi-engine: all 9 stems included
+**`/api/download-stems-zip` ("📦 Download Stems" button) -- one folder per
+song, named `<song>_<bpm>BPM_<key>`, with every `.wav` currently sitting in
+that song's `Audio/stems/<timestamp>/` (glob-based, not a hardcoded stem
+list):**
+- The 9 main stems
+- Bonus/reference stems (byproducts already generated for free, never
+  thrown away -- see Multi-Engine Stem Separation above): the vocal
+  ensemble's own two individual models' vocals + instrumental outputs
+  (`extra_vocals_melband_roformer`, `extra_instrumental_melband_roformer`,
+  `extra_vocals_bs_roformer`, `extra_instrumental_bs_roformer`), and
+  Demucs' own unused vocals (`extra_vocals_demucs`)
+- `<stem>_original.wav`/`<stem>_restored.wav` if that stem's restoration
+  has been toggled (see Restoration above)
+- ACID chunks embedded on every file (BPM/key for DAW auto-detect)
+- No more separate "original/" vs "processed/" folders -- a song only has
+  one current state at a time (whatever's currently active, as-is or
+  target-processed), so there was never a real second version to split
+  out; the two folders used to serve the exact same file under both labels
 
-**Beatgrid-aligned sessions:**
-- `/api/download-stems-zip` - aligned + processed stems
-- `/api/download-unaligned-stems` - pre-alignment backup (on-demand)
+**`/api/download-unaligned-stems`** - pre-alignment backup (on-demand,
+separate from the above): re-separates the pre-alignment WAV for whichever
+song(s) used "align", since that source is never separated automatically.
 
 ## Development Notes
 
@@ -190,7 +228,9 @@ of vocals/drums finishes last)
 - All generated audio goes under `Audio/` (git-ignored): uploads/aligned WAVs,
   `Audio/stems/<timestamp>/`, `Audio/renders/`, and download ZIPs
 - Separation results are cached in `separated_stems/<hash>/` (git-ignored);
-  `/api/cleanup` only clears `Audio/`, not this cache
+  `/api/cleanup` clears both this and `Audio/`, but leaves the downloaded
+  model weights under `~/.cache/audio-separator-models` alone (those are a
+  ~3GB download, not per-song generated data)
 - Requires system FFmpeg installation
 - Beat/BPM detection uses Essentia (`RhythmExtractor2013`); madmom was tried
   first historically but doesn't install in this project's environment

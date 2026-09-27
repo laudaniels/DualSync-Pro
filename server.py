@@ -313,6 +313,8 @@ def process_song():
         session_dir = serve_dir / timestamp
         session_dir.mkdir(exist_ok=True)
 
+        _copy_bonus_stems(stem_dict, session_dir)
+
         stems = {}
         _set_slot_state(slot, progress=95, current_step='📦 Copying stems')
         add_log_message("📦 Copying stems to server...", slot)
@@ -450,6 +452,23 @@ def _set_slot_state(slot, **fields):
     global _processing_state
     _processing_state['slots'].setdefault(slot, _new_slot_state())
     _processing_state['slots'][slot].update(fields)
+
+
+def _copy_bonus_stems(stem_dict, session_dir):
+    """Pop the '__bonus__' entry (see mashup_engine.py's
+    separate_stems_multi_engine) off stem_dict and copy its byproduct stems
+    -- the vocal ensemble's own individual models' vocals/instrumental
+    outputs, Demucs' own unused vocals -- into session_dir as
+    extra_<name>.wav, for /api/download-stems-zip to pick up. Deliberately
+    never added to `stems`/`processed_stems`, so they never show up as
+    mixer sliders, only as bonus downloads."""
+    import shutil
+    bonus = stem_dict.pop('__bonus__', None)
+    if not bonus:
+        return
+    for bonus_name, bonus_path in bonus.items():
+        if bonus_path and Path(bonus_path).is_file():
+            shutil.copy2(bonus_path, str(session_dir / f"extra_{bonus_name}.wav"))
 
 
 _VALID_KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -623,6 +642,8 @@ def process_stems():
         # Copy processed stems to serve directory
         stems_dir = BASE_DIR / 'Audio' / 'stems' / timestamp
         stems_dir.mkdir(parents=True, exist_ok=True)
+
+        _copy_bonus_stems(stem_dict, stems_dir)
 
         processed_stems = {}
 
@@ -966,8 +987,24 @@ def render_final_mix():
 
 @app.route('/api/download-stems-zip', methods=['POST'])
 def download_stems_zip():
-    """Download all stems as a ZIP of WAVs, each carrying an ACID chunk
-    (BPM/key) so DAWs can auto-detect tempo on import -- see _tag_stem_wav."""
+    """Download every generated stem as a ZIP, one folder per song named
+    with the BPM/Key it's currently processed at -- one folder, not an
+    "original" vs "processed" split, since a song only ever has one current
+    state at a time (this endpoint used to serve both labels from the exact
+    same file, since nothing ever wrote a *_processed.wav variant).
+
+    Includes everything actually sitting in that song's served stems
+    directory: the 9 main stems, the vocals ensemble's own byproducts
+    (individual models' vocals/instrumental outputs, Demucs' own unused
+    vocals -- see mashup_engine.py's separate_stems_multi_engine), and the
+    restore-toggle's *_original.wav/*_restored.wav copies if a stem's been
+    restored. The two low-quality frequency-filtered kick/snare fallbacks
+    split_drums() also generates are NOT in here -- they're never copied to
+    the served directory in the first place (real ML kick/snare from
+    DrumSep are used instead), so there's nothing to exclude.
+
+    Each WAV carries an ACID chunk (BPM/key) so DAWs can auto-detect tempo
+    on import -- see _tag_stem_wav."""
     data = request.json
     try:
         import zipfile
@@ -977,8 +1014,6 @@ def download_stems_zip():
 
         timestamps = data.get('timestamps')
         metadata_list = data.get('metadata', [None, None])  # [{filename, bpm, key}, ...]
-        include_original = data.get('include_original', True)
-        include_processed = data.get('include_processed', True)
 
         engine = MashupEngine()
         temp_dir = tempfile.mkdtemp()
@@ -998,49 +1033,23 @@ def download_stems_zip():
 
                 bpm = meta.get('bpm', '?')
                 key = meta.get('key', '?')
+                folder_name = f"{song_name}_{bpm}BPM_{key}"
 
                 logging.info(f"Processing slot {slot}: {song_name} ({key} {bpm}BPM)")
 
-                # Dynamically discover available stems (supports both 7-stem legacy and 9-stem advanced)
-                # Legacy priority: vocals, kick, snare, hihat, tom, bass, other
-                # Advanced stems: vocals, kick, snare, hihat, tom, bass, guitar, piano, other
-                legacy_stems = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'other']
-                advanced_stems = ['vocals', 'kick', 'snare', 'hihat', 'tom', 'bass', 'guitar', 'piano', 'other']
+                stem_files = sorted(stems_dir.glob('*.wav')) if stems_dir.is_dir() else []
+                if not stem_files:
+                    logging.warning(f"No stems found for slot {slot} at {stems_dir}")
+                    continue
 
-                # Auto-detect which stems are available
-                available_stems = []
-                for stem in advanced_stems:
-                    if (stems_dir / f"{stem}.wav").exists():
-                        available_stems.append(stem)
-
-                # Fall back to legacy if no advanced stems found
-                if not available_stems:
-                    available_stems = [s for s in legacy_stems if (stems_dir / f"{s}.wav").exists()]
-
-                if include_original:
-                    for stem in available_stems:
-                        stem_file = stems_dir / f"{stem}.wav"
-                        if stem_file.exists():
-                            wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
-                            dest_path = Path(temp_dir) / wav_name
-                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem,
-                                          beat_anchor=meta.get('beat_anchor'))
-                            zip_file.write(str(dest_path), f"original/{wav_name}")
-                            logging.debug(f"  ✓ original/{wav_name}")
-
-                if include_processed:
-                    for stem in available_stems:
-                        stem_file = stems_dir / f"{stem}_processed.wav"
-                        if not stem_file.exists():
-                            stem_file = stems_dir / f"{stem}.wav"
-
-                        if stem_file.exists():
-                            wav_name = f"{song_name}-{bpm}-{key}-{stem}.wav"
-                            dest_path = Path(temp_dir) / f"processed_{wav_name}"
-                            _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem,
-                                          beat_anchor=meta.get('beat_anchor'))
-                            zip_file.write(str(dest_path), f"processed/{wav_name}")
-                            logging.debug(f"  ✓ processed/{wav_name}")
+                for stem_file in stem_files:
+                    stem_label = stem_file.stem  # e.g. "vocals", "extra_vocals_bs_roformer"
+                    wav_name = f"{song_name}-{bpm}-{key}-{stem_label}.wav"
+                    dest_path = Path(temp_dir) / wav_name
+                    _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label,
+                                  beat_anchor=meta.get('beat_anchor'))
+                    zip_file.write(str(dest_path), f"{folder_name}/{wav_name}")
+                    logging.debug(f"  ✓ {folder_name}/{wav_name}")
 
         # Cleanup temp directory
         import shutil
@@ -1110,6 +1119,7 @@ def download_unaligned_stems():
                 import os
                 use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
                 stem_dict = engine.separate_stems([str(wav_path)], use_multi_engine=use_multi_engine)[0]
+                stem_dict.pop('__bonus__', None)
 
                 for stem_name, stem_path in stem_dict.items():
                     if not Path(stem_path).exists():
@@ -1177,18 +1187,31 @@ def download_file(filename):
 
 @app.route('/api/cleanup', methods=['POST'])
 def cleanup_audio():
-    """Clean up all generated audio files"""
+    """Clean up all generated audio files, plus the separated_stems/ cache
+    (intermediate per-model outputs, not the downloaded model weights
+    themselves -- those live under ~/.cache/audio-separator-models and stay
+    put, or every song would re-download ~3GB on its next run)."""
     try:
         import shutil
-        audio_dir = BASE_DIR / 'Audio'
+        cleaned = []
 
+        audio_dir = BASE_DIR / 'Audio'
         if audio_dir.exists():
             shutil.rmtree(str(audio_dir))
             audio_dir.mkdir(exist_ok=True)
-            logging.info("✅ Cleaned up all audio files")
-            return jsonify({'status': 'success', 'message': 'All audio files cleaned up'})
+            cleaned.append('Audio/')
+
+        stems_cache_dir = BASE_DIR / 'separated_stems'
+        if stems_cache_dir.exists():
+            shutil.rmtree(str(stems_cache_dir))
+            stems_cache_dir.mkdir(exist_ok=True)
+            cleaned.append('separated_stems/')
+
+        if cleaned:
+            logging.info(f"✅ Cleaned up: {', '.join(cleaned)}")
+            return jsonify({'status': 'success', 'message': f"Cleaned up: {', '.join(cleaned)}"})
         else:
-            return jsonify({'status': 'success', 'message': 'No audio files to clean'})
+            return jsonify({'status': 'success', 'message': 'Nothing to clean'})
     except Exception as e:
         logging.error(f"Cleanup failed: {e}", exc_info=True)
         return jsonify({'error': f'Cleanup failed: {str(e)}'}), 500
