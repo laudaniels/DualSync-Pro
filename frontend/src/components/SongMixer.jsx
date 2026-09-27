@@ -374,8 +374,19 @@ function SongMixer({
       ) : (
         <div className="stem-controls">
           <h4>🎚️ Volumes {!audioReady && <span style={{ fontWeight: 'normal', fontSize: '11px', color: '#999' }}>(⏳ preparing audio...)</span>}</h4>
-          {(stemNames || []).map(stem => (
-            <div key={stem} className="volume-control" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+          {(stemNames || []).map((stem, i) => (
+            <div
+              key={stem}
+              className="volume-control"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                paddingBottom: '10px',
+                marginBottom: '10px',
+                borderBottom: i < stemNames.length - 1 ? '1px solid rgba(255, 255, 255, 0.12)' : 'none'
+              }}
+            >
               <label style={{ minWidth: '80px' }}>{stemLabels[stem] || stem}</label>
               <div style={{ width: '120px', height: '40px' }}>
                 {metadata?.stems?.[stem] && (
@@ -387,26 +398,33 @@ function SongMixer({
                   />
                 )}
               </div>
-              <label
-                title="Denoise + de-reverb restoration (can only be toggled while nothing is playing)"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: '3px',
-                  fontSize: '11px',
-                  color: '#999',
-                  cursor: (playing || restoringStem?.[`${slot}:${stem}`]) ? 'not-allowed' : 'pointer',
-                  opacity: (playing || restoringStem?.[`${slot}:${stem}`]) ? 0.5 : 1
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={!!restoredStems?.[stem]}
-                  disabled={playing || !!restoringStem?.[`${slot}:${stem}`]}
-                  onChange={(e) => onToggleRestoration(slot, stem, e.target.checked)}
-                />
-                {restoringStem?.[`${slot}:${stem}`] ? '⏳' : '✨'}
-              </label>
+              {/* Denoise + de-reverb only makes sense for vocals -- these
+                  models are trained for vocal cleanup, and testing showed
+                  they gut non-vocal stems instead of helping (e.g. guitar
+                  measured ~11dB quieter after "restoration"). No checkbox
+                  for stems it can only hurt. */}
+              {stem === 'vocals' && (
+                <label
+                  title="Denoise + de-reverb restoration (can only be toggled while nothing is playing)"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '3px',
+                    fontSize: '11px',
+                    color: '#999',
+                    cursor: (playing || restoringStem?.[`${slot}:${stem}`]) ? 'not-allowed' : 'pointer',
+                    opacity: (playing || restoringStem?.[`${slot}:${stem}`]) ? 0.5 : 1
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!!restoredStems?.[stem]}
+                    disabled={playing || !!restoringStem?.[`${slot}:${stem}`]}
+                    onChange={(e) => onToggleRestoration(slot, stem, e.target.checked)}
+                  />
+                  {restoringStem?.[`${slot}:${stem}`] ? '⏳' : '✨'}
+                </label>
+              )}
               <input
                 type="range"
                 min="0"

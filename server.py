@@ -277,7 +277,7 @@ def process_song():
         use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
 
         if use_multi_engine:
-            add_log_message("🚀 Separating stems using multi-engine pipeline (Karaoke vocals + Demucs 6s + DrumSep)...", slot)
+            add_log_message("🚀 Separating stems using multi-engine pipeline (vocal-model ensemble + Demucs 6s + DrumSep)...", slot)
         else:
             add_log_message("🔊 Separating stems using Demucs AI...", slot)
 

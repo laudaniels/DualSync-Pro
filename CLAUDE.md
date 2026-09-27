@@ -64,29 +64,32 @@ not a full mix, so kick/snare runs on Demucs' `drums` output.
 
 **Pipeline (tested end-to-end with real audio):**
 1. **Stage 1 (Parallel GPU)** — both from full song:
-   - **Mel-Band RoFormer** (12.6 dB SDR): cleanest vocals, minimal artifacts
+   - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer
+     12.1 dB SDR, averaged sample-by-sample): cleanest vocals -- verified
+     by ear against each model alone, the average won clearly (a known
+     technique, UVR's "Ensemble Mode": different architectures make
+     different mistakes, averaging smooths those out)
    - **Demucs `htdemucs_6s`** (9.5 dB SDR): bass, guitar, piano, other, drums
    - Simultaneous processing (threading with locks)
 2. **Stage 2** — from Demucs' `drums` output:
    - **MDX23C DrumSep** (SOTA): kick, snare (ML-based)
    - **Frequency-band filtering**: hihat, tom (fallback, no model)
-3. **Stage 3** — all 9 stems:
-   - **Denoise + de-reverb** (audio-separator Mel-Band Roformer models,
-     27.99 / 19.17 dB SDR): artifact removal, quality enhancement
-   - Graceful fallback to spectral filtering if these models can't load
+3. **Stage 3** — assembling the 9 stems (no restoration here anymore --
+   see below)
 
 **Output (9 stems, 7 ML-separated + 2 filtered):**
-- `vocals` — Mel-Band RoFormer (12.6 dB SDR)
+- `vocals` — vocal-model ensemble (Mel-Band RoFormer + BS-RoFormer, averaged)
 - `kick`, `snare` — MDX23C DrumSep (SOTA ML separation on drums stem)
 - `hihat`, `tom` — Frequency-band filtering on drums stem
 - `bass`, `guitar`, `piano`, `other` — Demucs `htdemucs_6s`
 
 **Model Details:**
-- **Vocal Model:** `vocals_mel_band_roformer.ckpt` (highest quality in audio-separator registry)
+- **Vocal Models (ensemble, averaged):** `vocals_mel_band_roformer.ckpt` (12.60 dB SDR)
+  and `model_bs_roformer_ep_368_sdr_12.9628.ckpt` ("BS-Roformer-Viperx-1296", 12.10 dB SDR)
 - **Drum ML:** `drumsep_5stems_mdx23c_jarredou.ckpt` (5-stem capable, we use kick+snare)
-- **Restoration:** `denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt` (27.99 dB SDR)
-  then `dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt` (19.17 dB SDR), both from
-  the audio-separator registry -- applied to every stem, in that order
+- **Restoration (opt-in per stem, not run during separation):** `denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt`
+  (27.99 dB SDR) then `dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt` (19.17 dB SDR),
+  both from the audio-separator registry -- see "Restoration" below
 
 **Requirements:**
 ```bash
@@ -95,6 +98,20 @@ pip install onnxruntime   # required by audio-separator
 ```
 Both restoration models download automatically on first use, same as the
 vocal/drum models above -- no separate install step.
+
+**Past known issue (fixed):** despite this doc always naming
+`vocals_mel_band_roformer.ckpt` (12.6 dB SDR) as the vocal model, the code
+actually loaded `mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt`
+(10.2 dB SDR) instead -- audibly worse, confirmed 2026-09-27 by a listening
+test against the documented model and other candidates. Fixed in
+`_separate_vocals_karaoke()` to load the documented model -- and then, in
+the same session, upgraded further to the ensemble described above once an
+A/B/C/D/E listening test showed averaging it with BS-RoFormer beat either
+model alone. `vocals_mel_band_roformer.ckpt`'s own filename contains
+"vocals", so its non-vocals "(other)" output also matched the old naive
+`'vocal' in filename` check -- tightened to the parenthesized `(vocals)`
+stem marker, or ensembling would have silently averaged in the wrong file
+half the time.
 
 **Past known issue (fixed):** this stage used to call the CPJKU
 "music-source-restoration" project (a HiFi++ GAN) via
@@ -105,23 +122,33 @@ and silently fell back to spectral filtering, regardless of what was
 installed. Replaced with the denoise + de-reverb models above, which are
 real, tested, and use infrastructure already proven in this pipeline.
 
-**Performance:** ~14-20 min per track (quality prioritized over speed)
-- Stage 1 (parallel vocals + drums): ~8-10 min
-- Stage 2 (drum splitting + filtering): ~2-3 min  
-- Stage 3 (denoise + de-reverb restoration): ~4-7 min
+**Performance:** ~10-15 min per track (restoration no longer a mandatory
+stage -- see below; vocals now run two models in sequence instead of one,
+partly offsetting that saving since Stage 1 is bottlenecked by whichever
+of vocals/drums finishes last)
+- Stage 1 (parallel vocals ensemble + drums): ~8-11 min
+- Stage 2 (drum splitting + filtering): ~2-3 min
+- Stage 3 (assembling stems): seconds
 
 ## Features & Components
 
 ### Multi-Engine Stem Separation (9 stems)
 **Models (best-in-class, verified SDR):**
-- **Mel-Band RoFormer** (12.6 dB SDR) → lead vocals
+- **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged) → lead vocals
 - **Demucs htdemucs_6s** (9.5 dB SDR) → bass, guitar, piano, other, drums
 - **MDX23C DrumSep** (SOTA) → kick, snare (from drums stem)
 - **Frequency filtering** → hihat, tom (no ML model exists)
 
-**Restoration:**
+**Restoration (opt-in per stem, not part of separation):**
 - **Denoise + de-reverb** (audio-separator Mel-Band Roformer models) → artifact removal
-  - Denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR), applied to every stem
+  - Denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR)
+  - Skipped during separation itself (was costing every song several minutes
+    for all 9 stems whether or not it helped); toggle it per stem instead
+    from a checkbox next to that stem's volume slider, once stems exist --
+    see `/api/restore-stem`. Vocals-only in the UI: testing showed these
+    models measurably hurt non-vocal stems (e.g. guitar measured ~11 dB
+    quieter after "restoration") rather than helping, since they're trained
+    for vocal cleanup
   - Fallback to spectral filtering if these models can't load
   - No separate install -- downloads automatically via audio-separator, same as the vocal/drum models
 
@@ -137,6 +164,8 @@ real, tested, and use infrastructure already proven in this pipeline.
 - Waveform preview per slider
 - Real-time playback with stem mixing
 - BPM/Key override and analysis
+- Per-stem restoration toggle (vocals only -- see Restoration above),
+  disabled while playing
 
 ### Download Packages
 **Includes all stems:**
@@ -152,11 +181,12 @@ real, tested, and use infrastructure already proven in this pipeline.
 ## Development Notes
 
 - BPM detection and stem separation run in background threads
-- Multi-engine mode uses parallel GPU processing (Stage 1: Karaoke + Demucs)
-- Stem separation pipeline: ~14-20 min per track (quality prioritized)
-  - Stage 1 (parallel): ~8-10 min
+- Multi-engine mode uses parallel GPU processing (Stage 1: vocal-model ensemble + Demucs)
+- Stem separation pipeline: ~10-15 min per track (quality prioritized;
+  restoration is opt-in per stem afterward, not part of this)
+  - Stage 1 (parallel): ~8-11 min
   - Stage 2 (drum splitting): ~2-3 min
-  - Stage 3 (denoise + de-reverb): ~4-7 min
+  - Stage 3 (assembling stems): seconds
 - All generated audio goes under `Audio/` (git-ignored): uploads/aligned WAVs,
   `Audio/stems/<timestamp>/`, `Audio/renders/`, and download ZIPs
 - Separation results are cached in `separated_stems/<hash>/` (git-ignored);

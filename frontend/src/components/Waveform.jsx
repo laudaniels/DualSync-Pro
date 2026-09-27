@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { stemLabels } from './stemConstants';
 
-// Colors for each stem
+// Colors for each stem -- this component had its own copy of stemLabels too
+// (a legacy 7-stem-only list, missing guitar/piano/multi-engine's 'other'
+// wasn't the issue but guitar/piano were, showing up as "undefined" in the
+// canvas), now replaced by the shared one from stemConstants.
 const stemColors = {
   vocals: 'rgb(168, 85, 247)',    // purple
   kick: 'rgb(99, 102, 241)',      // indigo
@@ -8,17 +12,9 @@ const stemColors = {
   hihat: 'rgb(249, 115, 22)',     // orange
   tom: 'rgb(34, 197, 94)',        // green
   bass: 'rgb(59, 130, 246)',      // blue
+  guitar: 'rgb(234, 179, 8)',     // yellow
+  piano: 'rgb(20, 184, 166)',     // teal
   other: 'rgb(168, 162, 158)'     // gray
-};
-
-const stemLabels = {
-  vocals: '🎤 Vocals',
-  kick: '🔊 Kick',
-  snare: '🥁 Snare',
-  hihat: '⚡ Hi-Hat',
-  tom: '🔔 Tom',
-  bass: '🎸 Bass',
-  other: '🎹 Other'
 };
 
 export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, song1Bpm = 120, song1BeatAnchor = 0, zoomLevel = 10, onZoomChange }) {

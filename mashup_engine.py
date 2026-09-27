@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # audio-separator's own default (/tmp/audio-separator-models/) isn't
 # persistent -- on this box /tmp gets cleared across restarts, silently
-# forcing a ~3 GB re-download of all 4 models (karaoke, DrumSep, denoise,
+# forcing a ~3 GB re-download of all 4 models (vocals, DrumSep, denoise,
 # de-reverb) on the very next run, with no progress reporting for that time.
 # Caching under the user's home directory instead survives restarts.
 AUDIO_SEPARATOR_MODEL_DIR = Path.home() / ".cache" / "audio-separator-models"
@@ -44,7 +44,7 @@ def _report_audio_separator_progress(prefix, callback):
     """While the wrapped audio_separator call runs, forward its own log
     lines as progress updates. Safe to nest around a single synchronous
     call -- each audio_separator call this project makes runs to completion
-    on its own thread, so there's no cross-talk between the karaoke vocals
+    on its own thread, so there's no cross-talk between the vocals
     call (running in parallel with the separate Demucs subprocess) and
     everything else, which runs sequentially."""
     logger = logging.getLogger("audio_separator.separator.separator")
@@ -57,7 +57,7 @@ def _report_audio_separator_progress(prefix, callback):
 
 
 class MashupEngine:
-    """Build FFmpeg mixes with multi-engine stem separation: Mel-Band RoFormer Karaoke
+    """Build FFmpeg mixes with multi-engine stem separation: Mel-Band RoFormer
     (lead/backing vocals), Demucs htdemucs_6s (bass/guitar/piano/other/drums),
     MDX23C DrumSep (kick/snare/hihat/tom), denoise + de-reverb (restoration)."""
 
@@ -72,8 +72,8 @@ class MashupEngine:
     # Best-in-class audio models (verified SDR scores)
     AUDIO_SEPARATOR_MODELS = {
         'vocals_best': {
-            'model_name': 'mel_band_roformer',
-            'description': 'Mel-Band RoFormer - 12.6 dB SDR, cleanest vocals',
+            'model_name': 'mel_band_roformer + bs_roformer ensemble',
+            'description': 'Average of Mel-Band RoFormer (12.6 dB SDR) and BS-RoFormer (12.1 dB SDR) -- cleaner than either alone',
         },
         'drums_6stem': {
             'model_name': 'demucs',
@@ -126,7 +126,7 @@ class MashupEngine:
 
         Args:
             songs: List of audio file paths
-            use_multi_engine: If True, use advanced Karaoke + Demucs-6s + DrumSep + ML
+            use_multi_engine: If True, use advanced vocal model + Demucs-6s + DrumSep + ML
                              restoration pipeline (9 stems). If False, use legacy
                              Demucs-only (7 stems) for backward compatibility.
             use_restoration: If True and use_multi_engine=True, apply denoise + de-reverb restoration.
@@ -1524,12 +1524,12 @@ class MashupEngine:
             raise
 
     def separate_stems_multi_engine(self, songs, use_restoration=True, progress_callback=None):
-        """Advanced multi-engine stem separation: Mel-Band Roformer Karaoke (vocals) +
+        """Advanced multi-engine stem separation: a vocal-model ensemble (vocals) +
         Demucs htdemucs_6s (bass/guitar/piano/other/drums) + MDX23C DrumSep
         (kick/snare, ML) + frequency-split (hihat/tom, approximate) + optional
         denoise + de-reverb artifact restoration.
 
-        Every stem is derived straight from the full song: the Karaoke model and
+        Every stem is derived straight from the full song: the vocal model and
         htdemucs_6s both run directly against the original/processed WAV, in
         parallel. The one deliberate exception is kick/snare/hihat/tom -- both
         DrumSep and the frequency-split fallback need an isolated drum stem, not
@@ -1603,7 +1603,7 @@ class MashupEngine:
             def extract_vocals():
                 nonlocal vocals_path
                 try:
-                    logging.info(f"  🎤 Mel-Band Roformer Karaoke: extracting vocals...")
+                    logging.info(f"  🎤 Vocal model ensemble: extracting vocals...")
                     with _report_audio_separator_progress("Vocals", _set_vocals_status):
                         v = self._separate_vocals_karaoke(str(song), str(song_out_dir))
                     _set_vocals_status("Vocals: done")
@@ -1611,7 +1611,7 @@ class MashupEngine:
                         vocals_path = v
                     logging.info(f"  ✅ Vocals extracted")
                 except Exception as e:
-                    logging.error(f"  ❌ Karaoke vocal separation failed: {e}")
+                    logging.error(f"  ❌ Vocal separation failed: {e}")
                     with vocals_lock:
                         vocals_path = None
 
@@ -1698,22 +1698,34 @@ class MashupEngine:
 
         return results
 
+    # Ensemble of two vocal models (see _separate_vocals_karaoke): each run
+    # independently on the full song, then averaged sample-by-sample. Verified
+    # by ear on a real clip (2026-09-27, Radar Love) -- vocals_mel_band_roformer
+    # alone (12.60 dB SDR, the documented choice) vs. this BS-Roformer model
+    # alone (12.10 dB SDR) vs. their average: the average won clearly over
+    # either alone, with BS-Roformer the stronger of the two individually.
+    # A known technique (UVR's "Ensemble Mode") -- different architectures
+    # make different mistakes, so averaging smooths those out.
+    _ENSEMBLE_VOCAL_MODELS = ["vocals_mel_band_roformer.ckpt", "model_bs_roformer_ep_368_sdr_12.9628.ckpt"]
+
     def _separate_vocals_karaoke(self, audio_path, output_dir):
-        """Extract clean lead vocals using a Mel-Band Roformer Karaoke model, run
-        directly on the full song (not on an already-separated stem).
+        """Extract clean lead vocals as the average of two Mel-Band/BS-RoFormer
+        vocal models (see _ENSEMBLE_VOCAL_MODELS), each run directly on the
+        full song (not on an already-separated stem).
 
-        Verified against a real clip: despite the "Karaoke" name, this
-        checkpoint's second output is a generic Instrumental (full mix minus
-        vocals), not isolated backing/harmony vocals -- there's no dedicated
-        backing-vocal model in the audio-separator registry, so we only keep
-        the clean vocals file and discard the instrumental one. Roformer-family
-        vocal models like this one measurably outperform Demucs's built-in
-        vocal stem on separation quality (SDR), which is why we use this
-        instead of htdemucs_6s's own 'vocals' output.
+        Each model's own output files are named after the model's
+        *filename*, which for vocals_mel_band_roformer.ckpt happens to
+        contain "vocals" itself, so the non-vocals "(other)" file also
+        matches a naive 'vocal' in filename check -- matching on the
+        parenthesized "(vocals)" stem marker specifically avoids silently
+        picking that wrong file.
 
-        Returns: path to the vocals-only WAV.
+        Returns: path to the vocals-only WAV (the averaged ensemble result).
         """
         import logging
+        import re
+        import numpy as np
+        import soundfile as sf
 
         try:
             from audio_separator.separator import Separator
@@ -1726,30 +1738,44 @@ class MashupEngine:
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
-        try:
+        def _vocals_with_model(model_filename):
             separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            separator.load_model(model_filename="mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt")
+            separator.load_model(model_filename=model_filename)
 
-            logging.info(f"  Separating vocals from {Path(audio_path).name}...")
+            logging.info(f"  Separating vocals from {Path(audio_path).name} using {model_filename}...")
             output_files = separator.separate(audio_path)
             resolved = [p if Path(p).is_absolute() else str(output_dir_path / p) for p in output_files]
 
-            logging.info(f"  Karaoke model produced: {[Path(p).name for p in resolved]}")
+            logging.info(f"  {model_filename} produced: {[Path(p).name for p in resolved]}")
 
-            vocals_matches = [p for p in resolved if 'vocal' in Path(p).stem.lower()]
+            vocals_matches = [p for p in resolved if re.search(r'\(vocals\)', Path(p).stem, re.IGNORECASE)]
             if not vocals_matches:
                 raise RuntimeError(
                     f"Could not identify the vocals file among: {[Path(p).name for p in resolved]}"
                 )
             return vocals_matches[0]
+
+        try:
+            vocals_paths = [_vocals_with_model(m) for m in self._ENSEMBLE_VOCAL_MODELS]
+
+            audio_a, sr_a = sf.read(vocals_paths[0])
+            audio_b, sr_b = sf.read(vocals_paths[1])
+            if sr_a != sr_b:
+                raise RuntimeError(f"Sample rate mismatch between ensemble models: {sr_a} vs {sr_b}")
+            n = min(len(audio_a), len(audio_b))
+            ensemble = (audio_a[:n] + audio_b[:n]) / 2.0
+
+            ensemble_path = str(output_dir_path / f"{Path(audio_path).stem}_(vocals)_ensemble.wav")
+            sf.write(ensemble_path, ensemble, sr_a)
+            return ensemble_path
         except Exception as e:
-            logging.error(f"Karaoke vocal separation failed: {e}")
+            logging.error(f"Vocal separation failed: {e}")
             raise RuntimeError(f"Vocal extraction failed: {str(e)[-500:]}")
 
     def _separate_stems_demucs6s(self, audio_path, output_dir, progress_callback=None):
         """Separate bass/guitar/piano/other/drums directly from the full song using
         Demucs' htdemucs_6s model (also outputs a 'vocals' stem, unused here --
-        the Karaoke model supplies our (higher-quality) vocals instead).
+        the dedicated vocal-model ensemble above supplies our (higher-quality) vocals instead).
 
         progress_callback(fraction, label), if given, is fed straight from
         Demucs' own tqdm progress bar on stderr (e.g. " 42%|...") -- this call

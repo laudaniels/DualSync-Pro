@@ -200,6 +200,16 @@ export default function DualMixer() {
     setError('');
     setProcessingStage(prev => { const updated = [...prev]; updated[slot] = 'converting'; return updated; });
 
+    // A new song in this slot invalidates any BPM/Key override left over
+    // from whatever was here before -- it was leading for that song, not
+    // this one, and silently carrying it over would misapply it (see the
+    // 2026-09-27 log analysis: a stale override sent a transpose to the
+    // wrong absolute pitch without any indication why).
+    setOverrideBpm(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
+    setOverrideKey(prev => { const updated = [...prev]; updated[slot] = null; return updated; });
+    setEditingBpm(prev => { const updated = [...prev]; updated[slot] = false; return updated; });
+    setEditingKey(prev => { const updated = [...prev]; updated[slot] = false; return updated; });
+
     // Show filename immediately while converting
     setMetadata(prev => { const updated = [...prev]; updated[slot] = { filename: file.name }; return updated; });
 
@@ -357,7 +367,7 @@ export default function DualMixer() {
     setStems(prev => { const updated = [...prev]; updated[slot] = data.stems; return updated; });
     setMetadata(prev => {
       const updated = [...prev];
-      updated[slot] = { ...updated[slot], timestamp: data.timestamp || Date.now().toString() };
+      updated[slot] = { ...updated[slot], stems: data.stems, timestamp: data.timestamp || Date.now().toString() };
       return updated;
     });
     await decodeStemsForSlot(slot, data.stems);
@@ -398,6 +408,7 @@ export default function DualMixer() {
       const updated = [...prev];
       updated[slot] = {
         ...updated[slot],
+        stems: data.processed_stems,
         timestamp,
         ...(data.measured_bpm && { measured_bpm: data.measured_bpm, currentBpm: data.measured_bpm }),
         ...(data.measured_key && { currentKey: data.measured_key })
@@ -817,6 +828,7 @@ export default function DualMixer() {
           if (newMetadata[slot]) {
             newMetadata[slot] = {
               ...newMetadata[slot],
+              stems: data.processed_stems,
               ...(data.measured_bpm && {
                 measured_bpm: data.measured_bpm,
                 source_bpm: data.source_bpm,
