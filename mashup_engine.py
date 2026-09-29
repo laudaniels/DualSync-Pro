@@ -69,6 +69,83 @@ class MashupEngine:
     )
     TARGET_SAMPLE_RATE = 44100
 
+    # How far before a detected kick transient to actually start beat-grid
+    # analysis (see _detect_first_kick_offset). Cutting an audio array
+    # exactly on a hard transient gives beat trackers no quiet lead-in to
+    # compute their first frame's onset/spectral-flux value against, which
+    # can bias that very first detected beat -- exactly the value used as
+    # beat_anchor. Used as the default first attempt, before any BPM
+    # estimate is available; see KICK_PRE_ROLL_MIN_SEC/MAX_SEC and
+    # KICK_PRE_ROLL_REFINE_MAX_BPM below for the tempo-adaptive refinement
+    # applied afterward for slow tracks.
+    KICK_PRE_ROLL_SEC = 0.35
+
+    # Once a rough BPM is known (from the first extraction attempt, using
+    # KICK_PRE_ROLL_SEC above), slow tracks get the pre-roll refined to one
+    # beat's duration (60/bpm), clamped to this range. Measured directly on
+    # synthetic audio (kick at a known position, various tempos): at 60 BPM
+    # (one beat = 1.0s), anchor error was +0.71s with the fixed 0.35s value
+    # vs. +0.42s with the tempo-adaptive one. The clamp matters: an
+    # UNCLAMPED full beat (1.0s pre-roll at 60 BPM) was worse still
+    # (err -0.50s) -- re-admitting too much of the pre-kick audio confuses
+    # the extractor again, so the max caps how far this can help.
+    KICK_PRE_ROLL_MIN_SEC = 0.2
+    KICK_PRE_ROLL_MAX_SEC = 0.5
+
+    # Only tracks slower than this get the refinement pass above (an extra
+    # Essentia call per candidate). 60/bpm only diverges meaningfully from
+    # KICK_PRE_ROLL_SEC below roughly 150 BPM, which would mean paying for
+    # the extra call on most real music (hip-hop, pop/rock, house/techno --
+    # not just genre outliers). Capping it at 100 BPM keeps the extra cost
+    # to where the measured benefit was clearest, instead of on most songs.
+    KICK_PRE_ROLL_REFINE_MAX_BPM = 100.0
+
+    # How far into the track _detect_kick_candidates searches for a kick
+    # transient. Validated against 38 real tracks (validate_pipeline.py):
+    # DJ re-edits/extended club mixes routinely push their real beat past
+    # the previous 45s cutoff -- a direct A/B on the exact same song showed
+    # it plainly (the "Lau Re-Edit" of a track found no candidates at all
+    # in the first 45s, while the non-re-edited version of the same song
+    # found them fine). This step is cheap regardless of length (plain
+    # onset detection, not a repeated Essentia extractor call), so widening
+    # it doesn't add meaningful cost -- unlike KICK_PRE_ROLL_REFINE_MAX_BPM
+    # above, which gates an actually expensive repeated extraction.
+    KICK_SEARCH_MAX_SEC = 90.0
+
+    # Crest-factor (peak / RMS) window and minimum ratio for validating a
+    # candidate kick transient (see _detect_first_kick_offset). A genuine
+    # percussive hit's energy is a short spike far above its surroundings;
+    # a sustained drone or pad keeps peak and RMS close together no matter
+    # how loud or distorted it's mastered, so this stays reliable even when
+    # a spectral-flux baseline (onset_env) would get skewed by one.
+    KICK_CREST_WINDOW_SEC = 0.25
+    KICK_CREST_FACTOR_MIN = 4.0
+
+    # When more than one kick candidate is found (see _detect_kick_candidates
+    # -- e.g. an early sub-bass drop before the track's real downbeat),
+    # _detect_beats_essentia tries each in turn and keeps whichever gives the
+    # highest RhythmExtractor2013 confidence (no early exit: tested on
+    # synthetic audio, a plain "stop at the first 'good' one" rule kept the
+    # WRONG candidate, since confidence mostly reflects how periodic the
+    # bulk of the shared remaining audio is, not whether this exact trim
+    # point is the real downbeat). NOTE: Essentia's confidence for
+    # method='multifeature' (what this project uses) is NOT a 0-1 score --
+    # it's documented as ranging [0, 5.32], with Essentia's own guidelines
+    # reading [0, 1) very low, [1, 1.5] low, (1.5, 3.5] good (~80% accuracy,
+    # AMLt measure), (3.5, 5.32] excellent. 1.5 is Essentia's own "good"
+    # cutoff (used only for logging now), not an arbitrary guess.
+    KICK_CONFIDENCE_GOOD = 1.5
+
+    # Minimum gap between kept kick candidates. Without this, a normal song
+    # with drums from the very start (no vague intro at all -- the common
+    # case) returns 3 near-duplicate candidates that are just consecutive
+    # beats of the same groove (e.g. 0.3s/0.8s/1.3s), tripling the cost of
+    # analyze-song for zero benefit, since near-identical trims score
+    # near-identical confidence. Extra candidates should only be tried when
+    # they plausibly represent a genuinely different section (an early
+    # one-off transient vs. the track's real groove), not the next beat.
+    KICK_CANDIDATE_MIN_GAP_SEC = 2.0
+
     # Best-in-class audio models (verified SDR scores)
     AUDIO_SEPARATOR_MODELS = {
         'vocals_best': {
@@ -251,12 +328,245 @@ class MashupEngine:
             shutil.move(padded_path, path)
             logging.info(f"🩹 Padded {name}: {durations[name]:.3f}s → {target:.3f}s")
 
+    def _detect_first_kick_offset(self, y, sr, max_search_sec=None):
+        """Convenience wrapper around _detect_kick_candidates for callers
+        with no independent way to score which candidate is actually right
+        (the Librosa beat_track() fallback has no confidence output to
+        compare candidates against) -- just takes the earliest qualifying
+        transient. See _detect_kick_candidates for the detection logic.
+        """
+        candidates = self._detect_kick_candidates(y, sr, max_search_sec)
+        return candidates[0][0] if candidates else None
+
+    def _detect_kick_candidates(self, y, sr, max_search_sec=None, max_candidates=3):
+        """Locate up to `max_candidates` genuine kick-drum transients in
+        `y`, in chronological order, so beatgrid phase detection can skip a
+        vague/drum-less intro instead of anchoring to whatever weak,
+        non-percussive content sits at the very start of the track.
+
+        Returns a list of (offset_sec, run_length) tuples in chronological
+        order, where run_length is how many qualifying onsets were grouped
+        into that candidate's run before the next big gap -- an isolated
+        one-off transient has run_length 1, while the start of a real
+        repeating groove has run_length > 1. _detect_beats_essentia uses
+        run_length to disambiguate cases where an early false lead (e.g. a
+        sub-bass drop) and the track's real downbeat score near-identical
+        beat-tracking confidence, which happens because both candidates'
+        analysis windows share almost all the same downstream audio.
+
+        Kick drums concentrate their energy below ~150 Hz, so this
+        low-pass filters the search window first (a plain onset-strength
+        pass on the full-band signal would just as happily fire on a
+        vocal consonant, a cymbal swell, or a synth pad in the intro).
+
+        Only searches the first `max_search_sec` of `y` -- if the intro
+        runs longer than that, or has no clear low-end transient at all,
+        returns an empty list and callers fall back to treating the track
+        as starting at 0 (the previous behavior).
+        """
+        import logging
+        import numpy as np
+        import librosa
+        from scipy.signal import butter, sosfiltfilt
+
+        if max_search_sec is None:
+            max_search_sec = self.KICK_SEARCH_MAX_SEC
+
+        search_samples = int(max_search_sec * sr)
+        y_search = y[:search_samples] if len(y) > search_samples else y
+        if len(y_search) < sr:
+            return []  # too little audio to search meaningfully
+
+        try:
+            sos = butter(4, 150, btype='low', fs=sr, output='sos')
+            y_low = sosfiltfilt(sos, y_search)
+            onset_env = librosa.onset.onset_strength(y=y_low, sr=sr)
+            if not np.any(onset_env):
+                return []
+            # backtrack=False here: onset_detect's peak positions carry
+            # their own onset_env strength, which is what "strong" below
+            # filters on. backtrack=True would shift each one to its
+            # preceding local minimum instead, where onset_env is ~0 by
+            # definition -- that shift is only useful once we've already
+            # decided a transient is real and want its exact attack point.
+            onsets = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr, backtrack=False)
+        except Exception as e:
+            logging.warning(f"Kick-transient detection failed: {e}")
+            return []
+
+        if len(onsets) == 0:
+            return []
+
+        onset_times = librosa.frames_to_time(onsets, sr=sr)
+
+        # onset_strength flags the very first frame or two as a spurious
+        # "attack" on almost any signal, since there's no preceding audio
+        # for it to compare against (an STFT boundary artifact, not a real
+        # transient). A genuine kick within that sliver of a track needs no
+        # correction anyway -- analysis already starts at ~0 -- so it's
+        # safe to just ignore this window entirely.
+        boundary_guard = onset_times >= 0.2
+
+        # Validate each candidate by crest factor (peak / RMS) on the raw
+        # low-passed waveform around it, rather than trusting onset_env's
+        # own scale. onset_env is a spectral-flux measure -- it can be
+        # thrown off by a loud/overdriven sub-bass drone in the intro: hard
+        # clipping's harmonic buzz can itself register as a string of
+        # "onsets" whose relative strength swamps or hides a real kick,
+        # depending on how it happens to skew the envelope's baseline.
+        # Crest factor sidesteps that: a genuine kick's energy is a short
+        # spike far above its surroundings (crest factor in the double
+        # digits, measured below), while a sustained drone or pad -- however
+        # loud or distorted -- keeps its peak and RMS close together
+        # (crest factor near 1-2), because it has no isolated impact to spike.
+        half_win = int(self.KICK_CREST_WINDOW_SEC * sr)
+        crest_ok = np.zeros(len(onsets), dtype=bool)
+        for i, onset_frame in enumerate(onsets):
+            center = librosa.frames_to_samples(onset_frame)
+            start, end = max(0, center - half_win), min(len(y_low), center + half_win)
+            segment = y_low[start:end]
+            if len(segment) == 0:
+                continue
+            peak = np.max(np.abs(segment))
+            rms = np.sqrt(np.mean(segment.astype(np.float64) ** 2)) + 1e-9
+            crest_ok[i] = (peak / rms) >= self.KICK_CREST_FACTOR_MIN
+
+        candidates = boundary_guard & crest_ok
+        if not np.any(candidates):
+            return []
+
+        # Group consecutive qualifying onsets into "runs" (gap between them
+        # < KICK_CANDIDATE_MIN_GAP_SEC keeps them in the same run), keeping
+        # each run's first onset time and how many onsets it contains. A
+        # normal song with drums from the start is one continuous run --
+        # one candidate, not three consecutive beats of the same groove. A
+        # genuine one-off transient followed by a real gap before the
+        # actual groove starts becomes two runs (the first of length 1).
+        runs = []  # [[offset, run_length], ...]
+        last_onset_time = None
+        for t in onset_times[candidates]:
+            starts_new_run = last_onset_time is None or t - last_onset_time >= self.KICK_CANDIDATE_MIN_GAP_SEC
+            if starts_new_run:
+                runs.append([float(t), 1])
+            else:
+                runs[-1][1] += 1
+            last_onset_time = t
+
+        return [(offset, run_length) for offset, run_length in runs[:max_candidates]]
+
+    def _pick_kick_offset(self, song_path, kick_candidates, offsets, total_duration):
+        """Pick which kick candidate to use as the Librosa fallback's first
+        sample-window start, when _detect_kick_candidates found more than one.
+
+        Primarily prefers the candidate with the longest run_length (see
+        _detect_kick_candidates) -- the same signal used to disambiguate an
+        isolated one-off transient from a real repeating groove on the
+        Essentia path. An earlier version of this method instead compared
+        each candidate's own librosa.beat.beat_track tempo estimate against
+        a reference BPM built from the other sample offsets, on the theory
+        that librosa has no confidence/run_length equivalent of its own to
+        fall back on. Tested against a sub-drop-then-real-groove fixture,
+        that comparison didn't discriminate at all: beat_track's tempo
+        estimate is -- by design -- robust to exactly where a mostly
+        periodic window starts, so the isolated pre-groove transient and
+        the track's real groove start produced the IDENTICAL tempo (measured:
+        120.185 BPM for both, and for the reference offsets too). With an
+        exact tie, "closest wins" just silently kept the first (wrong)
+        candidate -- no improvement over not checking at all. run_length has
+        no such issue: it comes from the same crest-validated onset analysis
+        regardless of which engine ends up doing the beat tracking, and
+        directly measures "is this immediately followed by more of the same
+        pattern", which is exactly what separates the two cases.
+
+        BPM agreement (the original idea) is kept only as a tie-break
+        between candidates that end up with an equal run_length.
+
+        Returns a start offset in seconds (pre-roll already applied).
+        """
+        import logging
+        import numpy as np
+        import librosa
+
+        if len(kick_candidates) == 1:
+            return max(0.0, kick_candidates[0][0] - self.KICK_PRE_ROLL_SEC)
+
+        max_run_length = max(run_length for _offset, run_length in kick_candidates)
+        top_candidates = [c for c in kick_candidates if c[1] == max_run_length]
+        if len(top_candidates) == 1 or len(offsets) < 2:
+            return max(0.0, top_candidates[0][0] - self.KICK_PRE_ROLL_SEC)
+
+        def sample_tempo(offset):
+            offset = max(0.0, min(offset, total_duration - 10.0))
+            window = min(40.0, total_duration - offset)
+            y, sr = librosa.load(song_path, sr=None, mono=True, offset=offset, duration=window)
+            tempo, _beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+            return float(np.asarray(tempo).reshape(-1)[0])
+
+        reference_samples = []
+        for offset in offsets[1:]:
+            try:
+                reference_samples.append(sample_tempo(offset))
+            except Exception as e:
+                logging.warning(f"  Reference sample @ {offset:.0f}s failed: {e}")
+
+        if not reference_samples:
+            return max(0.0, top_candidates[0][0] - self.KICK_PRE_ROLL_SEC)
+        reference_bpm = float(np.median(reference_samples))
+
+        best_offset, best_distance = None, None
+        for kick_offset, _run_length in top_candidates:
+            trial_offset = max(0.0, kick_offset - self.KICK_PRE_ROLL_SEC)
+            try:
+                tempo = sample_tempo(trial_offset)
+            except Exception as e:
+                logging.warning(f"  Kick candidate @ {kick_offset:.2f}s failed: {e}")
+                continue
+            distance = abs(tempo - reference_bpm)
+            logging.info(f"  Kick candidate @ {kick_offset:.2f}s (run length {max_run_length}): "
+                         f"{tempo:.1f} BPM (reference {reference_bpm:.1f} BPM, distance {distance:.1f})")
+            if best_distance is None or distance < best_distance:
+                best_distance, best_offset = distance, trial_offset
+
+        if best_offset is not None:
+            return best_offset
+        return max(0.0, top_candidates[0][0] - self.KICK_PRE_ROLL_SEC)
+
     def _detect_beats_essentia(self, song_path, min_bpm=40, max_bpm=208):
         """Detect BPM and every individual beat position using Essentia's
         RhythmExtractor2013 (combines multiple beat-tracking algorithms;
         madmom would have been the neural-net alternative here, but it
         doesn't even install in this project's environment -- see
         requirements.txt).
+
+        Before running the extractor, looks for up to a few candidate
+        kick-drum transients (see _detect_kick_candidates) and trims the
+        vague/drum-less intro off the front of the analysis at the best one,
+        so the extractor's beat phase isn't anchored to that quiet section.
+
+        Candidates are ranked by run_length FIRST (how many onsets repeat
+        right after the candidate -- see _detect_kick_candidates), with the
+        extractor's own confidence used only to break an exact tie in
+        run_length. An earlier version did the reverse (confidence primary,
+        run_length only breaking close confidence ties), which real-track
+        validation (validate_pipeline.py, 38 tracks) showed fails badly:
+        confidence mostly reflects how periodic the BULK of the analyzed
+        audio is, which barely differs between candidates sharing the same
+        downstream track, so it isn't a reliable ranking signal on its own.
+        One case made this unambiguous: a candidate with run_length 85 (an
+        overwhelmingly dominant, sustained groove) lost to one with
+        run_length 4 purely on a confidence difference. run_length, however
+        it doesn't rely on anything from the (expensive) extractor at all --
+        it comes straight from the crest-validated onset analysis, so
+        candidates that aren't tied for the top run_length are never even
+        run through the extractor, which also cuts typical-case cost
+        (usually to a single Essentia call instead of up to 3).
+
+        The winning trim offset is added back onto every returned tick
+        afterward, so `ticks`/`beat_anchor` stay in the original track's
+        timeline -- the rest of the app (rendering, alignment, snapping)
+        never has to know the intro was skipped for analysis. Falls back to
+        analyzing the untrimmed track if no candidate qualifies or all of
+        the top-ranked ones fail.
 
         Returns (bpm, beat_anchor, ticks) where `ticks` is every detected
         beat timestamp in seconds (needed for per-beat beatgrid alignment,
@@ -266,12 +576,93 @@ class MashupEngine:
         import logging
         from essentia.standard import MonoLoader, RhythmExtractor2013
 
+        sr = 44100  # MonoLoader's default sampleRate
         loader = MonoLoader(filename=str(song_path))
         audio = loader()
-
         rhythm = RhythmExtractor2013(method='multifeature', minTempo=int(min_bpm), maxTempo=int(max_bpm))
-        bpm, ticks, confidence, _estimates, _bpm_intervals = rhythm(audio)
 
+        kick_candidates = []
+        try:
+            kick_candidates = self._detect_kick_candidates(audio, sr)
+        except Exception as e:
+            logging.warning(f"Kick-transient pre-detection failed, using full track: {e}")
+
+        # Only the candidate(s) tied for the highest run_length are worth
+        # actually running through the extractor -- see the docstring above
+        # for why run_length ranks ahead of confidence. Ties are rare (two
+        # candidates with the exact same onset count), so this is usually
+        # just one candidate.
+        if kick_candidates:
+            max_run_length = max(run_length for _offset, run_length in kick_candidates)
+            kick_candidates = [c for c in kick_candidates if c[1] == max_run_length]
+
+        best = None  # (confidence, run_length, trim_start, bpm, ticks)
+        for kick_offset, run_length in kick_candidates:
+            # Don't cut exactly on the transient -- a beat tracker's first
+            # analyzed frame has no quiet lead-in to compute its own
+            # onset/spectral-flux value against, which can bias that very
+            # first detected beat (used below as beat_anchor).
+            trim_start = max(0.0, kick_offset - self.KICK_PRE_ROLL_SEC)
+            # Leave at least 10s of audio after the trim -- an intro that
+            # eats almost the whole (short) track leaves nothing for the
+            # extractor to actually find a tempo in.
+            if len(audio) - int(trim_start * sr) < sr * 10:
+                continue
+
+            try:
+                bpm, ticks, confidence, _estimates, _bpm_intervals = rhythm(audio[int(trim_start * sr):])
+            except Exception as e:
+                logging.warning(f"Kick candidate @ {kick_offset:.2f}s failed: {e}")
+                continue
+            if len(ticks) < 2:
+                continue
+
+            # Now that this candidate's rough BPM is known, slow tracks get
+            # the pre-roll refined to match their actual beat duration
+            # instead of the fixed default. Gated to genuinely slow tracks
+            # (see KICK_PRE_ROLL_REFINE_MAX_BPM) rather than "whenever it
+            # would change the value" -- 60/bpm diverges from the 0.35s
+            # default for most real music, not just outliers, so refining
+            # unconditionally would double the Essentia cost on most songs
+            # for a benefit that's clearest specifically at slow tempo.
+            if 0 < bpm < self.KICK_PRE_ROLL_REFINE_MAX_BPM:
+                dynamic_pre_roll = max(self.KICK_PRE_ROLL_MIN_SEC, min(self.KICK_PRE_ROLL_MAX_SEC, 60.0 / bpm))
+                refined_trim_start = max(0.0, kick_offset - dynamic_pre_roll)
+                if len(audio) - int(refined_trim_start * sr) >= sr * 10:
+                    try:
+                        r_bpm, r_ticks, r_confidence, _e, _bi = rhythm(audio[int(refined_trim_start * sr):])
+                        if len(r_ticks) >= 2:
+                            logging.info(f"  Refined @ {kick_offset:.2f}s with tempo-adaptive pre-roll "
+                                         f"{dynamic_pre_roll:.2f}s (for ~{bpm:.0f} BPM, vs default "
+                                         f"{self.KICK_PRE_ROLL_SEC:.2f}s): {r_bpm:.1f} BPM, "
+                                         f"confidence {r_confidence:.2f}")
+                            trim_start, bpm, ticks, confidence = refined_trim_start, r_bpm, r_ticks, r_confidence
+                    except Exception as e:
+                        logging.warning(f"  Pre-roll refinement @ {kick_offset:.2f}s failed, "
+                                       f"keeping default: {e}")
+
+            logging.info(f"🥁 Kick candidate @ {kick_offset:.2f}s (run length {run_length}, "
+                         f"trim from {trim_start:.2f}s): {bpm:.1f} BPM, confidence {confidence:.2f}")
+
+            # All remaining candidates already share the same (top)
+            # run_length -- that filtering happened before this loop -- so
+            # confidence only needs to break ties among them here.
+            if best is None or confidence > best[0]:
+                best = (confidence, run_length, trim_start, bpm, list(ticks))
+
+        if best is not None:
+            confidence, run_length, trim_start, bpm, ticks = best
+            ticks = [float(t) + trim_start for t in ticks]
+            beat_anchor = float(ticks[0])
+            quality = "good" if confidence >= self.KICK_CONFIDENCE_GOOD else "low"
+            logging.info(f"✅ Essentia BPM: {bpm:.1f}, beat anchor: {beat_anchor:.2f}s, "
+                         f"beats: {len(ticks)}, confidence: {confidence:.2f} ({quality}) "
+                         f"(kick-trimmed from {trim_start:.2f}s)")
+            return float(bpm), beat_anchor, ticks
+
+        # No kick candidate qualified (or all of them failed) -- analyze
+        # the untrimmed track, same as before this feature existed.
+        bpm, ticks, confidence, _estimates, _bpm_intervals = rhythm(audio)
         if len(ticks) < 2:
             raise RuntimeError("Essentia detected fewer than 2 beats")
 
@@ -319,6 +710,22 @@ class MashupEngine:
         else:
             # Short track: sample from beginning
             offsets = [0.0]
+
+        # If the earliest sample point is a vague/drum-less intro, push it
+        # forward to a real kick transient instead -- otherwise beat_track's
+        # phase estimate for that pass gets anchored to whatever weak
+        # content happens to sit at the window's start.
+        try:
+            search_window = min(self.KICK_SEARCH_MAX_SEC, total_duration)
+            y_search, sr_search = librosa.load(song_path, sr=None, mono=True, duration=search_window)
+            kick_candidates = self._detect_kick_candidates(y_search, sr_search)
+        except Exception as e:
+            kick_candidates = []
+            logging.warning(f"Kick-transient pre-detection failed: {e}")
+
+        if kick_candidates:
+            offsets[0] = max(offsets[0], self._pick_kick_offset(
+                song_path, kick_candidates, offsets, total_duration))
 
         for offset in offsets:
             offset = max(0.0, min(offset, total_duration - 10.0))
@@ -403,6 +810,20 @@ class MashupEngine:
                 else:
                     # Very long: 5 passes, spread across middle sections
                     offsets = [30.0, total_duration / 4, total_duration / 2, total_duration * 0.75, total_duration - 50.0]
+
+                # Push the earliest pass forward to a real kick transient if
+                # that pass would otherwise land in a vague/drum-less intro
+                # -- same reasoning as analyze_track().
+                try:
+                    search_samples = int(min(self.KICK_SEARCH_MAX_SEC, total_duration) * sr)
+                    kick_candidates = self._detect_kick_candidates(y[:search_samples], sr)
+                except Exception as e:
+                    kick_candidates = []
+                    logging.warning(f"Kick-transient pre-detection failed: {e}")
+
+                if kick_candidates:
+                    offsets[0] = max(offsets[0], self._pick_kick_offset(
+                        song_path, kick_candidates, offsets, total_duration))
 
                 logging.info(f"📊 BPM analysis: {len(offsets)}-pass strategy (duration: {total_duration:.0f}s)")
 
