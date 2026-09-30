@@ -1280,10 +1280,33 @@ def _run_startup_sequence():
     print("DualSync Pro -- startup checks")
     print("=" * 60)
 
+    # Populate the full list up front, all "queued", so the GUI shows every
+    # check/model immediately instead of items only appearing one at a time
+    # as check_environment()/prefetch_models() actually get to them (models
+    # now fetch in parallel too, so "one at a time" wouldn't even match
+    # what's really happening).
+    with _startup_state_lock:
+        _startup_state['items'] = MashupEngine.all_startup_items()
+
+    # mashup_engine.py already throttles progress updates to ~10x/second
+    # (smooth enough for a GUI progress bar) -- printing every one of those
+    # to the console would still mean ~600-900 lines over a single big
+    # model's download. Print only every ~10 percentage points instead;
+    # _set_startup_item still gets every update, so the GUI stays smooth.
+    _last_printed_decile = {}
+
     def _progress(item):
         icon = {'checking': '⏳', 'cached': '✅', 'done': '✅',
                 'downloading': '⬇️ ', 'error': '❌'}.get(item['status'], '?')
-        print(f"  {icon} {item['label']}: {item['status']}")
+        progress = item.get('progress')
+        if progress is not None:
+            decile = int(progress * 10)
+            if _last_printed_decile.get(item['key']) == decile:
+                _set_startup_item(item)
+                return
+            _last_printed_decile[item['key']] = decile
+        suffix = f" ({progress:.0%})" if progress is not None else ""
+        print(f"  {icon} {item['label']}: {item['status']}{suffix}")
         _set_startup_item(item)
         if item['status'] == 'checking':
             time.sleep(_STARTUP_CHECK_DISPLAY_DELAY_SEC)

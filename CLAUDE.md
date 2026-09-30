@@ -12,6 +12,14 @@ was dropped and is not in this repository.)
 - **`server.py`** — Flask backend API (active)
 - **`frontend/`** — React web interface (active)
 - **`mashup_engine.py`** — Core audio processing engine (shared)
+- **`validate_pipeline.py`** — standalone dev/QA script: runs the real kick-
+  transient detection + beatgrid logic (`_detect_kick_candidates`,
+  `_detect_beats_essentia`) against a folder of real audio files and prints
+  a summary (candidates found, chosen trim point, processing time, crashes)
+  -- for sanity-checking the constants in "Beatgrid & Kick-Transient
+  Detection" below against real, diverse music instead of only synthetic
+  test fixtures. Usage: `python3 validate_pipeline.py <folder>`. Put test
+  tracks in `Audio/validation_tracks/` (already git-ignored).
 
 ## Running the App
 
@@ -45,7 +53,12 @@ Opens at `http://localhost:5000` (requires venv with dependencies installed).
     `/api/download-file/<filename>` — DAW-ready export packages
   - `/api/audio/<path>`, `/api/audio-stats`, `/api/process-status`,
     `/api/cleanup`, `/api/health` — serving, stats, progress polling, and
-    cleanup
+    cleanup (`/api/health` also returns the environment/dependency checks
+    from `MashupEngine.check_environment()` -- see "Startup: Dependency
+    Checks & Model Prefetch" below)
+  - `/api/startup-status` — polled by the frontend's blocking startup
+    overlay while dependency checks and model downloads run on their own
+    background thread (see "Startup: Dependency Checks & Model Prefetch")
 - CORS enabled for frontend communication
 
 ### `mashup_engine.py`
@@ -216,6 +229,146 @@ list):**
 separate from the above): re-separates the pre-alignment WAV for whichever
 song(s) used "align", since that source is never separated automatically.
 
+## Beatgrid & Kick-Transient Detection
+
+**Problem this solves:** a vague/drum-less intro (ambient pad, quiet build-up,
+DJ-edit buildup section) can anchor `beat_anchor`/`ticks[0]` to whatever weak
+content sits at the start of the track, corrupting cross-song phase
+alignment (`snap_to_reference`) and self-alignment (`align_beatgrid`) alike.
+`mashup_engine.py`'s `_detect_kick_candidates`/`_detect_beats_essentia` skip
+past that intro before analysis, then add the trimmed offset back onto every
+tick so the rest of the app never has to know the intro was skipped.
+
+**Detection (`_detect_kick_candidates`):** low-pass filters the first
+`KICK_SEARCH_MAX_SEC` (90s) of the track below ~150 Hz, runs onset
+detection, then validates each onset by **crest factor** (peak/RMS in a
+`KICK_CREST_WINDOW_SEC` window, `KICK_CREST_FACTOR_MIN = 4.0`) rather than
+trusting the onset-strength envelope's own scale directly -- a loud/
+overdriven sub-bass drone in the intro can skew that envelope's baseline
+unpredictably (tested: an early sub-drop and a real groove start scored
+near-identical envelope-relative strength), while crest factor stays
+reliable since a genuine kick's energy is a short spike far above its
+surroundings, whereas a sustained drone -- however loud -- keeps peak and
+RMS close together. Consecutive qualifying onsets closer than
+`KICK_CANDIDATE_MIN_GAP_SEC` (2.0s) are grouped into one "run" (a normal
+song with drums from the start is one continuous run, not several
+near-duplicate candidates), keeping each run's first onset time and how
+many onsets it contains (`run_length`).
+
+**Candidate ranking:** when more than one candidate qualifies (e.g. an early
+sub-bass drop before the track's real downbeat), candidates are ranked by
+`run_length` FIRST, with Essentia's own `RhythmExtractor2013` confidence
+used only to break an exact tie. Validated against 38 real tracks
+(`validate_pipeline.py`) -- an earlier version did the reverse (confidence
+primary) and failed badly: confidence mostly reflects how periodic the BULK
+of the analyzed audio is, which barely differs between candidates sharing
+the same downstream track. One case made this unambiguous: a candidate with
+`run_length` 85 (an overwhelmingly dominant, sustained groove) lost to one
+with `run_length` 4 purely on a confidence difference. Ranking by
+`run_length` first also cuts cost, since only candidates tied for the top
+`run_length` are ever run through the (expensive) extractor at all --
+usually just one, instead of up to 3. The Librosa fallback path
+(`_pick_kick_offset`, used by `analyze_track`/`analyze_track_and_key` only
+if Essentia fails entirely) uses the same `run_length`-primary ranking, for
+the same reason -- tested there too: comparing candidates by their own
+`beat_track()` tempo estimate against a reference BPM didn't discriminate at
+all (an isolated pre-groove transient and the real groove start produced
+the *identical* tempo estimate), since tempo estimation is deliberately
+robust to exactly where a mostly-periodic window starts.
+
+**Pre-roll (`KICK_PRE_ROLL_SEC = 0.35`):** cutting the analysis audio
+exactly on the kick's transient gives the beat tracker's first frame no
+quiet lead-in to compute its own onset/spectral-flux value against, which
+can bias that very first detected beat (used as `beat_anchor`). For tracks
+under `KICK_PRE_ROLL_REFINE_MAX_BPM` (100 BPM), the pre-roll is refined
+after a first pass to one beat's duration (`60/bpm`, clamped to
+`KICK_PRE_ROLL_MIN_SEC`-`KICK_PRE_ROLL_MAX_SEC`, i.e. 0.2-0.5s) -- gated to
+slow tracks specifically because `60/bpm` diverges from the 0.35s default
+for most real music (not just outliers), so refining unconditionally would
+double the extra Essentia call on most songs for a benefit that's clearest
+at slow tempo.
+
+**Past known issue (fixed):** `_warp_beats_to_grid` (shared core of
+`align_beatgrid`/`snap_to_reference`) used to assume `ticks[0]` always maps
+to grid index 0 -- true before kick-trimming existed (Essentia's own first
+detected beat was rarely more than a couple seconds in), but once
+kick-trimmed detection could put `ticks[0]` tens of seconds into the track,
+that assumption produced a nonsensical tens-of-seconds "correction" and
+would have asked RubberBand to crush that whole span down to nothing when
+snapping to another song whose own anchor sits near 0. Fixed by finding
+which grid index (`k0`) `ticks[0]` is actually closest to and enumerating
+from there -- since the target grid is periodic, any integer `k0` lands on
+the same absolute-time grid (phase-locking between songs is unaffected),
+so this only minimizes distortion instead of introducing one.
+
+## Startup: Dependency Checks & Model Prefetch
+
+At server startup (`server.py`, before `serve(app, ...)` -- the server
+starts accepting connections immediately, on its own background thread) the
+app checks its dependencies and pre-downloads every model it needs, so the
+first real separation a user runs never stalls on a multi-GB download, and
+Song 1/Song 2's parallel per-song processing threads can never race each
+other into corrupting a model file (see below).
+
+**`MashupEngine.check_environment()`** — checks ffmpeg/ffplay/demucs/
+rubberband presence, GPU availability, and whether `audio_separator`
+imports; each check is marked `required` (ffmpeg, demucs -- nothing works
+without them) or optional. A failed optional check carries a short
+`warning_label` ("slow processing", "align/snap disabled", "legacy mode
+only") for the UI to show instead of a bare, alarming "error" for something
+that isn't actually broken, just reduced-capability.
+
+**`MashupEngine.prefetch_models()`** — fetches all 7 models (5
+audio-separator + `htdemucs`/`htdemucs_6s`) **in parallel** (one thread
+each, via `ThreadPoolExecutor`) -- they're independent files, nothing about
+them requires serializing. Byte-level download progress is captured by
+transparently swapping in for the exact `tqdm` progress bar
+audio-separator's own download code already creates for the terminal (a
+thread-local context, since multiple models download concurrently and the
+swapped-in class is a single shared module attribute -- installed once for
+the whole batch, not per-model), throttled to ~10 reports/second (audio-
+separator's download loop calls `update()` once per 8KB chunk -- untouched,
+a ~900MB model would be 100,000+ calls). `_model_load_locks` (per-model-
+**filename**, not one global lock) guards every `Separator(...).load_model()`
+call site against the cross-song race (`audio_separator`'s own
+`download_file_if_not_exists()` writes straight to the final path with no
+locking or atomic rename of its own -- two threads seeing "not cached yet"
+at the same moment would both start writing the same file); per-filename
+rather than one lock so prefetching different models in parallel isn't
+serialized by the very same lock meant to stop two threads racing on the
+*same* file.
+
+**Corrupted/incomplete download detection:** `AUDIO_SEPARATOR_MODEL_SIZES`
+holds the exact known-good byte size for each of the 5 audio-separator
+checkpoints; a cached file whose size doesn't match is treated as a
+truncated/corrupted download (deleted and re-fetched) rather than silently
+handed to a real separation later, where it'd surface as a much more
+confusing failure. This only matters for audio-separator's own cache --
+Demucs' weights come from HuggingFace Hub (`~/.cache/huggingface`), which
+downloads to a `.incomplete` temp file and atomically renames it on
+completion, so an interrupted download there can never leave a corrupted
+final blob in the first place. (Size-only checking has a known gap: it
+can't catch corruption that happens to leave the exact right file size --
+confirmed directly during development, from an unrelated file-write
+collision -- so it's a cheap safety net for the common "download got
+killed" case, not a full integrity guarantee.)
+
+**Frontend (`StartupOverlay.jsx`):** polls `/api/startup-status`, which
+reports every check/model's live status (`queued` → `checking` →
+`cached`/`downloading` → `done`/`error`) -- the full list is populated as
+`queued` immediately (`MashupEngine.all_startup_items()`) so the GUI shows
+every item at once rather than one at a time as they're reached. A small
+per-item pacing delay (`_STARTUP_CHECK_DISPLAY_DELAY_SEC` in server.py,
+0.5s) after each "checking" report keeps that state visibly on-screen
+briefly, since the checks themselves are otherwise near-instant. The
+overlay blocks the rest of the UI until every `required` item resolves,
+then shows an OK button (no auto-dismiss) -- optional issues (no GPU,
+rubberband missing) are shown live but never hold that up. Audio-separator
+models additionally get a real progress bar (from the tqdm bridge above);
+Demucs models just show "downloading…" (their two files are small enough,
+~53-81MB, that a percentage wasn't worth the added complexity of hooking
+HuggingFace Hub's own progress reporting).
+
 ## Development Notes
 
 - BPM detection and stem separation run in background threads
@@ -229,8 +382,10 @@ song(s) used "align", since that source is never separated automatically.
   `Audio/stems/<timestamp>/`, `Audio/renders/`, and download ZIPs
 - Separation results are cached in `separated_stems/<hash>/` (git-ignored);
   `/api/cleanup` clears both this and `Audio/`, but leaves the downloaded
-  model weights under `~/.cache/audio-separator-models` alone (those are a
-  ~3GB download, not per-song generated data)
+  model weights alone (not per-song generated data) -- audio-separator's 5
+  models under `~/.cache/audio-separator-models` (~3.4GB) and Demucs'
+  `htdemucs`/`htdemucs_6s` under `~/.cache/huggingface` (~134MB); see
+  "Startup: Dependency Checks & Model Prefetch" for how these get fetched
 - Requires system FFmpeg installation
 - Beat/BPM detection uses Essentia (`RhythmExtractor2013`); madmom was tried
   first historically but doesn't install in this project's environment

@@ -9,8 +9,17 @@
 
 DualSync Pro is a modern web application for creating audio mashups. Load two songs side-by-side, automatically detect their BPM and key, beatmatch and transpose them to a common key, and mix the results in real-time with independent stem controls. All audio processing is powered by AI (Demucs for stem separation, Essentia for BPM/key detection) and professional audio tools (FFmpeg/RubberBand for beatmatching and pitch-shifting).
 
-![DualSync Pro — intro screen](docs/images/01-intro-screen.png)
-*Figure 1 — The intro screen you see when you first open DualSync Pro, before either song is loaded.*
+> 🖼️ **PLACEHOLDER — new screenshot needed:** `docs/images/01-startup-overlay.png`
+> The blocking startup overlay shown while the server checks dependencies
+> (ffmpeg, RubberBand, GPU, etc.) and fetches any missing AI models. For a
+> screenshot that shows the feature off properly, clear the model caches
+> first (see `docs/images/README.md` for the exact command) and capture it
+> **mid-download** — ideally with a mix of ✅ already-done items, at least
+> one ⬇️ model actively downloading with its live progress bar visible, and
+> one still "in queue". Once you have it, save it as
+> `docs/images/01-startup-overlay.png` and replace this block with:
+> `![DualSync Pro — startup overlay](docs/images/01-startup-overlay.png)`
+> plus a `*Figure 1 — ...*` caption line, matching the figures below.
 
 ---
 
@@ -94,6 +103,13 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 - **Drag-and-drop upload** — intuitive file loading with visual feedback
 - **Responsive design** — works on desktop browsers
 - **Locked controls during processing** — all mixing controls disabled while beatmatching or transposition is in progress
+
+### Startup & Reliability
+- **Blocking startup overlay** — on launch, the app checks every dependency (FFmpeg, RubberBand, GPU, `audio-separator`) and pre-fetches any AI models that aren't cached yet, showing live per-item status (queued → checking → downloading → done) before you can start using it — no more surprise multi-GB download stalling your first real separation
+- **Parallel model downloads** — all 7 models (5 vocal/drum/restoration models + 2 Demucs presets) download simultaneously instead of one after another
+- **Live download progress bars** — real byte-level percentage per model, not just a spinner
+- **Non-blocking optional warnings** — a missing optional dependency (no GPU, no RubberBand) shows a short, clear label ("slow processing", "align/snap disabled") instead of holding up the app or reading like a real error
+- **Corrupted-download protection** — a model file that got truncated by an interrupted previous run (wrong size on disk) is automatically detected and re-fetched, instead of silently failing much later during real separation
 
 ---
 
@@ -199,6 +215,9 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 - **WaveformPreview.jsx** — 120x40px waveform visualization
   - HTML5 AudioContext for audio decoding
   - Canvas rendering with color-coded stems
+- **StartupOverlay.jsx** — blocking startup screen shown while dependencies are checked and models are fetched
+  - Polls `/api/startup-status`; shows every check/model live (queued → checking → downloading with a real progress bar → done)
+  - OK button appears once every required item resolves; optional issues (no GPU, etc.) never hold it up
 
 ### Backend (Flask)
 - **Flask** + Flask-CORS — REST API for audio processing
@@ -218,6 +237,8 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
   - `GET /api/audio-stats` — audio level/statistics for a file
   - `POST /api/split-drums` — split a drums stem into kick/snare/hihat/tom
   - `POST /api/cleanup` — delete all generated audio files and the stem-separation cache (used by "Clean and Reset")
+  - `GET /api/health` — health check; also returns the dependency/environment checks (FFmpeg, RubberBand, GPU, etc.)
+  - `GET /api/startup-status` — polled by the blocking startup overlay for live dependency-check and model-download progress
 
 ### Audio Processing Core (Python)
 - **Multi-Engine Stem Separation Pipeline (9 stems):**
@@ -230,6 +251,8 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 - **FFmpeg** — tempo-stretching, pitch-shifting, spectral filtering, final mix rendering
 - **RubberBand** — per-beat beatgrid warping (align/snap modes) and optional higher-quality time-stretching (Pass 2+)
 - **Mutagen** — WAV/ID3 metadata tagging (title, BPM, key); a hand-built RIFF ACID chunk provides DAW-readable tempo/key
+- **Beatgrid intro-skipping** — kick-transient detection (crest-factor validated) trims a vague/drum-less intro off before Essentia analysis, so `beat_anchor` isn't anchored to weak content at the start of the track; see CLAUDE.md's "Beatgrid & Kick-Transient Detection" for the full mechanism
+- **Model prefetch & locking** — all 7 AI models download in parallel at startup (not per-song), guarded by per-model-file locks against Song 1/Song 2's parallel processing threads racing on the same download; see CLAUDE.md's "Startup: Dependency Checks & Model Prefetch"
 
 ### File Structure
 ```
@@ -238,6 +261,7 @@ DualSync-Pro/
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── DualMixer.jsx    # Main mixing interface
+│   │   │   ├── StartupOverlay.jsx  # Blocking startup checks/model-download screen
 │   │   │   └── ...
 │   │   ├── styles/
 │   │   └── App.jsx
@@ -245,12 +269,15 @@ DualSync-Pro/
 │   └── package.json
 ├── server.py                     # Flask REST API endpoints
 ├── mashup_engine.py              # Audio processing core
+├── validate_pipeline.py          # Dev/QA: sanity-check beatgrid detection against real audio
 ├── requirements.txt              # Python dependencies
 ├── separated_stems/[hash]/       # Stem-separation cache (git-ignored)
-└── Audio/                        # Generated stems/mixes (git-ignored)
-    ├── stems/[timestamp]/        # Stems per processed song
-    ├── renders/                  # Final mixes
-    └── ...                       # Uploaded/aligned WAVs, download ZIPs
+├── Audio/                        # Generated stems/mixes (git-ignored)
+│   ├── stems/[timestamp]/        # Stems per processed song
+│   ├── renders/                  # Final mixes
+│   ├── validation_tracks/        # Test tracks for validate_pipeline.py (git-ignored)
+│   └── ...                       # Uploaded/aligned WAVs, download ZIPs
+└── ...
 ```
 
 ---
@@ -261,7 +288,7 @@ DualSync-Pro/
 - **Python 3.10+** (3.12+ recommended)
 - **Node.js 16+** (for React frontend)
 - **FFmpeg** (for audio processing)
-- **Internet connection** (first run downloads Demucs ~500MB, plus the audio-separator vocal/drum/restoration models ~3GB — both cached persistently afterward)
+- **Internet connection** (first run downloads ~3.5GB across 7 models — Demucs ~134MB, the audio-separator vocal/drum/restoration models ~3.4GB — all fetched in parallel by the startup overlay, cached persistently afterward)
 
 ### Clone the Repository
 
@@ -339,11 +366,27 @@ source .venv/bin/activate    # or .venv\Scripts\activate on Windows
 python3 server.py
 ```
 
-Output:
+Output (first run — dependency checks, then downloading whatever's not cached yet, ~3.5GB total, all in parallel):
 ```
- * Running on http://127.0.0.1:5000
- * Press CTRL+C to quit
+============================================================
+DualSync Pro -- startup checks
+============================================================
+✅ ffmpeg: Required for all audio conversion/mixing -- app will not function without it.
+✅ ffplay: Used for in-app preview playback only.
+✅ demucs: Required for stem separation (both legacy and multi-engine mode).
+✅ rubberband: Required for the 'Align beatgrid' and 'Snap to reference' features only -- the rest of the app works without it.
+⚠️  gpu: No GPU detected -- separation will still work but run much slower on CPU.
+✅ audio_separator: Multi-engine (9-stem) mode is available.
+------------------------------------------------------------
+Checking cached models (downloads anything missing)...
+  ⬇️  Vocal model (Mel-Band RoFormer): downloading (40%)
+  ⬇️  Vocal model (BS-RoFormer): downloading (60%)
+  ...
+✅ Model prefetch complete.
+============================================================
+Serving on http://127.0.0.1:5000
 ```
+On every later run, once everything's cached, this whole sequence takes a couple of seconds. Meanwhile the browser shows a blocking startup overlay with the same information (see the Features section) — you don't need to watch this terminal output, it's just there too.
 
 **Start the React frontend (Terminal 2):**
 
@@ -390,14 +433,19 @@ cd ..
 
 ## Troubleshooting
 
-### Demucs Model Download Fails
-On first run, Demucs downloads a ~500MB AI model. This requires internet connection and may take 1-2 minutes.
+### Model Download Fails or Gets Stuck
+On first run, the startup overlay downloads ~3.5GB across 7 AI models (all in parallel) before the app becomes usable — this needs an internet connection and can take several minutes depending on your connection. Watch the server's own terminal output for per-model progress; a model that fails shows a clear `error` status in the overlay (with the underlying error printed server-side) instead of hanging silently.
 
-**If stuck:**
+**If a specific model seems stuck or corrupted, force a re-fetch by deleting its cached file and restarting the server:**
 ```bash
-# Manually download the model
-python3 -c "from demucs.apply import load_model; load_model('htdemucs')"
+# audio-separator models (vocals/drums/restoration)
+rm ~/.cache/audio-separator-models/<filename>.ckpt
+
+# Demucs models
+rm -rf ~/.cache/huggingface/hub/models--adefossez--HTDemucs      # legacy 4-stem
+rm -rf ~/.cache/huggingface/hub/models--adefossez--HTDemucs-6s   # multi-engine 6-stem
 ```
+The startup check re-downloads whatever's missing the next time `python3 server.py` runs; it also auto-detects and re-fetches an audio-separator model whose file size doesn't match the expected size (a truncated download from an interrupted previous run), so this manual step should rarely be needed.
 
 ### FFmpeg Not Found
 Ensure FFmpeg is in your system PATH:
@@ -566,13 +614,13 @@ React frontend requires Node.js 16+ with packages listed in `frontend/package.js
 - **Processor:** Modern CPU (Intel i5+ or AMD Ryzen 5+) recommended for real-time mixing
 - **RAM:** 8GB minimum, 16GB recommended (stem separation uses ~2-4GB per song)
 - **Storage:** 50GB+ free space (Demucs + audio-separator models ~3.5GB total, plus generated stems/mixes)
-- **Network:** Internet required for initial Demucs model download (~500MB)
+- **Network:** Internet required for the initial model download (~3.5GB total, fetched in parallel at startup)
 
 ---
 
 ## Performance Notes
 
-- **First run:** Demucs (~500MB) and the audio-separator models (vocal ensemble, DrumSep, denoise, de-reverb — ~3GB total) download once and are cached persistently (`~/.cache/audio-separator-models`), so this cost is paid only once, ever, not per song
+- **First run:** all 7 models — Demucs `htdemucs`/`htdemucs_6s` (~134MB, `~/.cache/huggingface`) and the 5 audio-separator models (vocal ensemble, DrumSep, denoise, de-reverb — ~3.4GB, `~/.cache/audio-separator-models`) — download once, **in parallel**, behind the startup overlay, and are cached persistently, so this cost is paid only once, ever, not per song
 - **Analysis:** seconds — BPM/Key detection runs before any separation, so you see real detected values right away
 - **Stem separation:** ~10-15 min per song, running for both songs in parallel (restoration is no longer part of this — it's opt-in per stem afterward)
 - **Beatmatching:** 30 seconds to 2 minutes (depends on convergence)
@@ -604,10 +652,18 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
-**Last Updated:** 2026-09-27  
+**Last Updated:** 2026-09-30  
 **Current Branch:** main
 
-## Recent Improvements (2026-09-27)
+## Recent Improvements (2026-09-30)
+- ✅ **Beatgrid intro-skipping:** kick-transient detection (crest-factor validated against 38 real tracks) now trims a vague/drum-less intro before BPM/beat analysis, instead of anchoring the whole beatgrid to whatever weak content sits at the start of the track
+- ✅ Fixed a real bug in the beatgrid-snap/align warp: it used to assume the first detected beat was always at grid position zero, which broke once intro-skipping could push that first beat tens of seconds into the track — producing a nonsensical multi-second "correction" instead of a real one
+- ✅ New `validate_pipeline.py` dev tool to sanity-check the above against a folder of real audio files (candidates found, chosen trim point, timing, crashes)
+- ✅ **Startup overlay:** the app now checks every dependency (FFmpeg, RubberBand, GPU, `audio-separator`) and pre-fetches any missing AI models before you can start using it, with live per-item progress — no more a multi-GB download silently starting mid-way through your first real separation
+- ✅ All 7 AI models now download **in parallel** at startup instead of one after another, with real byte-level progress bars for the 5 largest ones
+- ✅ Fixed a genuine race condition where Song 1 and Song 2's parallel processing threads could both start downloading the same model file at the same time; also added automatic detection of a truncated/corrupted cached model (from an interrupted previous download) instead of silently using it
+
+## Earlier Improvements (2026-09-27)
 - ✅ Vocal quality: fixed a long-standing mismatch where the code loaded a lower-quality Karaoke model instead of the documented one, then upgraded further to an ensemble (two models, averaged) after a listening test showed it beats either model alone
 - ✅ Analyze-first flow: BPM/Key detection now runs as its own fast (seconds) step before the slow stem separation, so you see real detected values (and can override them) before choosing "process as is" vs a shared target BPM/Key
 - ✅ Both songs now separate **in parallel** once you make that choice, instead of one after another

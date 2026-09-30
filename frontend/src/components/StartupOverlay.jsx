@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 
 const STATUS_ICON = {
+  queued: '⋯',
   checking: '⏳',
   cached: '✅',
   done: '✅',
@@ -9,6 +10,7 @@ const STATUS_ICON = {
 }
 
 const STATUS_TEXT = {
+  queued: 'in queue',
   checking: 'checking…',
   cached: 'ok (cached)',
   done: 'ok',
@@ -24,13 +26,27 @@ function ItemRow({ item }) {
   // short warning_label ("slow processing", "align/snap disabled") instead
   // of the bare word "error", which reads as a real problem.
   const statusText = isWarning && item.warning_label ? item.warning_label : (STATUS_TEXT[item.status] || item.status)
+  // Real byte-level progress (see mashup_engine.py's tqdm bridge) -- only
+  // available for the 5 audio-separator models, not the 2 Demucs ones or
+  // the environment checks, which just show the plain "downloading…" text.
+  const showBar = item.status === 'downloading' && typeof item.progress === 'number'
+
   return (
-    <li className={`startup-item${isBlockingError ? ' startup-item--error' : ''}${isWarning ? ' startup-item--warning' : ''}`}>
-      <span className={`startup-item-icon${item.status === 'checking' ? ' startup-item-icon--pulse' : ''}`}>
-        {isWarning ? '⚠️' : icon}
-      </span>
-      <span className="startup-item-label">{item.label}</span>
-      <span className="startup-item-status">{statusText}</span>
+    <li className={`startup-item${isBlockingError ? ' startup-item--error' : ''}${isWarning ? ' startup-item--warning' : ''}${item.status === 'queued' ? ' startup-item--queued' : ''}`}>
+      <div className="startup-item-row">
+        <span className={`startup-item-icon${item.status === 'checking' ? ' startup-item-icon--pulse' : ''}`}>
+          {isWarning ? '⚠️' : icon}
+        </span>
+        <span className="startup-item-label">{item.label}</span>
+        <span className="startup-item-status">
+          {showBar ? `${Math.round(item.progress * 100)}%` : statusText}
+        </span>
+      </div>
+      {showBar && (
+        <div className="startup-progress-track">
+          <div className="startup-progress-fill" style={{ width: `${item.progress * 100}%` }} />
+        </div>
+      )}
     </li>
   )
 }

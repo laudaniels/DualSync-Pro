@@ -123,12 +123,29 @@ body {
 }
 
 .startup-item {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   font-size: 13px;
   color: #ddd;
   padding: 4px 0;
+}
+
+.startup-item-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.startup-progress-track {
+  margin: 4px 0 0 26px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.startup-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #6366f1, #8b5cf6);
+  transition: width 0.15s ease-out;
 }
 
 .startup-item-icon {
@@ -164,6 +181,10 @@ body {
 
 .startup-item--warning .startup-item-status {
   color: #f59e0b;
+}
+
+.startup-item--queued {
+  opacity: 0.45;
 }
 
 .startup-error-note {

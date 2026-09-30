@@ -171,17 +171,92 @@ class MashupEngine:
     _preview_process = None
     _active_encode_processes = []
 
-    # Guards every audio-separator Separator(...).load_model(...) call
-    # (which downloads the model file on first use if it isn't cached yet).
-    # Song 1 and Song 2 are processed on their own top-level threads in
-    # parallel -- without this, both could see "not cached yet" at the same
-    # moment and both start writing the same destination file at once
-    # (audio-separator's own download_file_if_not_exists() has no locking
-    # or atomic rename of its own). Class-level so it's shared across the
+    # Every audio-separator model this app ever loads (see the 4 Separator(
+    # ...).load_model(...) call sites above/below) plus the 2 Demucs presets
+    # -- kept in one place so prefetch_models() and any future caller can
+    # enumerate them without hunting through separate_stems_multi_engine().
+    # (key, filename, label, required) -- `required` marks a model whose
+    # absence would break basic app function (nothing else can proceed
+    # without it), vs. one that only disables a specific optional feature.
+    AUDIO_SEPARATOR_MODEL_FILES = [
+        ("vocals_melband", "vocals_mel_band_roformer.ckpt", "Vocal model (Mel-Band RoFormer)", False),
+        ("vocals_bsroformer", "model_bs_roformer_ep_368_sdr_12.9628.ckpt", "Vocal model (BS-RoFormer)", False),
+        ("drumsep", "MDX23C-DrumSep-aufr33-jarredou.ckpt", "Kick/snare model (MDX23C DrumSep)", False),
+        ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "Restoration: denoise model", False),
+        ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "Restoration: de-reverb model", False),
+    ]
+
+    # Exact size (bytes) of each pinned checkpoint, measured from a known-
+    # good download -- used only to catch a truncated/corrupted local file
+    # (audio-separator's own download_file_if_not_exists() writes straight
+    # to the final path with no atomic rename, so a download killed
+    # mid-transfer leaves a permanently "present but broken" file that a
+    # bare os.path.isfile() check would wrongly call "cached"). NOT an
+    # update mechanism -- these models are pinned by filename (the SDR/epoch
+    # suffix IS the version), and upstream publishing a genuine new version
+    # would ship under a new filename, not silently replace this one. If a
+    # future upstream re-upload ever legitimately changes this exact
+    # file's size, update the number here along with it.
+    AUDIO_SEPARATOR_MODEL_SIZES = {
+        "vocals_mel_band_roformer.ckpt": 913106900,
+        "model_bs_roformer_ep_368_sdr_12.9628.ckpt": 639317465,
+        "MDX23C-DrumSep-aufr33-jarredou.ckpt": 437652699,
+        "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": 913097300,
+        "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt": 913107578,
+    }
+    # (key, model_name, label, required) -- htdemucs is legacy mode's
+    # default model, so basic (non-multi-engine) separation needs it;
+    # htdemucs_6s is multi-engine-only.
+    DEMUCS_MODELS = [
+        ("demucs_htdemucs", "htdemucs", "Demucs (legacy 4-stem model)", True),
+        ("demucs_htdemucs6s", "htdemucs_6s", "Demucs (multi-engine 6-stem model)", False),
+    ]
+
+    # (name, required) metadata for check_environment()'s checks, in the
+    # order they run -- kept alongside AUDIO_SEPARATOR_MODEL_FILES/
+    # DEMUCS_MODELS purely so all_startup_items() can build the full,
+    # up-front "queued" list without running anything. NOTE: if a check is
+    # ever added to/removed from check_environment(), update this list too
+    # -- there's no other link between the two.
+    ENVIRONMENT_CHECK_NAMES = [
+        ("ffmpeg", True),
+        ("ffplay", False),
+        ("demucs", True),
+        ("rubberband", False),
+        ("gpu", False),
+        ("audio_separator", False),
+    ]
+
+    # Guards every audio-separator Separator(...).load_model(...) call for
+    # a given model FILE (downloads it on first use if not cached yet).
+    # Keyed per-filename rather than one single lock, so prefetch_models()
+    # can fetch different models in parallel -- only two attempts at the
+    # SAME file need to be mutually exclusive. That matters for Song 1 and
+    # Song 2's parallel per-song processing threads: without this, both
+    # could see "not cached yet" for the same model at the same moment and
+    # both start writing the same destination file at once (audio-
+    # separator's own download_file_if_not_exists() has no locking or
+    # atomic rename of its own). Class-level so it's shared across the
     # separate MashupEngine() instances each request creates. Only guards
     # the load step, not the actual (slow) separation call that follows --
     # that still runs in parallel across songs/models as intended.
-    _model_load_lock = threading.Lock()
+    _model_load_locks = {filename: threading.Lock() for _key, filename, _label, _required in AUDIO_SEPARATOR_MODEL_FILES}
+
+    @classmethod
+    def all_startup_items(cls):
+        """The full set of startup checks/models, all in "queued" status --
+        for a caller (server.py) to populate its state with up front, so a
+        GUI can show the complete list immediately instead of items only
+        appearing one at a time as check_environment()/prefetch_models()
+        actually get to them."""
+        items = []
+        for name, required in cls.ENVIRONMENT_CHECK_NAMES:
+            items.append({"key": f"env_{name}", "label": name, "status": "queued", "required": required})
+        for key, _filename, label, required in cls.AUDIO_SEPARATOR_MODEL_FILES:
+            items.append({"key": key, "label": label, "status": "queued", "required": required})
+        for key, _model_name, label, required in cls.DEMUCS_MODELS:
+            items.append({"key": key, "label": label, "status": "queued", "required": required})
+        return items
 
     @classmethod
     def is_previewing(cls):
@@ -206,28 +281,6 @@ class MashupEngine:
                 proc.terminate()
         cls._active_encode_processes = []
 
-    # Every audio-separator model this app ever loads (see the 4 Separator(
-    # ...).load_model(...) call sites above/below) plus the 2 Demucs presets
-    # -- kept in one place so prefetch_models() and any future caller can
-    # enumerate them without hunting through separate_stems_multi_engine().
-    # (key, filename, label, required) -- `required` marks a model whose
-    # absence would break basic app function (nothing else can proceed
-    # without it), vs. one that only disables a specific optional feature.
-    AUDIO_SEPARATOR_MODEL_FILES = [
-        ("vocals_melband", "vocals_mel_band_roformer.ckpt", "Vocal model (Mel-Band RoFormer)", False),
-        ("vocals_bsroformer", "model_bs_roformer_ep_368_sdr_12.9628.ckpt", "Vocal model (BS-RoFormer)", False),
-        ("drumsep", "MDX23C-DrumSep-aufr33-jarredou.ckpt", "Kick/snare model (MDX23C DrumSep)", False),
-        ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "Restoration: denoise model", False),
-        ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "Restoration: de-reverb model", False),
-    ]
-    # (key, model_name, label, required) -- htdemucs is legacy mode's
-    # default model, so basic (non-multi-engine) separation needs it;
-    # htdemucs_6s is multi-engine-only.
-    DEMUCS_MODELS = [
-        ("demucs_htdemucs", "htdemucs", "Demucs (legacy 4-stem model)", True),
-        ("demucs_htdemucs6s", "htdemucs_6s", "Demucs (multi-engine 6-stem model)", False),
-    ]
-
     @staticmethod
     def _is_demucs_model_cached(model_name):
         """Demucs weights live in HuggingFace Hub's cache, under a
@@ -244,9 +297,12 @@ class MashupEngine:
     def prefetch_models(cls, progress_callback=None):
         """Download every model this app needs, if not already cached, so
         the first real separation a user runs doesn't stall (or, worse,
-        race -- see _model_load_lock) on a multi-GB download. Meant to be
+        race -- see _model_load_locks) on a multi-GB download. Meant to be
         called once at server startup, before any request can trigger a
-        real separation.
+        real separation. All 7 models are fetched in parallel (one thread
+        each) -- they're independent files/URLs, so nothing about them
+        requires serializing, and this is what actually gets the download
+        time down instead of just displaying it more nicely.
 
         progress_callback, if given, is called for each model -- first with
         status "checking" (so a caller pacing this for a UI, e.g. server.py,
@@ -256,46 +312,121 @@ class MashupEngine:
         message). Checking for "already cached" first (rather than always
         calling the download-if-needed function) is what lets the GUI show
         an instant checkmark for models that don't need fetching, instead
-        of every model looking identical mid-startup.
+        of every model looking identical mid-startup. progress_callback is
+        called concurrently from multiple threads (one per model) -- it
+        must be safe for that (server.py's is, via its state lock).
+
+        Byte-level "progress" (0.0-1.0) is included alongside "downloading"
+        for the 5 audio-separator models, by transparently swapping in for
+        the exact tqdm progress bar audio-separator's own download code
+        already creates for the terminal -- so a GUI caller can show the
+        identical progress a terminal would, without this needing to know
+        anything about audio-separator's URL-resolution/download internals.
+        Since multiple models now download at once, that swap-in is a
+        single one installed once for the whole batch (not per-model,
+        which would race threads against each other rewriting the same
+        module attribute); each thread's own bridge instance instead reads
+        which model IT is fetching from thread-local storage, set right
+        before that thread's download call.
 
         Never raises -- a single model failing to download is reported via
         its own "error" status so the rest can still proceed; the caller
         decides what to do with a failed required model."""
         import logging
+        import threading
+        import time
+        from concurrent.futures import ThreadPoolExecutor
         from audio_separator.separator import Separator
+        import audio_separator.separator.separator as _as_module
 
-        def report(key, label, status, required, detail=None):
+        def report(key, label, status, required, detail=None, progress=None):
             if progress_callback:
                 progress_callback({"key": key, "label": label, "status": status,
-                                    "required": required, "detail": detail})
-            logging.info(f"🔧 {label}: {status}")
+                                    "required": required, "detail": detail, "progress": progress})
+            logging.info(f"🔧 {label}: {status}" + (f" ({progress:.0%})" if progress is not None else ""))
 
-        for key, filename, label, required in cls.AUDIO_SEPARATOR_MODEL_FILES:
+        _tqdm_thread_ctx = threading.local()
+
+        class _Bridge:
+            # audio-separator's own download loop calls update() once per
+            # 8KB chunk -- for a ~900MB model that's well over 100,000
+            # calls. Without throttling, every single one would update
+            # shared state, flooding both the console and
+            # /api/startup-status for no visible benefit (a GUI polling
+            # every ~700ms only ever sees the latest value anyway).
+            # Reporting at most ~10x/second is still smooth for a progress
+            # bar and cuts that by ~4-5 orders of magnitude.
+            _MIN_REPORT_INTERVAL_SEC = 0.1
+
+            def __init__(self, total=0, *_args, **_kwargs):
+                self._total = total or 0
+                self._n = 0
+                self._last_report_time = 0.0
+                # Captured at construction time, on whichever thread is
+                # actually making this particular download call -- see the
+                # docstring above for why this has to be thread-local
+                # rather than a closure over one shared key/label/required.
+                self._ctx = getattr(_tqdm_thread_ctx, "value", None)
+
+            def update(self, n):
+                self._n += n
+                if not self._total or not self._ctx:
+                    return
+                key, label, required = self._ctx
+                now = time.monotonic()
+                is_last_chunk = self._n >= self._total
+                if is_last_chunk or (now - self._last_report_time) >= self._MIN_REPORT_INTERVAL_SEC:
+                    self._last_report_time = now
+                    report(key, label, "downloading", required, progress=min(self._n / self._total, 1.0))
+
+            def close(self):
+                pass
+
+        def _fetch_audio_separator_model(key, filename, label, required):
             report(key, label, "checking", required)
-            if (AUDIO_SEPARATOR_MODEL_DIR / filename).is_file():
-                report(key, label, "cached", required)
-                continue
-            report(key, label, "downloading", required)
+            model_path = AUDIO_SEPARATOR_MODEL_DIR / filename
+            if model_path.is_file():
+                expected_size = cls.AUDIO_SEPARATOR_MODEL_SIZES.get(filename)
+                actual_size = model_path.stat().st_size
+                if expected_size is None or actual_size == expected_size:
+                    report(key, label, "cached", required)
+                    return
+                # Present but the wrong size -- almost certainly a download
+                # that got killed mid-transfer on a previous run (audio-
+                # separator writes straight to this path, no atomic rename).
+                # Remove it and fall through to re-download rather than
+                # silently handing a broken checkpoint to real separation
+                # later, where it'd surface as a much more confusing failure.
+                logging.warning(f"{filename} is {actual_size} bytes, expected {expected_size} -- "
+                                 f"treating as a corrupted/incomplete download and re-fetching")
+                try:
+                    model_path.unlink()
+                except OSError:
+                    pass
+            report(key, label, "downloading", required, progress=0.0)
+            _tqdm_thread_ctx.value = (key, label, required)
             try:
-                with cls._model_load_lock:
+                with cls._model_load_locks[filename]:
                     separator = Separator(output_dir=str(BASE_DIR), model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
                     separator.download_model_files(filename)
                 report(key, label, "done", required)
             except Exception as e:
                 logging.error(f"Failed to fetch model {filename}: {e}")
                 report(key, label, "error", required, detail=str(e))
+            finally:
+                _tqdm_thread_ctx.value = None
 
-        # Demucs weights come from HuggingFace Hub (~/.cache/huggingface),
-        # not audio-separator's own cache -- also persistent, not /tmp, so
-        # no equivalent to the AUDIO_SEPARATOR_MODEL_DIR override is needed
-        # here. get_model() fetches (if needed) and loads the checkpoint
-        # without running inference, which is all we need here.
-        import demucs.pretrained
-        for key, model_name, label, required in cls.DEMUCS_MODELS:
+        def _fetch_demucs_model(key, model_name, label, required):
+            # Demucs weights come from HuggingFace Hub (~/.cache/huggingface),
+            # not audio-separator's own cache -- also persistent, not /tmp,
+            # so no equivalent to the AUDIO_SEPARATOR_MODEL_DIR override is
+            # needed here. get_model() fetches (if needed) and loads the
+            # checkpoint without running inference, which is all we need.
+            import demucs.pretrained
             report(key, label, "checking", required)
             if cls._is_demucs_model_cached(model_name):
                 report(key, label, "cached", required)
-                continue
+                return
             report(key, label, "downloading", required)
             try:
                 demucs.pretrained.get_model(model_name)
@@ -303,6 +434,19 @@ class MashupEngine:
             except Exception as e:
                 logging.error(f"Failed to fetch Demucs model {model_name}: {e}")
                 report(key, label, "error", required, detail=str(e))
+
+        tasks = [(_fetch_audio_separator_model, args) for args in cls.AUDIO_SEPARATOR_MODEL_FILES]
+        tasks += [(_fetch_demucs_model, args) for args in cls.DEMUCS_MODELS]
+
+        original_tqdm = _as_module.tqdm
+        _as_module.tqdm = _Bridge
+        try:
+            with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                futures = [executor.submit(fn, *args) for fn, args in tasks]
+                for f in futures:
+                    f.result()  # each task already catches its own exceptions; this just re-raises anything that somehow escaped
+        finally:
+            _as_module.tqdm = original_tqdm
 
         logging.info("✅ Model prefetch complete.")
 
@@ -2397,7 +2541,7 @@ class MashupEngine:
 
         def _vocals_with_model(model_filename):
             separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            with MashupEngine._model_load_lock:
+            with MashupEngine._model_load_locks[model_filename]:
                 separator.load_model(model_filename=model_filename)
 
             logging.info(f"  Separating vocals from {Path(audio_path).name} using {model_filename}...")
@@ -2539,7 +2683,7 @@ class MashupEngine:
 
         try:
             separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            with MashupEngine._model_load_lock:
+            with MashupEngine._model_load_locks["MDX23C-DrumSep-aufr33-jarredou.ckpt"]:
                 separator.load_model(model_filename="MDX23C-DrumSep-aufr33-jarredou.ckpt")
 
             logging.info(f"  Splitting kick/snare from {Path(drums_path).name}...")
@@ -2625,8 +2769,9 @@ class MashupEngine:
                 "Restoration", lambda label: progress_callback(0.0, label) if progress_callback else None):
             denoiser = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
             dereverber = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            with MashupEngine._model_load_lock:
+            with MashupEngine._model_load_locks["denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"]:
                 denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
+            with MashupEngine._model_load_locks["dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"]:
                 dereverber.load_model(model_filename="dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
 
         def _resolve(output_files, marker):
