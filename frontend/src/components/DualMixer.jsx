@@ -1096,8 +1096,6 @@ export default function DualMixer() {
   // open together, instead of Song 1's mixer popping in while Song 2 is still
   // a spinner (or vice versa).
   const bothStemsReady = !!stems[0] && !!stems[1];
-  const waitingOnSlot = !stems[0] ? 0 : !stems[1] ? 1 : null;
-  const showWaitingBar = waitingOnSlot !== null && (!!stems[0] || !!stems[1]);
 
   return (
     <div className="dual-mixer">
@@ -1148,39 +1146,6 @@ export default function DualMixer() {
             />
           ))}
         </div>
-
-        {/* Shared progress bar while one song is done and the other is still
-            separating -- keeps both volume panels from opening lopsided. */}
-        {showWaitingBar && (
-          <div style={{ margin: '10px 0 20px' }}>
-            <div style={{ fontSize: '12px', color: '#94a3b8', marginBottom: '6px', textAlign: 'center' }}>
-              ⏳ Waiting for Song {waitingOnSlot + 1}
-              {initialLoadSlots[waitingOnSlot]?.current_step ? `: ${initialLoadSlots[waitingOnSlot].current_step}` : '...'}
-            </div>
-            <div style={{
-              background: 'rgba(99, 102, 241, 0.1)',
-              border: '1px solid #6366f1',
-              borderRadius: '4px',
-              overflow: 'hidden',
-              height: '24px'
-            }}>
-              <div style={{
-                width: `${initialLoadSlots[waitingOnSlot]?.progress ?? 0}%`,
-                height: '100%',
-                background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
-                transition: 'width 0.3s ease',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                color: '#fff',
-                fontSize: '12px',
-                fontWeight: 'bold'
-              }}>
-                {Math.round(initialLoadSlots[waitingOnSlot]?.progress ?? 0)}%
-              </div>
-            </div>
-          </div>
-        )}
 
         {/* Waveform Stem Selector - Center Section */}
         {stems[0] && stems[1] && (
