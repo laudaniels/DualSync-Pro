@@ -9,17 +9,9 @@
 
 DualSync Pro is a modern web application for creating audio mashups. Load two songs side-by-side, automatically detect their BPM and key, beatmatch and transpose them to a common key, and mix the results in real-time with independent stem controls. All audio processing is powered by AI (Demucs for stem separation, Essentia for BPM/key detection) and professional audio tools (FFmpeg/RubberBand for beatmatching and pitch-shifting).
 
-> 🖼️ **PLACEHOLDER — new screenshot needed:** `docs/images/01-startup-overlay.png`
-> The blocking startup overlay shown while the server checks dependencies
-> (ffmpeg, RubberBand, GPU, etc.) and fetches any missing AI models. For a
-> screenshot that shows the feature off properly, clear the model caches
-> first (see `docs/images/README.md` for the exact command) and capture it
-> **mid-download** — ideally with a mix of ✅ already-done items, at least
-> one ⬇️ model actively downloading with its live progress bar visible, and
-> one still "in queue". Once you have it, save it as
-> `docs/images/01-startup-overlay.png` and replace this block with:
-> `![DualSync Pro — startup overlay](docs/images/01-startup-overlay.png)`
-> plus a `*Figure 1 — ...*` caption line, matching the figures below.
+![DualSync Pro — startup overlay](docs/images/01-startup-overlay.png)
+*Figure 1 — Startup overlay shown while the server checks dependencies
+(ffmpeg, RubberBand, GPU, etc.) and fetches any missing AI models.*
 
 ---
 
