@@ -63,15 +63,10 @@ class MashupEngine:
     MDX23C DrumSep (kick/snare/hihat/tom), denoise + de-reverb (restoration)."""
 
     STEM_NAMES = ("vocals", "drums", "bass", "other")
-    FINAL_STEM_NAMES = (
-        "vocals",
-        "kick", "snare", "hihat", "tom",
-        "bass", "guitar", "piano", "other",
-    )
     TARGET_SAMPLE_RATE = 44100
 
     # How far before a detected kick transient to actually start beat-grid
-    # analysis (see _detect_first_kick_offset). Cutting an audio array
+    # analysis (see _detect_kick_candidates). Cutting an audio array
     # exactly on a hard transient gives beat trackers no quiet lead-in to
     # compute their first frame's onset/spectral-flux value against, which
     # can bias that very first detected beat -- exactly the value used as
@@ -114,7 +109,7 @@ class MashupEngine:
     KICK_SEARCH_MAX_SEC = 90.0
 
     # Crest-factor (peak / RMS) window and minimum ratio for validating a
-    # candidate kick transient (see _detect_first_kick_offset). A genuine
+    # candidate kick transient (see _detect_kick_candidates). A genuine
     # percussive hit's energy is a short spike far above its surroundings;
     # a sustained drone or pad keeps peak and RMS close together no matter
     # how loud or distorted it's mastered, so this stays reliable even when
@@ -146,30 +141,6 @@ class MashupEngine:
     # they plausibly represent a genuinely different section (an early
     # one-off transient vs. the track's real groove), not the next beat.
     KICK_CANDIDATE_MIN_GAP_SEC = 2.0
-
-    # Best-in-class audio models (verified SDR scores)
-    AUDIO_SEPARATOR_MODELS = {
-        'vocals_best': {
-            'model_name': 'mel_band_roformer + bs_roformer ensemble',
-            'description': 'Average of Mel-Band RoFormer (12.6 dB SDR) and BS-RoFormer (12.1 dB SDR) -- cleaner than either alone',
-        },
-        'drums_6stem': {
-            'model_name': 'demucs',
-            'preset': 'htdemucs_6s',
-            'description': 'Demucs 6-stem - 9.5 dB SDR, bass/guitar/piano/other/drums',
-        },
-        'kick_snare_ml': {
-            'model_name': 'mdx23c',
-            'description': 'MDX23C DrumSep - SOTA kick/snare ML separation',
-        }
-    }
-
-    # Class-level, not per-instance: the GUI creates a fresh MashupEngine()
-    # for every button click, but "is a preview currently playing" and "kill
-    # everything this app has spawned" both need to survive across those
-    # short-lived instances.
-    _preview_process = None
-    _active_encode_processes = []
 
     # Every audio-separator model this app ever loads (see the 4 Separator(
     # ...).load_model(...) call sites above/below) plus the 2 Demucs presets
@@ -220,7 +191,6 @@ class MashupEngine:
     # -- there's no other link between the two.
     ENVIRONMENT_CHECK_NAMES = [
         ("ffmpeg", True),
-        ("ffplay", False),
         ("demucs", True),
         ("rubberband", False),
         ("gpu", False),
@@ -257,29 +227,6 @@ class MashupEngine:
         for key, _model_name, label, required in cls.DEMUCS_MODELS:
             items.append({"key": key, "label": label, "status": "queued", "required": required})
         return items
-
-    @classmethod
-    def is_previewing(cls):
-        return cls._preview_process is not None and cls._preview_process.poll() is None
-
-    @classmethod
-    def stop_preview(cls):
-        """Kill the currently playing preview, if any."""
-        if cls._preview_process and cls._preview_process.poll() is None:
-            cls._preview_process.terminate()
-        cls._preview_process = None
-
-    @classmethod
-    def stop_all(cls):
-        """Kill every ffmpeg/ffplay process this app has spawned. Call this
-        before the GUI exits -- ffmpeg/ffplay are independent OS processes
-        and are not tied to the Python process's lifetime, so closing the
-        window does not stop them on its own."""
-        cls.stop_preview()
-        for proc in cls._active_encode_processes:
-            if proc.poll() is None:
-                proc.terminate()
-        cls._active_encode_processes = []
 
     @staticmethod
     def _is_demucs_model_cached(model_name):
@@ -398,7 +345,7 @@ class MashupEngine:
                 # silently handing a broken checkpoint to real separation
                 # later, where it'd surface as a much more confusing failure.
                 logging.warning(f"{filename} is {actual_size} bytes, expected {expected_size} -- "
-                                 f"treating as a corrupted/incomplete download and re-fetching")
+                                 "treating as a corrupted/incomplete download and re-fetching")
                 try:
                     model_path.unlink()
                 except OSError:
@@ -484,9 +431,6 @@ class MashupEngine:
         add("ffmpeg", shutil.which("ffmpeg") is not None,
             "Required for all audio conversion/mixing -- app will not function without it.",
             required=True)
-        add("ffplay", shutil.which("ffplay") is not None,
-            "Used for in-app preview playback only.",
-            warning_label="preview disabled")
 
         demucs_ok = shutil.which("demucs") is not None
         if not demucs_ok:
@@ -523,18 +467,18 @@ class MashupEngine:
 
     def __init__(self):
         self.ffmpeg = "ffmpeg"
-        self.ffplay = "ffplay"
         self.stems_dir = BASE_DIR / "separated_stems"
 
-    def separate_stems(self, songs, use_multi_engine=False, use_restoration=True, progress_callback=None):
+    def separate_stems(self, songs, use_multi_engine=False, progress_callback=None):
         """Stem separation with optional multi-engine mode.
 
         Args:
             songs: List of audio file paths
-            use_multi_engine: If True, use advanced vocal model + Demucs-6s + DrumSep + ML
-                             restoration pipeline (9 stems). If False, use legacy
-                             Demucs-only (7 stems) for backward compatibility.
-            use_restoration: If True and use_multi_engine=True, apply denoise + de-reverb restoration.
+            use_multi_engine: If True, use advanced vocal model + Demucs-6s + DrumSep
+                             pipeline (9 stems). If False, use legacy Demucs-only
+                             (7 stems) for backward compatibility. Denoise + de-reverb
+                             restoration is never applied here -- it's opt-in per stem,
+                             after separation, via /api/restore-stem.
             progress_callback: Optional callable(fraction, label) invoked at each internal
                              stage boundary. fraction is 0.0-1.0 across all `songs` combined;
                              label is a short human-readable description of the stage just
@@ -547,8 +491,7 @@ class MashupEngine:
         import logging
 
         if use_multi_engine:
-            return self.separate_stems_multi_engine(songs, use_restoration=use_restoration,
-                                                      progress_callback=progress_callback)
+            return self.separate_stems_multi_engine(songs, progress_callback=progress_callback)
 
         # Legacy Demucs-only mode
         if not shutil.which("demucs"):
@@ -593,7 +536,7 @@ class MashupEngine:
                 drum_splits = self.split_drums(stems['drums'], str(folder))
                 del stems['drums']
                 stems.update(drum_splits)
-                logging.info(f"✅ Drums split into: kick, snare, hi-hat, tom")
+                logging.info("✅ Drums split into: kick, snare, hi-hat, tom")
             except Exception as e:
                 logging.warning(f"⚠️  Drum split failed: {e}")
                 drums_path = stems['drums']
@@ -655,16 +598,6 @@ class MashupEngine:
                 continue
             shutil.move(padded_path, path)
             logging.info(f"🩹 Padded {name}: {durations[name]:.3f}s → {target:.3f}s")
-
-    def _detect_first_kick_offset(self, y, sr, max_search_sec=None):
-        """Convenience wrapper around _detect_kick_candidates for callers
-        with no independent way to score which candidate is actually right
-        (the Librosa beat_track() fallback has no confidence output to
-        compare candidates against) -- just takes the earliest qualifying
-        transient. See _detect_kick_candidates for the detection logic.
-        """
-        candidates = self._detect_kick_candidates(y, sr, max_search_sec)
-        return candidates[0][0] if candidates else None
 
     def _detect_kick_candidates(self, y, sr, max_search_sec=None, max_candidates=3):
         """Locate up to `max_candidates` genuine kick-drum transients in
@@ -1237,57 +1170,6 @@ class MashupEngine:
 
         return bpm, beat_anchor, key, scale
 
-    def analyze_key(self, song_path):
-        """Detect the musical key using librosa chroma (reliable) or essentia (fallback).
-        Returns key as integer: 0=C, 1=C#, ..., 11=B.
-        Returns -1 if detection fails."""
-        import logging
-        import librosa
-        import numpy as np
-
-        # Primary: librosa chroma (always works)
-        try:
-            y, sr = librosa.load(song_path, sr=None, mono=True)
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-            chroma_mean = chroma.mean(axis=1)
-            key = int(np.argmax(chroma_mean))
-            logging.info(f"Key detected via Librosa: {self._key_to_note(key)}")
-            return key
-        except Exception as e:
-            logging.warning(f"Librosa key detection failed: {e}")
-
-        # Fallback to Essentia (may fail without classifier models)
-        try:
-            from essentia.standard import MonoLoader, KeyExtractor
-
-            loader = MonoLoader(filename=song_path, sampleRate=44100)
-            audio = loader()
-            key_extractor = KeyExtractor()
-            key_str, confidence = key_extractor(audio)
-
-            if key_str and confidence > 0.5:
-                key_notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-                key_name = key_str.split()[0]  # Extract note part
-                if key_name in key_notes:
-                    key = key_notes.index(key_name)
-                    logging.info(f"Key detected via Essentia: {key_name} (confidence: {confidence:.2f})")
-                    return key
-        except Exception as e:
-            logging.warning(f"Essentia key detection failed: {e}")
-
-        logging.warning("Key detection failed for all methods")
-        return -1
-
-    @staticmethod
-    def _semitones_between(key1, key2):
-        """Calculate semitone difference between two keys (0-11)."""
-        if key1 == -1 or key2 == -1:
-            return 0
-        diff = (key2 - key1) % 12
-        if diff > 6:
-            diff -= 12
-        return diff
-
     def align_beatgrid(self, input_path, output_path, target_bpm=None):
         """Warp a track so every detected beat lands on a perfectly steady
         tempo grid, correcting drift (vinyl rips, live-tracked recordings)
@@ -1319,7 +1201,6 @@ class MashupEngine:
         import subprocess
         import tempfile
         from pathlib import Path
-        import soundfile as sf
 
         if shutil.which("rubberband") is None:
             raise RuntimeError(
@@ -1988,7 +1869,7 @@ class MashupEngine:
 
         return available
 
-    def render(self, params, preview=False, preview_duration=15):
+    def render(self, params):
         slots = params["songs"]
         stems_by_slot = params.get("stems", [None] * len(slots))
         bpms = params.get("bpms", [None] * len(slots))
@@ -2086,7 +1967,7 @@ class MashupEngine:
             else:
                 raise RuntimeError(
                     f"Song {slot + 1}'s stems are missing or incomplete -- cannot render without them. "
-                    f"Try reprocessing this song's stems."
+                    "Try reprocessing this song's stems."
                 )
 
             # BPM-match this track to the user's target tempo, if both a
@@ -2129,91 +2010,28 @@ class MashupEngine:
         filter_complex += ";" + "".join(mixed_tracks)
         filter_complex += f"amix=inputs={len(mixed_tracks)}:duration=longest:normalize=0,alimiter=limit=0.95[final]"
 
-        # Use unique preview files to avoid concurrent render conflicts.
-        # Preview stays MP3 (small, fast to generate/stream for a quick
-        # listen); the real final render is WAV -- genuinely lossless, and
-        # a WAV (not a FLAC re-encode of an already-lossy MP3, which is what
-        # this used to produce) is also what write_acid_chunk() needs to
-        # embed tempo/key info DAWs can actually read.
-        if preview:
-            import time
-            timestamp = str(int(time.time() * 1000))[-8:]  # Last 8 digits of milliseconds
-            output = str(BASE_DIR / f"preview_temp_{timestamp}.mp3")
-        else:
-            output = str(BASE_DIR / "final_remix.wav")
-        command = [self.ffmpeg, "-y", *inputs, "-filter_complex", filter_complex, "-map", "[final]"]
-        if preview:
-            command += ["-c:a", "libmp3lame", "-q:a", "2", "-t", str(preview_duration)]
-        command += [output]
+        # WAV, not a FLAC re-encode of an already-lossy MP3 (what this used
+        # to produce) -- genuinely lossless, and it's what write_acid_chunk()
+        # needs to embed tempo/key info DAWs can actually read.
+        output = str(BASE_DIR / "final_remix.wav")
+        command = [self.ffmpeg, "-y", *inputs, "-filter_complex", filter_complex, "-map", "[final]", output]
 
-        # Run via Popen (not subprocess.run) and track the process so
-        # stop_all() can kill it if the GUI is closed mid-encode.
         try:
             proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except FileNotFoundError as error:
-            raise RuntimeError("FFmpeg is not installed or is not in PATH. Install FFmpeg before previewing or rendering.") from error
+            raise RuntimeError("FFmpeg is not installed or is not in PATH. Install FFmpeg before rendering.") from error
 
-        MashupEngine._active_encode_processes.append(proc)
         try:
             stdout, stderr = proc.communicate(timeout=300)
         except subprocess.TimeoutExpired:
             proc.kill()
             stdout, stderr = proc.communicate()
-        finally:
-            if proc in MashupEngine._active_encode_processes:
-                MashupEngine._active_encode_processes.remove(proc)
 
         if proc.returncode != 0:
             detail = (stderr or "").strip() or "FFmpeg failed without an error message."
             raise RuntimeError(f"FFmpeg could not make the mix:\n{detail[-1200:]}")
 
-        if preview:
-            # Stop any currently playing preview
-            MashupEngine.stop_preview()
-            # Don't auto-play with ffplay - let the browser player handle it
         return output
-
-    def process_stem(self, input_stem, output_path, pitch_shift=0.0, speed=1.0, target_bpm=None, song_bpm=None):
-        """Apply pitch and tempo adjustments to a stem file (no mixing, just effects)."""
-        normalize = f"aformat=sample_rates={self.TARGET_SAMPLE_RATE}:channel_layouts=stereo"
-        chain = "[0:a]" + normalize
-
-        # Calculate tempo ratio for BPM matching
-        tempo_ratio = (target_bpm / song_bpm) if (target_bpm and song_bpm) else 1.0
-        speed = speed * tempo_ratio
-
-        # Apply pitch shift
-        if abs(pitch_shift) > 0.05:
-            rate = self.TARGET_SAMPLE_RATE
-            pitch_ratio = 2 ** (pitch_shift / 12)
-            chain += f",asetrate={rate}*{pitch_ratio},aresample={rate}"
-
-        # Apply tempo/speed
-        if abs(speed - 1.0) > 0.05:
-            chain += "," + self._atempo_chain(speed)
-
-        chain += "[out]"
-
-        command = [self.ffmpeg, "-y", "-i", input_stem, "-filter_complex", chain, "-map", "[out]", "-c:a", "libmp3lame", "-q:a", "2", output_path]
-
-        try:
-            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        except FileNotFoundError as error:
-            raise RuntimeError("FFmpeg is not installed or is not in PATH.") from error
-
-        MashupEngine._active_encode_processes.append(proc)
-        try:
-            stdout, stderr = proc.communicate(timeout=300)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-        finally:
-            if proc in MashupEngine._active_encode_processes:
-                MashupEngine._active_encode_processes.remove(proc)
-
-        if proc.returncode != 0:
-            detail = (stderr or "").strip() or "FFmpeg failed without an error message."
-            raise RuntimeError(f"FFmpeg could not process stem:\n{detail[-500:]}")
 
     def split_drums(self, drum_stem_path, output_dir):
         """Split drum stem into kick, snare, hi-hat, and toms using frequency-based separation.
@@ -2241,38 +2059,18 @@ class MashupEngine:
             # Snare: 1000-8000 Hz (snare crack)
             # Hi-hat: 5000-20000 Hz (high cymbals)
 
-            filter_graph = (
-                # Split into parallel chains
-                "[0:a]"
-                # Kick: Low-pass to 250 Hz, then high-pass to 20 Hz
-                "lowpass=f=250[kick_low]; "
-                "[kick_low]highpass=f=20[kick]; "
-
-                # Snare: Band-pass 1000-8000 Hz
-                "[0:a]bandpass=f=4000:width_type=o:width=2[snare]; "
-
-                # Hi-hat: High-pass 5000 Hz
-                "[0:a]highpass=f=5000[hihat]; "
-
-                # Tom: Band-pass 200-2000 Hz
-                "[0:a]bandpass=f=1000:width_type=o:width=1[tom]"
-            )
-
-            # Export each frequency band to separate file
-            for name, freq_range in [
-                ('kick', '20-250Hz'),
-                ('snare', '1000-8000Hz'),
-                ('hihat', '5000-20000Hz'),
-                ('tom', '200-2000Hz'),
-            ]:
+            # Export each frequency band to its own file (one FFmpeg call per
+            # stem -- simpler than a single combined filter_complex graph,
+            # and easier to report a per-stem failure for)
+            for name in ('kick', 'snare', 'hihat', 'tom'):
                 if name == 'kick':
-                    filters = f"[0:a]lowpass=f=250,highpass=f=20"
+                    filters = "[0:a]lowpass=f=250,highpass=f=20"
                 elif name == 'snare':
-                    filters = f"[0:a]bandpass=f=4000:width_type=o:width=2"
+                    filters = "[0:a]bandpass=f=4000:width_type=o:width=2"
                 elif name == 'hihat':
-                    filters = f"[0:a]highpass=f=5000"
+                    filters = "[0:a]highpass=f=5000"
                 elif name == 'tom':
-                    filters = f"[0:a]bandpass=f=1000:width_type=o:width=1"
+                    filters = "[0:a]bandpass=f=1000:width_type=o:width=1"
 
                 cmd = [
                     self.ffmpeg, "-i", str(drum_stem_path),
@@ -2297,11 +2095,12 @@ class MashupEngine:
             logging.error(f"Drum split failed for {drum_stem_path}: {e}", exc_info=True)
             raise
 
-    def separate_stems_multi_engine(self, songs, use_restoration=True, progress_callback=None):
+    def separate_stems_multi_engine(self, songs, progress_callback=None):
         """Advanced multi-engine stem separation: a vocal-model ensemble (vocals) +
         Demucs htdemucs_6s (bass/guitar/piano/other/drums) + MDX23C DrumSep
-        (kick/snare, ML) + frequency-split (hihat/tom, approximate) + optional
-        denoise + de-reverb artifact restoration.
+        (kick/snare, ML) + frequency-split (hihat/tom, approximate). Denoise +
+        de-reverb restoration is not applied here -- it's opt-in per stem,
+        after separation, via /api/restore-stem.
 
         Every stem is derived straight from the full song: the vocal model and
         htdemucs_6s both run directly against the original/processed WAV, in
@@ -2339,7 +2138,7 @@ class MashupEngine:
 
             # STAGE 1: Parallel extraction, both straight from the full song
             report(0.0, "Stage 1: extracting vocals + separating instruments...")
-            logging.info(f"📊 [STAGE 1] Parallel vocal + multi-instrument extraction...")
+            logging.info("📊 [STAGE 1] Parallel vocal + multi-instrument extraction...")
 
             vocals_path = None
             vocals_bonus = None
@@ -2378,14 +2177,14 @@ class MashupEngine:
             def extract_vocals():
                 nonlocal vocals_path, vocals_bonus
                 try:
-                    logging.info(f"  🎤 Vocal model ensemble: extracting vocals...")
+                    logging.info("  🎤 Vocal model ensemble: extracting vocals...")
                     with _report_audio_separator_progress("Vocals", _set_vocals_status):
                         v, bonus = self._separate_vocals_karaoke(str(song), str(song_out_dir))
                     _set_vocals_status("Vocals: done")
                     with vocals_lock:
                         vocals_path = v
                         vocals_bonus = bonus
-                    logging.info(f"  ✅ Vocals extracted")
+                    logging.info("  ✅ Vocals extracted")
                 except Exception as e:
                     logging.error(f"  ❌ Vocal separation failed: {e}")
                     with vocals_lock:
@@ -2394,13 +2193,13 @@ class MashupEngine:
             def extract_instruments():
                 nonlocal demucs_stems
                 try:
-                    logging.info(f"  🎼 Demucs htdemucs_6s: extracting bass/guitar/piano/other/drums...")
+                    logging.info("  🎼 Demucs htdemucs_6s: extracting bass/guitar/piano/other/drums...")
                     stems = self._separate_stems_demucs6s(str(song), str(song_out_dir),
                                                            progress_callback=_set_instruments_status)
                     _set_instruments_status(1.0, "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s): done")
                     with demucs_lock:
                         demucs_stems = stems
-                    logging.info(f"  ✅ 6-stem separation complete")
+                    logging.info("  ✅ 6-stem separation complete")
                 except Exception as e:
                     logging.error(f"  ❌ Demucs htdemucs_6s failed: {e}")
                     with demucs_lock:
@@ -2421,7 +2220,7 @@ class MashupEngine:
             # hihat/tom come from bandpass filtering the same drum stem, since no
             # ML model for those exists in the registry.
             report(0.55, "Stage 2: splitting drums (kick/snare/hihat/tom)...")
-            logging.info(f"🥁 [STAGE 2] Kick/snare (MDX23C DrumSep) + hihat/tom (frequency split)...")
+            logging.info("🥁 [STAGE 2] Kick/snare (MDX23C DrumSep) + hihat/tom (frequency split)...")
             drums_stem = demucs_stems['drums']
             with _report_audio_separator_progress(
                     "Kick/snare (DrumSep)", lambda label: report(0.6, f"Stage 2: {label}")):
@@ -2430,7 +2229,7 @@ class MashupEngine:
 
             # STAGE 3: Assemble final stem structure
             report(0.75, "Stage 3: assembling stems...")
-            logging.info(f"🔧 [STAGE 3] Assembling final stem structure...")
+            logging.info("🔧 [STAGE 3] Assembling final stem structure...")
             final_stems = {
                 'vocals': vocals_path,
                 'kick': kick_snare.get('kick'),
@@ -2446,26 +2245,6 @@ class MashupEngine:
             missing = [k for k, v in final_stems.items() if not v or not Path(v).is_file()]
             if missing:
                 raise RuntimeError(f"Multi-engine separation did not produce: {missing}")
-
-            # STAGE 4: Optional denoise + de-reverb restoration
-            if use_restoration:
-                report(0.8, "Stage 4: denoise + de-reverb restoration...")
-                logging.info(f"✨ [STAGE 4] Denoise + de-reverb restoration...")
-
-                def _restoration_progress(fraction, label):
-                    # Restoration is the last, per-stem-slow part of this
-                    # stage -- without this, the bar sits frozen at 0.8 (78%
-                    # after server.py's mapping) for however long it takes to
-                    # denoise+de-reverb all 9 stems, looking exactly like a
-                    # stall even though every stem really is being processed.
-                    report(0.8 + fraction * 0.18, label)
-
-                try:
-                    final_stems = self._apply_hifi_restoration(final_stems, str(song_out_dir),
-                                                                 progress_callback=_restoration_progress)
-                    logging.info(f"  ✅ Restoration complete")
-                except Exception as e:
-                    logging.warning(f"  ⚠️  Restoration skipped: {e}")
 
             self._conform_stem_lengths(final_stems)
 
@@ -2525,7 +2304,6 @@ class MashupEngine:
         """
         import logging
         import re
-        import numpy as np
         import soundfile as sf
 
         try:
@@ -2705,7 +2483,7 @@ class MashupEngine:
                 raise RuntimeError(
                     f"Could not identify {missing} among DrumSep's output files: "
                     f"{[Path(p).name for p in resolved]}. Update the keyword matching "
-                    f"above to match this model's actual naming."
+                    "above to match this model's actual naming."
                 )
             return mapping
         except Exception as e:

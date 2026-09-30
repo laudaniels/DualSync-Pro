@@ -86,14 +86,17 @@ group, now labeled "Process All Changes").
 ## Stem Separation Modes
 
 ### Legacy Mode (7 stems) — Demucs only
-Default behavior: uses Demucs v4 for 4-stem separation, then splits drums into kick/snare/hihat/tom.
+Opt-out fallback: uses Demucs v4 for 4-stem separation, then splits drums into kick/snare/hihat/tom.
+Enable with: `export DUALSYNC_MULTI_ENGINE=false` before running `python3 server.py`
 - Output: `vocals`, `kick`, `snare`, `hihat`, `tom`, `bass`, `other`
 - Quality: Good general-purpose
 - Speed: ~5-8 min per track
 
 ### Multi-Engine Mode (9 stems) — Best-of-breed pipeline
-Advanced mode combining best-in-class tools for maximum quality per stem-type.
-Enables with: `export DUALSYNC_MULTI_ENGINE=true` before running `python3 server.py`
+**Default mode** -- combines best-in-class tools for maximum quality per
+stem-type; no environment variable needed to get this, it's what
+`python3 server.py` gives you out of the box (`os.getenv('DUALSYNC_MULTI_ENGINE', 'true')` in
+`server.py`).
 
 Every stem is derived directly from the full song (original or beatgrid-aligned
 WAV) rather than chained off another already-separated stem, with one
@@ -310,7 +313,7 @@ first real separation a user runs never stalls on a multi-GB download, and
 Song 1/Song 2's parallel per-song processing threads can never race each
 other into corrupting a model file (see below).
 
-**`MashupEngine.check_environment()`** — checks ffmpeg/ffplay/demucs/
+**`MashupEngine.check_environment()`** — checks ffmpeg/demucs/
 rubberband presence, GPU availability, and whether `audio_separator`
 imports; each check is marked `required` (ffmpeg, demucs -- nothing works
 without them) or optional. A failed optional check carries a short

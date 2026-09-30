@@ -173,14 +173,14 @@ def print_summary(results):
 
     multi = [r for r in results if len(r["candidates"]) > 1]
     if multi:
-        print(f"\nTracks with >1 kick candidate (worth a manual listen -- did the right one win?):")
+        print("\nTracks with >1 kick candidate (worth a manual listen -- did the right one win?):")
         for r in multi:
             offsets = ", ".join(f"{o:.2f}s(run={rl})" for o, rl in r["candidates"])
             chosen = f"{r['final_trim_start']:.2f}s" if r["final_trim_start"] is not None else "?"
             print(f"  {r['file']}: candidates=[{offsets}]  chose_trim={chosen}")
 
     if crashed:
-        print(f"\nErrors:")
+        print("\nErrors:")
         for r in crashed:
             print(f"  {r['file']} [{r['status']}]: {r['error']}")
 

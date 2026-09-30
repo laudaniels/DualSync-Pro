@@ -61,7 +61,6 @@ def upload_audio():
     try:
         import subprocess
         import time
-        global _processing_state
 
         # Both songs can upload at once (threaded server), so only clear this
         # slot's own previous log lines -- wiping the whole shared log here
@@ -296,13 +295,12 @@ def process_song():
                 add_log_message(f"  {label}", slot)
                 last_reported_label = label
 
-        # Restoration (denoise + de-reverb) is opt-in per stem now, applied
-        # on demand from the mixer via /api/restore-stem -- skipping it here
-        # cuts several minutes off this endpoint, and every stem this
+        # Restoration (denoise + de-reverb) is opt-in per stem, applied on
+        # demand from the mixer via /api/restore-stem -- never during
+        # separation itself (see separate_stems' docstring). Every stem this
         # produces is kept as <stem>_original.wav below so that later restore
         # (and reverting it) never needs to re-separate from scratch.
         stem_dict = engine.separate_stems([str(file_path)], use_multi_engine=use_multi_engine,
-                                           use_restoration=False,
                                            progress_callback=_on_separation_progress)[0]
 
         # Copy stems to a simple location for serving
@@ -444,7 +442,6 @@ def add_log_message(message, slot=None):
     Both songs can be uploading/processing at once, so untagged messages would
     be ambiguous once merged into the single shared log list the frontend polls.
     """
-    global _processing_state
     tagged = f"[Song {slot + 1}] {message}" if slot is not None else message
     if len(_processing_state['logs']) > 50:  # Keep last 50 messages
         _processing_state['logs'].pop(0)
@@ -454,7 +451,6 @@ def add_log_message(message, slot=None):
 
 def _set_slot_state(slot, **fields):
     """Update this slot's own progress/status without touching the other slot's."""
-    global _processing_state
     _processing_state['slots'].setdefault(slot, _new_slot_state())
     _processing_state['slots'][slot].update(fields)
 
@@ -532,7 +528,6 @@ def _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label,
 @app.route('/api/process-stems', methods=['POST'])
 def process_stems():
     """Process FULL SONG (BPM + Key), then separate into stems"""
-    global _processing_state
     data = request.json
     slot = (data or {}).get('slot', 0)
     try:
@@ -555,7 +550,7 @@ def process_stems():
         add_log_message(f"🎯 Processing: BPM {source_bpm}→{target_bpm}, Key {source_key}→{target_key}", slot)
 
         if not timestamp or not filename:
-            add_log_message(f"❌ Missing timestamp or filename", slot)
+            add_log_message("❌ Missing timestamp or filename", slot)
             return jsonify({'error': 'Missing timestamp or filename'}), 400
 
         # Reprocess from the SAME WAV that produced the currently-loaded
@@ -566,7 +561,7 @@ def process_stems():
         audio_dir = BASE_DIR / 'Audio'
         original_file = audio_dir / (source_wav_filename or filename)
         if not original_file.exists():
-            add_log_message(f"❌ Original file not found", slot)
+            add_log_message("❌ Original file not found", slot)
             return jsonify({'error': 'Original file not found'}), 400
 
         from mashup_engine import MashupEngine
@@ -591,7 +586,7 @@ def process_stems():
                 current_input = processed_song
                 add_log_message(f"✅ Beatmatched to {measured_bpm:.1f} BPM", slot)
             else:
-                add_log_message(f"⚠️ Beatmatch failed, continuing with original", slot)
+                add_log_message("⚠️ Beatmatch failed, continuing with original", slot)
                 measured_bpm = None
 
         # Apply Key transpose if needed
@@ -616,11 +611,11 @@ def process_stems():
                     measured_key_name = engine._key_to_note(measured_key) if measured_key >= 0 else target_key
                     add_log_message(f"✅ Transposed to {measured_key_name}", slot)
                 else:
-                    add_log_message(f"⚠️ Transpose failed, continuing", slot)
+                    add_log_message("⚠️ Transpose failed, continuing", slot)
 
         # Step 2: Now separate stems from the PROCESSED full song (includes auto drum splitting)
         _set_slot_state(slot, progress=50, current_step=_processing_state['steps'][3])
-        add_log_message(f"🔊 Separating stems from processed song...", slot)
+        add_log_message("🔊 Separating stems from processed song...", slot)
         import os
         use_multi_engine = os.getenv('DUALSYNC_MULTI_ENGINE', 'true').lower() == 'true'
 
@@ -637,11 +632,10 @@ def process_stems():
                 add_log_message(f"  {label}", slot)
                 last_reported_label = label
 
-        # Restoration is opt-in per stem now, applied on demand from the
-        # mixer via /api/restore-stem -- see the matching comment in
-        # /api/process-song.
+        # Restoration is opt-in per stem, applied on demand from the mixer
+        # via /api/restore-stem -- never during separation (see the matching
+        # comment in /api/process-song).
         stem_dict = engine.separate_stems([str(current_input)], use_multi_engine=use_multi_engine,
-                                           use_restoration=False,
                                            progress_callback=_on_separation_progress)[0]
 
         # Copy processed stems to serve directory
@@ -675,7 +669,7 @@ def process_stems():
             return jsonify({'error': 'Processing failed'}), 500
 
         _set_slot_state(slot, progress=100, current_step=_processing_state['steps'][6], status='success')
-        add_log_message(f"✨ Processing complete!", slot)
+        add_log_message("✨ Processing complete!", slot)
         return jsonify({
             'status': 'success',
             'processed_stems': processed_stems,
@@ -695,9 +689,10 @@ def process_stems():
 def restore_stem():
     """Apply (or revert) denoise + de-reverb restoration to a single
     already-separated stem, on demand from the mixer's per-stem checkbox --
-    initial separation skips restoration entirely now (see the
-    use_restoration=False calls above), so this is the only place it
-    actually runs, and only for whichever stem(s) the user opts into.
+    initial separation never applies restoration itself (see
+    separate_stems' docstring in mashup_engine.py), so this is the only
+    place it actually runs, and only for whichever stem(s) the user opts
+    into.
 
     The first time a stem is restored, the result is cached alongside it
     (<stem>_restored.wav) so toggling it off and back on again is instant
@@ -768,7 +763,6 @@ def split_drums():
     data = request.json
     try:
         from mashup_engine import MashupEngine
-        import shutil
 
         drum_path = data.get('drum_path')
         timestamp = data.get('timestamp')
@@ -921,7 +915,7 @@ def render_final_mix():
 
         # Render using engine (applies beatmatching and beat offset)
         try:
-            engine.render(params, preview=False)
+            engine.render(params)
             output_file = BASE_DIR / 'final_remix.wav'
 
             if not output_file.exists():
@@ -1164,8 +1158,6 @@ def download_unaligned_stems():
 def download_file(filename):
     """Download a file"""
     try:
-        from pathlib import Path
-
         # Security: only allow files from specific directories
         safe_dirs = [
             BASE_DIR / 'Audio' / 'stems',
@@ -1225,7 +1217,6 @@ def cleanup_audio():
 @app.route('/api/process-status', methods=['GET'])
 def process_status():
     """Get current processing status and progress"""
-    global _processing_state
     return jsonify(_processing_state)
 
 

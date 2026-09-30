@@ -363,7 +363,6 @@ Output (first run — dependency checks, then downloading whatever's not cached 
 DualSync Pro -- startup checks
 ============================================================
 ✅ ffmpeg: Required for all audio conversion/mixing -- app will not function without it.
-✅ ffplay: Used for in-app preview playback only.
 ✅ demucs: Required for stem separation (both legacy and multi-engine mode).
 ✅ rubberband: Required for the 'Align beatgrid' and 'Snap to reference' features only -- the rest of the app works without it.
 ⚠️  gpu: No GPU detected -- separation will still work but run much slower on CPU.
