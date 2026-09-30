@@ -59,8 +59,9 @@ def _report_audio_separator_progress(prefix, callback):
 
 class MashupEngine:
     """Build FFmpeg mixes with multi-engine stem separation: Mel-Band RoFormer
-    (lead/backing vocals), Demucs htdemucs_6s (bass/guitar/piano/other/drums),
-    MDX23C DrumSep (kick/snare/hihat/tom), denoise + de-reverb (restoration)."""
+    (lead/backing vocals), Demucs htdemucs_6s (guitar/piano/other, plus bass/
+    drums before hdemucs_mmi refines those two), MDX23C DrumSep
+    (kick/snare/hihat/tom), denoise + de-reverb (restoration)."""
 
     STEM_NAMES = ("vocals", "drums", "bass", "other")
     TARGET_SAMPLE_RATE = 44100
@@ -177,10 +178,11 @@ class MashupEngine:
     }
     # (key, model_name, label, required) -- htdemucs is legacy mode's
     # default model, so basic (non-multi-engine) separation needs it;
-    # htdemucs_6s is multi-engine-only.
+    # htdemucs_6s and hdemucs_mmi are multi-engine-only.
     DEMUCS_MODELS = [
         ("demucs_htdemucs", "htdemucs", "Demucs (legacy 4-stem model)", True),
         ("demucs_htdemucs6s", "htdemucs_6s", "Demucs (multi-engine 6-stem model)", False),
+        ("demucs_hdemucsmmi", "hdemucs_mmi", "Demucs (bass/drums refinement model)", False),
     ]
 
     # (name, required) metadata for check_environment()'s checks, in the
@@ -234,7 +236,7 @@ class MashupEngine:
         content-hashed 'blobs' dir per repo -- checking for at least one
         blob is a reasonable proxy for "already downloaded" without
         needing a network call to confirm."""
-        repo = {"htdemucs": "HTDemucs", "htdemucs_6s": "HTDemucs-6s"}.get(model_name)
+        repo = {"htdemucs": "HTDemucs", "htdemucs_6s": "HTDemucs-6s", "hdemucs_mmi": "Demucs-hdemucs_mmi"}.get(model_name)
         if not repo:
             return False
         blobs_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--adefossez--{repo}" / "blobs"
@@ -2097,17 +2099,18 @@ class MashupEngine:
 
     def separate_stems_multi_engine(self, songs, progress_callback=None):
         """Advanced multi-engine stem separation: a vocal-model ensemble (vocals) +
-        Demucs htdemucs_6s (bass/guitar/piano/other/drums) + MDX23C DrumSep
+        Demucs htdemucs_6s (guitar/piano/other) + Demucs hdemucs_mmi
+        (bass/drums, see _separate_bass_drums_mmi for why) + MDX23C DrumSep
         (kick/snare, ML) + frequency-split (hihat/tom, approximate). Denoise +
         de-reverb restoration is not applied here -- it's opt-in per stem,
         after separation, via /api/restore-stem.
 
         Every stem is derived straight from the full song: the vocal model and
-        htdemucs_6s both run directly against the original/processed WAV, in
-        parallel. The one deliberate exception is kick/snare/hihat/tom -- both
-        DrumSep and the frequency-split fallback need an isolated drum stem, not
-        a full mix, so stage 2 runs them on htdemucs_6s's 'drums' output rather
-        than on the song itself.
+        both Demucs passes run directly against the original/processed WAV.
+        The one deliberate exception is kick/snare/hihat/tom -- both DrumSep
+        and the frequency-split fallback need an isolated drum stem, not a
+        full mix, so stage 2 runs them on hdemucs_mmi's (refined) 'drums'
+        output rather than on the song itself.
 
         Verified against a real 25s clip: DrumSep (MDX23C-DrumSep-aufr33-jarredou)
         only separates kick + snare, not hihat/tom -- there's no ML model for
@@ -2194,12 +2197,23 @@ class MashupEngine:
                 nonlocal demucs_stems
                 try:
                     logging.info("  🎼 Demucs htdemucs_6s: extracting bass/guitar/piano/other/drums...")
-                    stems = self._separate_stems_demucs6s(str(song), str(song_out_dir),
-                                                           progress_callback=_set_instruments_status)
-                    _set_instruments_status(1.0, "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s): done")
+                    # Two sequential Demucs passes share this thread's 0.0-1.0
+                    # progress budget (0.0-0.5 / 0.5-1.0) so the reported
+                    # fraction keeps climbing instead of resetting to 0% when
+                    # the second pass starts.
+                    stems = self._separate_stems_demucs6s(
+                        str(song), str(song_out_dir),
+                        progress_callback=lambda frac, label: _set_instruments_status(frac * 0.5, label))
+                    logging.info("  🎚️ Demucs hdemucs_mmi: refining bass/drums...")
+                    refined = self._separate_bass_drums_mmi(
+                        str(song), str(song_out_dir),
+                        progress_callback=lambda frac, label: _set_instruments_status(0.5 + frac * 0.5, label))
+                    stems['bass'] = refined['bass']
+                    stems['drums'] = refined['drums']
+                    _set_instruments_status(1.0, "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s + hdemucs_mmi): done")
                     with demucs_lock:
                         demucs_stems = stems
-                    logging.info("  ✅ 6-stem separation complete")
+                    logging.info("  ✅ 6-stem separation complete (bass/drums refined via hdemucs_mmi)")
                 except Exception as e:
                     logging.error(f"  ❌ Demucs htdemucs_6s failed: {e}")
                     with demucs_lock:
@@ -2363,26 +2377,24 @@ class MashupEngine:
             logging.error(f"Vocal separation failed: {e}")
             raise RuntimeError(f"Vocal extraction failed: {str(e)[-500:]}")
 
-    def _separate_stems_demucs6s(self, audio_path, output_dir, progress_callback=None):
-        """Separate bass/guitar/piano/other/drums directly from the full song using
-        Demucs' htdemucs_6s model (also outputs a 'vocals' stem, unused here --
-        the dedicated vocal-model ensemble above supplies our (higher-quality) vocals instead).
+    def _run_demucs(self, model_name, audio_path, output_dir, label, progress_callback=None):
+        """Run a Demucs model against the full song; return the path to its
+        output folder (one .wav per stem the model produces). Shared by
+        _separate_stems_demucs6s and _separate_bass_drums_mmi.
 
         progress_callback(fraction, label), if given, is fed straight from
-        Demucs' own tqdm progress bar on stderr (e.g. " 42%|...") -- this call
-        alone is the majority of Stage 1's multi-minute runtime, so without
+        Demucs' own tqdm progress bar on stderr (e.g. " 42%|...") -- each of
+        these calls is a multi-minute chunk of Stage 1's runtime, so without
         it the bar sits frozen the entire time Demucs is actually working.
         """
-        import logging
         import re
         import threading
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
-        command = [sys.executable, "-m", "demucs", "-n", "htdemucs_6s",
+        command = [sys.executable, "-m", "demucs", "-n", model_name,
                    "--out", str(output_dir_path), audio_path]
-        label = "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s)..."
         percent_re = re.compile(r"(\d+)%\|")
 
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2410,19 +2422,33 @@ class MashupEngine:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
-            raise RuntimeError(f"Demucs htdemucs_6s timed out separating {Path(audio_path).name}")
+            raise RuntimeError(f"Demucs {model_name} timed out separating {Path(audio_path).name}")
         for w in watchers:
             w.join(timeout=5)
 
         if process.returncode != 0:
             detail = "".join(stderr_lines).strip() or "".join(stdout_lines).strip() or "Demucs failed without an error message."
-            raise RuntimeError(f"Demucs htdemucs_6s could not separate {Path(audio_path).name}:\n{detail[-1200:]}")
+            raise RuntimeError(f"Demucs {model_name} could not separate {Path(audio_path).name}:\n{detail[-1200:]}")
 
         song_folder = Path(audio_path).stem
-        candidates = list(output_dir_path.glob(f"htdemucs_6s/{song_folder}"))
+        candidates = list(output_dir_path.glob(f"{model_name}/{song_folder}"))
         if not candidates:
-            raise RuntimeError(f"Demucs htdemucs_6s finished, but no stem folder was found for {Path(audio_path).name}.")
-        folder = candidates[0]
+            raise RuntimeError(f"Demucs {model_name} finished, but no stem folder was found for {Path(audio_path).name}.")
+        return candidates[0]
+
+    def _separate_stems_demucs6s(self, audio_path, output_dir, progress_callback=None):
+        """Separate bass/guitar/piano/other/drums directly from the full song using
+        Demucs' htdemucs_6s model (also outputs a 'vocals' stem, unused here --
+        the dedicated vocal-model ensemble above supplies our (higher-quality) vocals instead).
+        bass/drums get further refined by _separate_bass_drums_mmi afterward --
+        this call is still needed for guitar/piano/other (and as the source
+        for kick/snare/hihat/tom before that refinement, see Stage 2).
+        """
+        import logging
+
+        folder = self._run_demucs("htdemucs_6s", audio_path, output_dir,
+                                   "extracting bass/guitar/piano/other/drums (Demucs htdemucs_6s)...",
+                                   progress_callback=progress_callback)
 
         # 'vocals' is Demucs' own (unused in the main mix -- the ensemble
         # above supplies the real vocals stem) but kept as a bonus/reference
@@ -2434,6 +2460,37 @@ class MashupEngine:
             raise RuntimeError(f"Demucs htdemucs_6s did not create all expected stems: {', '.join(missing)}")
 
         logging.info(f"  Demucs htdemucs_6s produced: {list(stems.keys())}")
+        return stems
+
+    def _separate_bass_drums_mmi(self, audio_path, output_dir, progress_callback=None):
+        """Refine bass + drums using Demucs' hdemucs_mmi model instead of
+        htdemucs_6s. Verified by ear + registry SDR (2026-09-30):
+        htdemucs_6s trades away bass/drums quality for its extra guitar/
+        piano split -- it's the worst Demucs variant for both (bass 10.10
+        dB, drums 8.47 dB), while hdemucs_mmi scores bass 12.23 dB / drums
+        9.64 dB. Since kick/snare/hihat/tom (Stage 2) all derive from the
+        drums stem, this improves four downstream stems, not just bass.
+        guitar/piano/other stay sourced from htdemucs_6s -- it's the only
+        model in the registry that separates those at all.
+
+        Returns {'bass': path, 'drums': path}. This model's own vocals/
+        other outputs aren't used (existing sources are equal or better)
+        and are left on disk rather than surfaced as bonus stems, unlike
+        htdemucs_6s's unused vocals.wav (that one meaningfully differs from
+        the ensemble; this model's vocals/other don't add anything new).
+        """
+        import logging
+
+        folder = self._run_demucs("hdemucs_mmi", audio_path, output_dir,
+                                   "refining bass/drums (Demucs hdemucs_mmi)...",
+                                   progress_callback=progress_callback)
+
+        stems = {name: str(folder / f"{name}.wav") for name in ("bass", "drums")}
+        missing = [name for name, path in stems.items() if not Path(path).is_file()]
+        if missing:
+            raise RuntimeError(f"Demucs hdemucs_mmi did not create all expected stems: {', '.join(missing)}")
+
+        logging.info(f"  Demucs hdemucs_mmi produced: {list(stems.keys())}")
         return stems
 
     def _split_drums_mdx23c(self, drums_path, output_dir):

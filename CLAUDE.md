@@ -101,7 +101,7 @@ stem-type; no environment variable needed to get this, it's what
 Every stem is derived directly from the full song (original or beatgrid-aligned
 WAV) rather than chained off another already-separated stem, with one
 deliberate exception: drum-component separation needs an isolated drum stem,
-not a full mix, so kick/snare runs on Demucs' `drums` output.
+not a full mix, so kick/snare runs on the (refined, see below) `drums` output.
 
 **Pipeline (tested end-to-end with real audio):**
 1. **Stage 1 (Parallel GPU)** — both from full song:
@@ -110,9 +110,18 @@ not a full mix, so kick/snare runs on Demucs' `drums` output.
      by ear against each model alone, the average won clearly (a known
      technique, UVR's "Ensemble Mode": different architectures make
      different mistakes, averaging smooths those out)
-   - **Demucs `htdemucs_6s`** (9.5 dB SDR): bass, guitar, piano, other, drums
-   - Simultaneous processing (threading with locks)
-2. **Stage 2** — from Demucs' `drums` output:
+   - **Demucs `htdemucs_6s`** (9.5 dB SDR): guitar, piano, other -- plus an
+     initial bass/drums pass, refined by the next bullet (it's the only
+     model that separates guitar/piano at all, but trades away bass/drums
+     quality for that; see `_separate_bass_drums_mmi`'s docstring)
+   - **Demucs `hdemucs_mmi`**: re-extracts just bass (12.2 dB SDR) and
+     drums (9.6 dB SDR) from the same full song, sequentially after
+     htdemucs_6s within the same thread -- both feed into Stage 2/3 in
+     place of htdemucs_6s's own (worse) bass/drums
+   - Vocal ensemble and the two Demucs passes run in parallel with each
+     other (threading with locks); the two Demucs passes run sequentially
+     with each other (GPU memory headroom, not a correctness requirement)
+2. **Stage 2** — from the refined `drums` output:
    - **MDX23C DrumSep** (SOTA): kick, snare (ML-based)
    - **Frequency-band filtering**: hihat, tom (fallback, no model)
 3. **Stage 3** — assembling the 9 stems (no restoration here anymore --
@@ -120,9 +129,10 @@ not a full mix, so kick/snare runs on Demucs' `drums` output.
 
 **Output (9 stems, 7 ML-separated + 2 filtered):**
 - `vocals` — vocal-model ensemble (Mel-Band RoFormer + BS-RoFormer, averaged)
-- `kick`, `snare` — MDX23C DrumSep (SOTA ML separation on drums stem)
-- `hihat`, `tom` — Frequency-band filtering on drums stem
-- `bass`, `guitar`, `piano`, `other` — Demucs `htdemucs_6s`
+- `kick`, `snare` — MDX23C DrumSep (SOTA ML separation on the refined drums stem)
+- `hihat`, `tom` — Frequency-band filtering on the refined drums stem
+- `bass`, `drums` (source stem) — Demucs `hdemucs_mmi`
+- `guitar`, `piano`, `other` — Demucs `htdemucs_6s`
 
 **Model Details:**
 - **Vocal Models (ensemble, averaged):** `vocals_mel_band_roformer.ckpt` (12.60 dB SDR)
@@ -131,6 +141,20 @@ not a full mix, so kick/snare runs on Demucs' `drums` output.
 - **Restoration (opt-in per stem, not run during separation):** `denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt`
   (27.99 dB SDR) then `dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt` (19.17 dB SDR),
   both from the audio-separator registry -- see "Restoration" below
+
+**Past known issue (fixed):** `htdemucs_6s` was used for bass and drums too
+(not just guitar/piano/other), but it's the *worst*-scoring Demucs variant
+for both (bass 10.10 dB, drums 8.47 dB SDR) -- the price of the extra
+guitar/piano split it alone provides. Since kick/snare/hihat/tom all derive
+from the drums stem, this was quietly degrading four stems, not just one.
+Confirmed 2026-09-30 by ear (bass sounded bad enough to investigate) and by
+registry SDR across every Demucs variant. Fixed by adding a second Demucs
+pass (`hdemucs_mmi`, bass 12.23 dB / drums 9.64 dB) whose bass/drums
+override htdemucs_6s's own in `extract_instruments()` -- htdemucs_6s is
+kept only for guitar/piano/other, since it's the only model in the
+registry that separates those at all. (A dedicated MVSEP ensemble bass
+model scores higher still, ~13.3 dB, but isn't in the audio-separator
+registry and would need a separate, heavier integration -- not pursued.)
 
 **Requirements:**
 ```bash
@@ -163,11 +187,11 @@ and silently fell back to spectral filtering, regardless of what was
 installed. Replaced with the denoise + de-reverb models above, which are
 real, tested, and use infrastructure already proven in this pipeline.
 
-**Performance:** ~10-15 min per track (restoration no longer a mandatory
-stage -- see below; vocals now run two models in sequence instead of one,
-partly offsetting that saving since Stage 1 is bottlenecked by whichever
-of vocals/drums finishes last)
-- Stage 1 (parallel vocals ensemble + drums): ~8-11 min
+**Performance:** ~12-17 min per track (restoration no longer a mandatory
+stage -- see below; vocals run two models in sequence, and the
+instruments side now runs two Demucs passes in sequence too, since Stage 1
+is bottlenecked by whichever of the two threads finishes last)
+- Stage 1 (parallel vocals ensemble + instruments): ~10-13 min
 - Stage 2 (drum splitting + filtering): ~2-3 min
 - Stage 3 (assembling stems): seconds
 
@@ -176,8 +200,9 @@ of vocals/drums finishes last)
 ### Multi-Engine Stem Separation (9 stems)
 **Models (best-in-class, verified SDR):**
 - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged) → lead vocals
-- **Demucs htdemucs_6s** (9.5 dB SDR) → bass, guitar, piano, other, drums
-- **MDX23C DrumSep** (SOTA) → kick, snare (from drums stem)
+- **Demucs htdemucs_6s** (9.5 dB SDR) → guitar, piano, other (only model that separates these at all)
+- **Demucs hdemucs_mmi** (bass 12.2 dB / drums 9.6 dB SDR) → bass, and the drums stem that feeds kick/snare/hihat/tom below
+- **MDX23C DrumSep** (SOTA) → kick, snare (from the hdemucs_mmi drums stem)
 - **Frequency filtering** → hihat, tom (no ML model exists)
 
 **Restoration (opt-in per stem, not part of separation):**
@@ -321,8 +346,8 @@ without them) or optional. A failed optional check carries a short
 only") for the UI to show instead of a bare, alarming "error" for something
 that isn't actually broken, just reduced-capability.
 
-**`MashupEngine.prefetch_models()`** — fetches all 7 models (5
-audio-separator + `htdemucs`/`htdemucs_6s`) **in parallel** (one thread
+**`MashupEngine.prefetch_models()`** — fetches all 8 models (5
+audio-separator + `htdemucs`/`htdemucs_6s`/`hdemucs_mmi`) **in parallel** (one thread
 each, via `ThreadPoolExecutor`) -- they're independent files, nothing about
 them requires serializing. Byte-level download progress is captured by
 transparently swapping in for the exact `tqdm` progress bar
@@ -375,10 +400,10 @@ HuggingFace Hub's own progress reporting).
 ## Development Notes
 
 - BPM detection and stem separation run in background threads
-- Multi-engine mode uses parallel GPU processing (Stage 1: vocal-model ensemble + Demucs)
-- Stem separation pipeline: ~10-15 min per track (quality prioritized;
+- Multi-engine mode uses parallel GPU processing (Stage 1: vocal-model ensemble + Demucs x2)
+- Stem separation pipeline: ~12-17 min per track (quality prioritized;
   restoration is opt-in per stem afterward, not part of this)
-  - Stage 1 (parallel): ~8-11 min
+  - Stage 1 (parallel): ~10-13 min
   - Stage 2 (drum splitting): ~2-3 min
   - Stage 3 (assembling stems): seconds
 - All generated audio goes under `Audio/` (git-ignored): uploads/aligned WAVs,
@@ -387,7 +412,8 @@ HuggingFace Hub's own progress reporting).
   `/api/cleanup` clears both this and `Audio/`, but leaves the downloaded
   model weights alone (not per-song generated data) -- audio-separator's 5
   models under `~/.cache/audio-separator-models` (~3.4GB) and Demucs'
-  `htdemucs`/`htdemucs_6s` under `~/.cache/huggingface` (~134MB); see
+  `htdemucs`/`htdemucs_6s`/`hdemucs_mmi` under `~/.cache/huggingface`
+  (~294MB); see
   "Startup: Dependency Checks & Model Prefetch" for how these get fetched
 - Requires system FFmpeg installation
 - Beat/BPM detection uses Essentia (`RhythmExtractor2013`); madmom was tried

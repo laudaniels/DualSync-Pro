@@ -52,8 +52,9 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 ### Audio Analysis & Processing
 - **Multi-Engine Stem Separation (9 stems)** — best-in-class models for maximum quality:
   - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged sample-by-sample) — cleanest lead vocals; a listening test showed the average beats either model alone (a known technique, UVR's "Ensemble Mode": different architectures make different mistakes, averaging smooths those out)
-  - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
-  - **MDX23C DrumSep** (SOTA) — ML-based kick and snare isolation
+  - **Demucs htdemucs_6s** (9.5 dB SDR) — guitar, piano, other (the only model that separates these at all)
+  - **Demucs hdemucs_mmi** (bass 12.2 dB / drums 9.6 dB SDR) — replaces htdemucs_6s's own (worse) bass and drums, since kick/snare/hi-hat/tom all derive from the drums stem
+  - **MDX23C DrumSep** (SOTA) — ML-based kick and snare isolation (from the refined drums stem)
   - **Frequency-based filtering** — hi-hat and tom (fallback, no ML model)
 - **Denoise + De-Reverb Restoration (opt-in per stem)** — artifact removal and quality enhancement:
   - Mel-Band Roformer denoise (27.99 dB SDR) then de-reverb (19.17 dB SDR)
@@ -234,8 +235,9 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 ### Audio Processing Core (Python)
 - **Multi-Engine Stem Separation Pipeline (9 stems):**
   - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged) — lead vocals
-  - **Demucs htdemucs_6s** (9.5 dB SDR) — bass, guitar, piano, other, drums
-  - **MDX23C DrumSep** (SOTA) — kick, snare from drums stem
+  - **Demucs htdemucs_6s** (9.5 dB SDR) — guitar, piano, other
+  - **Demucs hdemucs_mmi** (bass 12.2 dB / drums 9.6 dB SDR) — bass, and the drums stem feeding kick/snare/hi-hat/tom
+  - **MDX23C DrumSep** (SOTA) — kick, snare from the refined drums stem
   - **Frequency filtering** — hi-hat, tom (fallback)
   - **Denoise + De-Reverb** (Mel-Band Roformer, 27.99 / 19.17 dB SDR) — opt-in per stem (vocals only), applied on demand rather than during separation
 - **Essentia** — BPM/beat-grid detection (`RhythmExtractor2013`) and key detection (`KeyExtractor`)
