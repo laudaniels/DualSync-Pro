@@ -3,6 +3,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -170,6 +171,18 @@ class MashupEngine:
     _preview_process = None
     _active_encode_processes = []
 
+    # Guards every audio-separator Separator(...).load_model(...) call
+    # (which downloads the model file on first use if it isn't cached yet).
+    # Song 1 and Song 2 are processed on their own top-level threads in
+    # parallel -- without this, both could see "not cached yet" at the same
+    # moment and both start writing the same destination file at once
+    # (audio-separator's own download_file_if_not_exists() has no locking
+    # or atomic rename of its own). Class-level so it's shared across the
+    # separate MashupEngine() instances each request creates. Only guards
+    # the load step, not the actual (slow) separation call that follows --
+    # that still runs in parallel across songs/models as intended.
+    _model_load_lock = threading.Lock()
+
     @classmethod
     def is_previewing(cls):
         return cls._preview_process is not None and cls._preview_process.poll() is None
@@ -192,6 +205,177 @@ class MashupEngine:
             if proc.poll() is None:
                 proc.terminate()
         cls._active_encode_processes = []
+
+    # Every audio-separator model this app ever loads (see the 4 Separator(
+    # ...).load_model(...) call sites above/below) plus the 2 Demucs presets
+    # -- kept in one place so prefetch_models() and any future caller can
+    # enumerate them without hunting through separate_stems_multi_engine().
+    # (key, filename, label, required) -- `required` marks a model whose
+    # absence would break basic app function (nothing else can proceed
+    # without it), vs. one that only disables a specific optional feature.
+    AUDIO_SEPARATOR_MODEL_FILES = [
+        ("vocals_melband", "vocals_mel_band_roformer.ckpt", "Vocal model (Mel-Band RoFormer)", False),
+        ("vocals_bsroformer", "model_bs_roformer_ep_368_sdr_12.9628.ckpt", "Vocal model (BS-RoFormer)", False),
+        ("drumsep", "MDX23C-DrumSep-aufr33-jarredou.ckpt", "Kick/snare model (MDX23C DrumSep)", False),
+        ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "Restoration: denoise model", False),
+        ("dereverb", "dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt", "Restoration: de-reverb model", False),
+    ]
+    # (key, model_name, label, required) -- htdemucs is legacy mode's
+    # default model, so basic (non-multi-engine) separation needs it;
+    # htdemucs_6s is multi-engine-only.
+    DEMUCS_MODELS = [
+        ("demucs_htdemucs", "htdemucs", "Demucs (legacy 4-stem model)", True),
+        ("demucs_htdemucs6s", "htdemucs_6s", "Demucs (multi-engine 6-stem model)", False),
+    ]
+
+    @staticmethod
+    def _is_demucs_model_cached(model_name):
+        """Demucs weights live in HuggingFace Hub's cache, under a
+        content-hashed 'blobs' dir per repo -- checking for at least one
+        blob is a reasonable proxy for "already downloaded" without
+        needing a network call to confirm."""
+        repo = {"htdemucs": "HTDemucs", "htdemucs_6s": "HTDemucs-6s"}.get(model_name)
+        if not repo:
+            return False
+        blobs_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--adefossez--{repo}" / "blobs"
+        return blobs_dir.is_dir() and any(blobs_dir.iterdir())
+
+    @classmethod
+    def prefetch_models(cls, progress_callback=None):
+        """Download every model this app needs, if not already cached, so
+        the first real separation a user runs doesn't stall (or, worse,
+        race -- see _model_load_lock) on a multi-GB download. Meant to be
+        called once at server startup, before any request can trigger a
+        real separation.
+
+        progress_callback, if given, is called for each model -- first with
+        status "checking" (so a caller pacing this for a UI, e.g. server.py,
+        has a natural moment to pause before the result), then with the
+        result: "cached" (already present, nothing to do), "downloading" +
+        eventually "done", or "error" (see "detail" for the exception
+        message). Checking for "already cached" first (rather than always
+        calling the download-if-needed function) is what lets the GUI show
+        an instant checkmark for models that don't need fetching, instead
+        of every model looking identical mid-startup.
+
+        Never raises -- a single model failing to download is reported via
+        its own "error" status so the rest can still proceed; the caller
+        decides what to do with a failed required model."""
+        import logging
+        from audio_separator.separator import Separator
+
+        def report(key, label, status, required, detail=None):
+            if progress_callback:
+                progress_callback({"key": key, "label": label, "status": status,
+                                    "required": required, "detail": detail})
+            logging.info(f"🔧 {label}: {status}")
+
+        for key, filename, label, required in cls.AUDIO_SEPARATOR_MODEL_FILES:
+            report(key, label, "checking", required)
+            if (AUDIO_SEPARATOR_MODEL_DIR / filename).is_file():
+                report(key, label, "cached", required)
+                continue
+            report(key, label, "downloading", required)
+            try:
+                with cls._model_load_lock:
+                    separator = Separator(output_dir=str(BASE_DIR), model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+                    separator.download_model_files(filename)
+                report(key, label, "done", required)
+            except Exception as e:
+                logging.error(f"Failed to fetch model {filename}: {e}")
+                report(key, label, "error", required, detail=str(e))
+
+        # Demucs weights come from HuggingFace Hub (~/.cache/huggingface),
+        # not audio-separator's own cache -- also persistent, not /tmp, so
+        # no equivalent to the AUDIO_SEPARATOR_MODEL_DIR override is needed
+        # here. get_model() fetches (if needed) and loads the checkpoint
+        # without running inference, which is all we need here.
+        import demucs.pretrained
+        for key, model_name, label, required in cls.DEMUCS_MODELS:
+            report(key, label, "checking", required)
+            if cls._is_demucs_model_cached(model_name):
+                report(key, label, "cached", required)
+                continue
+            report(key, label, "downloading", required)
+            try:
+                demucs.pretrained.get_model(model_name)
+                report(key, label, "done", required)
+            except Exception as e:
+                logging.error(f"Failed to fetch Demucs model {model_name}: {e}")
+                report(key, label, "error", required, detail=str(e))
+
+        logging.info("✅ Model prefetch complete.")
+
+    @classmethod
+    def check_environment(cls, progress_callback=None):
+        """Check the external tools/hardware this app depends on, so
+        problems (missing rubberband, no GPU, etc.) surface as one clear
+        report at startup instead of as a confusing failure deep inside
+        whatever feature happens to need that dependency first.
+
+        progress_callback, if given, is called twice per check: first with
+        status "checking" (a natural pacing point for a UI caller, same as
+        prefetch_models), then with the resolved "done"/"error". A failed
+        OPTIONAL check also carries "warning_label" -- a short phrase
+        ("slow processing", "align/snap disabled") for a UI to show instead
+        of a bare, alarming "error" for something that isn't actually
+        broken, just a reduced-functionality trade-off. Required checks
+        have no warning_label; their failure IS a real error.
+
+        Returns a list of {name, ok, detail, required} dicts (unchanged
+        shape from before progress_callback existed, for /api/health's
+        sake); nothing here raises."""
+        checks = []
+
+        def add(name, ok, detail, required=False, warning_label=None):
+            if progress_callback:
+                progress_callback({"key": f"env_{name}", "label": name, "status": "checking", "required": required})
+            checks.append({"name": name, "ok": bool(ok), "detail": detail, "required": required})
+            if progress_callback:
+                progress_callback({"key": f"env_{name}", "label": name,
+                                    "status": "done" if ok else "error",
+                                    "required": required, "detail": detail,
+                                    "warning_label": None if (ok or required) else warning_label})
+
+        add("ffmpeg", shutil.which("ffmpeg") is not None,
+            "Required for all audio conversion/mixing -- app will not function without it.",
+            required=True)
+        add("ffplay", shutil.which("ffplay") is not None,
+            "Used for in-app preview playback only.",
+            warning_label="preview disabled")
+
+        demucs_ok = shutil.which("demucs") is not None
+        if not demucs_ok:
+            try:
+                probe = subprocess.run([sys.executable, "-m", "demucs", "--help"],
+                                       capture_output=True, text=True, timeout=30)
+                demucs_ok = probe.returncode == 0
+            except Exception:
+                demucs_ok = False
+        add("demucs", demucs_ok, "Required for stem separation (both legacy and multi-engine mode).",
+            required=True)
+
+        add("rubberband", shutil.which("rubberband") is not None,
+            "Required for the 'Align beatgrid' and 'Snap to reference' features only -- "
+            "the rest of the app works without it.",
+            warning_label="align/snap disabled")
+
+        try:
+            import torch
+            add("gpu", torch.cuda.is_available(),
+                "No GPU detected -- separation will still work but run much slower on CPU.",
+                warning_label="slow processing")
+        except Exception as e:
+            add("gpu", False, f"Could not check (torch import failed: {e})", warning_label="slow processing")
+
+        try:
+            import audio_separator  # noqa: F401
+            add("audio_separator", True, "Multi-engine (9-stem) mode is available.")
+        except Exception as e:
+            add("audio_separator", False, f"Multi-engine mode unavailable: {e}",
+                warning_label="legacy mode only")
+
+        return checks
 
     def __init__(self):
         self.ffmpeg = "ffmpeg"
@@ -1094,15 +1278,25 @@ class MashupEngine:
     def _warp_beats_to_grid(self, wav_in, ticks, target_bpm, target_anchor, output_path, tmpdir):
         """Shared core of align_beatgrid/snap_to_reference: build a rubberband
         --timemap mapping each detected beat in `ticks` onto an evenly-spaced
-        grid of `target_bpm` starting at `target_anchor` seconds, warp
-        wav_in through it, and encode the result to output_path.
+        grid of `target_bpm`, anchored so ticks[0] lands on the grid point
+        closest to its own real position (see the k0 computation below --
+        NOT necessarily `target_anchor` itself, since ticks[0] can now sit
+        far into the file when kick-trimmed detection skipped a long
+        vague/drum-less intro), then warps wav_in through it and encodes the
+        result to output_path.
 
         Returns (time_ratio, mean_correction_ms, max_correction_ms):
         time_ratio is the overall ratio applied (output duration / input
         duration); the correction stats are how far each detected beat sat
         from its ideal grid position BEFORE warping -- i.e. the actual size
         of the drift/misalignment this step corrected, in milliseconds,
-        averaged and worst-case across all beats."""
+        averaged and worst-case across all beats. Past bug: enumerating grid
+        targets as target_anchor + i*ideal_interval assumed ticks[0] was at
+        i=0 (essentially the start of the track); once kick-trimming could
+        put ticks[0] tens of seconds in, that produced a nonsensical tens-
+        of-seconds "correction" instead of the intended small drift figure,
+        and would have asked rubberband to crush that whole span down to
+        nothing. Fixed via k0 below."""
         import subprocess
         import soundfile as sf
 
@@ -1112,6 +1306,21 @@ class MashupEngine:
 
         ideal_interval = 60.0 / target_bpm
 
+        # ticks[0] is not necessarily "the first beat of the track" anymore
+        # -- kick-trimmed detection (_detect_beats_essentia) can put it far
+        # into the file when it skips a long vague/drum-less intro. Naively
+        # enumerating grid targets as target_anchor + i*ideal_interval
+        # (i.e. assuming ticks[0] maps to i=0) would then try to warp that
+        # real position all the way back to target_anchor -- e.g. crushing
+        # 50 seconds of intro into a fraction of a second when snapping to
+        # another song whose own anchor sits near 0. Since the target grid
+        # is periodic with period ideal_interval, ANY integer offset k0
+        # lands on the exact same absolute-time grid (so phase-locking
+        # between songs is unaffected) -- so pick the k0 that keeps ticks[0]
+        # closest to its OWN actual position, minimizing distortion instead
+        # of introducing a spurious multi-second correction across every tick.
+        k0 = round((float(ticks[0]) - target_anchor) / ideal_interval)
+
         # Timemap: (source_frame, target_frame) pairs -- anchor the file
         # start, snap each beat to its ideal grid position, then hold the
         # tail (after the last beat) at a constant offset so it isn't cut.
@@ -1119,12 +1328,12 @@ class MashupEngine:
         corrections_ms = []
         for i, t in enumerate(ticks):
             src = int(float(t) * sr)
-            tgt = max(0, int((target_anchor + i * ideal_interval) * sr))
+            tgt = max(0, int((target_anchor + (k0 + i) * ideal_interval) * sr))
             timemap.append((src, tgt))
             corrections_ms.append(abs(src - tgt) / sr * 1000.0)
 
         last_src = int(float(ticks[-1]) * sr)
-        last_tgt = max(0, int((target_anchor + (len(ticks) - 1) * ideal_interval) * sr))
+        last_tgt = max(0, int((target_anchor + (k0 + len(ticks) - 1) * ideal_interval) * sr))
         tail_frames = total_frames - last_src
         total_output_frames = last_tgt + tail_frames
         timemap.append((total_frames, total_output_frames))
@@ -2188,7 +2397,8 @@ class MashupEngine:
 
         def _vocals_with_model(model_filename):
             separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            separator.load_model(model_filename=model_filename)
+            with MashupEngine._model_load_lock:
+                separator.load_model(model_filename=model_filename)
 
             logging.info(f"  Separating vocals from {Path(audio_path).name} using {model_filename}...")
             output_files = separator.separate(audio_path)
@@ -2329,7 +2539,8 @@ class MashupEngine:
 
         try:
             separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            separator.load_model(model_filename="MDX23C-DrumSep-aufr33-jarredou.ckpt")
+            with MashupEngine._model_load_lock:
+                separator.load_model(model_filename="MDX23C-DrumSep-aufr33-jarredou.ckpt")
 
             logging.info(f"  Splitting kick/snare from {Path(drums_path).name}...")
             output_files = separator.separate(drums_path)
@@ -2413,9 +2624,10 @@ class MashupEngine:
         with _report_audio_separator_progress(
                 "Restoration", lambda label: progress_callback(0.0, label) if progress_callback else None):
             denoiser = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
             dereverber = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            dereverber.load_model(model_filename="dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
+            with MashupEngine._model_load_lock:
+                denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
+                dereverber.load_model(model_filename="dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt")
 
         def _resolve(output_files, marker):
             for f in output_files:

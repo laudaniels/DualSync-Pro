@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify, send_from_directory, send_file
 from flask_cors import CORS
 from pathlib import Path
 import logging
+import threading
 import time
 
 logging.basicConfig(level=logging.DEBUG)
@@ -1231,11 +1232,105 @@ def process_status():
 # ===== Health Check =====
 @app.route('/api/health')
 def health():
-    """Health check endpoint"""
-    return jsonify({'status': 'ok'})
+    """Health check endpoint. Also carries the environment/dependency
+    checks run at startup (see check_environment()), so the frontend can
+    show a warning if e.g. rubberband is missing or no GPU was found --
+    re-checked on every call (all local, fast) rather than cached, so a
+    dependency installed after startup is picked up without a restart."""
+    from mashup_engine import MashupEngine
+    return jsonify({'status': 'ok', 'environment': MashupEngine.check_environment()})
+
+
+# ===== Startup sequence (environment checks + model prefetch) =====
+# The server starts accepting connections immediately (so the GUI loads
+# right away); _run_startup_sequence() runs on its own background thread
+# and updates _startup_state as it goes, which /api/startup-status exposes
+# for the frontend to poll and render as a blocking "please wait" overlay
+# until every REQUIRED item is ready (see StartupOverlay.jsx). Optional
+# items (no GPU, rubberband missing, etc.) are reported the same way but
+# don't hold up that overlay -- only ffmpeg/demucs presence and the two
+# demucs/htdemucs-family checks marked required=True in mashup_engine.py do.
+_startup_state_lock = threading.Lock()
+_startup_state = {'done': False, 'items': []}
+
+
+def _set_startup_item(item):
+    with _startup_state_lock:
+        items = _startup_state['items']
+        for i, existing in enumerate(items):
+            if existing['key'] == item['key']:
+                items[i] = item
+                return
+        items.append(item)
+
+
+# How long the "checking..." state stays visible before flipping to its
+# resolved icon. Every check here is near-instant on its own (a shutil.which
+# call, a cache-hit file check) -- without this, the overlay would jump
+# straight to fully resolved and the user would never actually see it work
+# through the list. Only applied after "checking"; a real download's own
+# transfer time already paces "downloading" -> "done" without any help.
+_STARTUP_CHECK_DISPLAY_DELAY_SEC = 0.5
+
+
+def _run_startup_sequence():
+    from mashup_engine import MashupEngine
+
+    print("\n" + "=" * 60)
+    print("DualSync Pro -- startup checks")
+    print("=" * 60)
+
+    def _progress(item):
+        icon = {'checking': '⏳', 'cached': '✅', 'done': '✅',
+                'downloading': '⬇️ ', 'error': '❌'}.get(item['status'], '?')
+        print(f"  {icon} {item['label']}: {item['status']}")
+        _set_startup_item(item)
+        if item['status'] == 'checking':
+            time.sleep(_STARTUP_CHECK_DISPLAY_DELAY_SEC)
+
+    MashupEngine.check_environment(progress_callback=_progress)
+
+    print("-" * 60)
+    print("Checking cached models (downloads anything missing)...")
+
+    try:
+        MashupEngine.prefetch_models(progress_callback=_progress)
+    except Exception as e:
+        # Shouldn't happen -- prefetch_models() reports per-model failures
+        # via _progress instead of raising -- but a broad safety net here
+        # still beats leaving _startup_state['done'] stuck at False forever.
+        print(f"⚠️  Model prefetch crashed unexpectedly: {e}")
+        logging.error(f"Model prefetch crashed: {e}", exc_info=True)
+
+    print("=" * 60 + "\n")
+    with _startup_state_lock:
+        _startup_state['done'] = True
+
+
+@app.route('/api/startup-status')
+def startup_status():
+    """Polled by StartupOverlay.jsx while the blocking startup screen is
+    up. 'ready' is true once every REQUIRED item has resolved (cached/done
+    for models, ok for environment checks) -- optional items may still be
+    mid-download or have failed without affecting it."""
+    with _startup_state_lock:
+        items = list(_startup_state['items'])
+        done = _startup_state['done']
+
+    required_ready = all(
+        item['status'] in ('cached', 'done')
+        for item in items
+        if item['required']
+    )
+    return jsonify({'items': items, 'done': done, 'ready': done and required_ready})
 
 
 if __name__ == '__main__':
+    # Runs in the background rather than blocking here, so the GUI can load
+    # immediately and show its own progress overlay instead of the user
+    # staring at an unresponsive browser tab during a first-run download.
+    threading.Thread(target=_run_startup_sequence, daemon=True).start()
+
     # Werkzeug's built-in dev server (app.run) is documented as unfit for
     # production and, in practice here, would leave roughly half of the 14
     # concurrent streaming <audio> connections (7 stems x 2 songs) hung at

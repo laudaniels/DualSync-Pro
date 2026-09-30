@@ -1,10 +1,13 @@
 import { useState } from 'react'
 import DualMixer from './components/DualMixer'
+import StartupOverlay from './components/StartupOverlay'
 import './styles/App.css'
 
 export default function App() {
   return (
     <div className="app">
+      <StartupOverlay />
+
       <header className="app-header">
         <div className="header-content">
           <h1>🎵 DualSync Pro</h1>
