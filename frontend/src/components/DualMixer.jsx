@@ -520,6 +520,17 @@ export default function DualMixer() {
     playerRef.current.setVolume(slot, stem, value);
   }, []);
 
+  // "Mute all" / "Full volume" buttons -- set every stem slider for one
+  // song at once, instead of dragging each one individually.
+  const handleSetAllVolumes = useCallback((slot, value) => {
+    const names = stems[slot] ? orderStems(Object.keys(stems[slot])) : [];
+    setVolumes(prev => ({
+      ...prev,
+      [slot]: Object.fromEntries(names.map(stem => [stem, value]))
+    }));
+    names.forEach(stem => playerRef.current.setVolume(slot, stem, value));
+  }, [stems]);
+
   // Apply or revert denoise + de-reverb restoration for one stem, on demand
   // (separation itself always skips it now -- see server.py). The served
   // URL doesn't change, only its content does, so the re-fetch below is
@@ -632,6 +643,18 @@ export default function DualMixer() {
 
     const waveformData = { stems: {}, duration: 0 };
 
+    // Peak (min/max) envelope at a fixed time resolution, not a flat
+    // sample-count cap spread across the whole song -- the old approach
+    // (2048 samples total, one nearest-sample pick each) gave a zoomed-in
+    // window (as little as 3s out of a multi-minute song) only a handful of
+    // points, and picked a single raw sample per bucket instead of its
+    // actual min/max range, so the line looked sparse/jagged and missed
+    // most of the audio's real amplitude between those picks. 200
+    // buckets/sec keeps even the tightest zoom window dense; Waveform.jsx
+    // aggregates further per on-screen pixel when zoomed out, so this never
+    // over-draws.
+    const BUCKETS_PER_SEC = 200;
+
     for (const stem of selectedStemsForWaveform) {
       waveformData.stems[stem] = { data1: null, data2: null };
 
@@ -640,13 +663,24 @@ export default function DualMixer() {
         if (!audioBuffer) continue;
 
         const rawData = audioBuffer.getChannelData(0);
-        const samples = Math.min(rawData.length, 2048); // Limit samples for display
-        const stemData = new Float32Array(samples);
-        for (let i = 0; i < samples; i++) {
-          stemData[i] = rawData[Math.floor((i / samples) * rawData.length)];
+        const buckets = Math.max(1, Math.round(audioBuffer.duration * BUCKETS_PER_SEC));
+        const samplesPerBucket = rawData.length / buckets;
+        const min = new Float32Array(buckets);
+        const max = new Float32Array(buckets);
+        for (let i = 0; i < buckets; i++) {
+          const start = Math.floor(i * samplesPerBucket);
+          const end = Math.min(rawData.length, Math.floor((i + 1) * samplesPerBucket));
+          let bucketMin = 0, bucketMax = 0;
+          for (let j = start; j < end; j++) {
+            const v = rawData[j];
+            if (v < bucketMin) bucketMin = v;
+            if (v > bucketMax) bucketMax = v;
+          }
+          min[i] = bucketMin;
+          max[i] = bucketMax;
         }
 
-        waveformData.stems[stem][`data${slot + 1}`] = stemData;
+        waveformData.stems[stem][`data${slot + 1}`] = { min, max, bucketsPerSec: BUCKETS_PER_SEC };
         waveformData.duration = Math.max(waveformData.duration, audioBuffer.duration);
       }
     }
@@ -1142,6 +1176,7 @@ export default function DualMixer() {
               onFileDropped={handleFileDropped}
               onChooseMode={handleChooseMode}
               onVolumeChange={handleVolumeChange}
+              onSetAllVolumes={handleSetAllVolumes}
               onToggleRestoration={handleToggleRestoration}
             />
           ))}
@@ -1235,28 +1270,6 @@ export default function DualMixer() {
               />
             )}
 
-            {/* Crossfader */}
-            <div className="crossfader-section">
-              <label>🎛️ Crossfader</label>
-              <div className="crossfader-labels">
-                <span>Song 1</span>
-                <span>Both</span>
-                <span>Song 2</span>
-              </div>
-              <input
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value={crossfader}
-                onChange={(e) => handleCrossfaderChange(parseFloat(e.target.value))}
-                className="crossfader-slider"
-              />
-              <div className="crossfader-value">
-                {crossfader === 50 ? 'Both: 50/50' : crossfader < 50 ? `Song 1: ${100 - crossfader}%` : `Song 2: ${crossfader}%`}
-              </div>
-            </div>
-
             {/* Beat Offset for Song 2 with Magnetic Snap -- up to 32 bars.
                 The slider's own unit is BARS (precise to drag/snap at this
                 range); beatOffset (bars*4) is what's sent to the player and
@@ -1332,6 +1345,28 @@ export default function DualMixer() {
                   {' · '}Total realigned so far: {driftInfo.cumulativeBeats.toFixed(2)} beats
                 </div>
               )}
+            </div>
+
+            {/* Crossfader */}
+            <div className="crossfader-section" style={{ marginTop: '15px' }}>
+              <label>🎛️ Crossfader</label>
+              <div className="crossfader-labels">
+                <span>Song 1</span>
+                <span>Both</span>
+                <span>Song 2</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value={crossfader}
+                onChange={(e) => handleCrossfaderChange(parseFloat(e.target.value))}
+                className="crossfader-slider"
+              />
+              <div className="crossfader-value">
+                {crossfader === 50 ? 'Both: 50/50' : crossfader < 50 ? `Song 1: ${100 - crossfader}%` : `Song 2: ${crossfader}%`}
+              </div>
             </div>
 
           </div>

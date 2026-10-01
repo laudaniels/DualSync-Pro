@@ -95,46 +95,65 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, son
 
     // Draw each selected stem
     stemsToDisplay.forEach((stem, stemIdx) => {
-      const yOffset = (stemIdx + 0.5) * rowHeight;
+      const rowTop = stemIdx * rowHeight;
+      const yOffset = rowTop + rowHeight / 2;
+      const laneHeight = rowHeight / stemsPerSlot; // one lane per song, within this stem's row
       const stemData = kicks.stems[stem];
       const color = stemColors[stem];
 
       // Draw both Song 1 and Song 2 for this stem
       [
-        { data: stemData.data1, offset: 0, label: `${stemLabels[stem]} (Song 1)`, xShift: 0 },
-        { data: stemData.data2, offset: rowHeight / 2, label: `Song 2`, xShift: song2PixelOffset }
+        { data: stemData.data1, laneIdx: 0, label: `${stemLabels[stem]} (Song 1)`, xShift: 0 },
+        { data: stemData.data2, laneIdx: 1, label: `Song 2`, xShift: song2PixelOffset }
       ].forEach((songData, songIdx) => {
         if (!songData.data) return;
 
-        const yPos = yOffset + (songIdx - 0.5) * (rowHeight / 3);
-        const totalSamples = songData.data.length;
-        const startSample = Math.floor((actualStart / totalDuration) * totalSamples);
-        const endSample = Math.floor((actualEnd / totalDuration) * totalSamples);
-        const visibleSamples = endSample - startSample;
+        // Center of this song's own lane (half the stem's row each), with a
+        // small margin so peaks don't run into the neighboring lane.
+        const yPos = rowTop + (songData.laneIdx + 0.5) * laneHeight;
+        const amplitudeScale = laneHeight * 0.9;
+        // Individual stems rarely hit true full-scale (+/-1.0) peaks even at
+        // their loudest -- a flat visual gain (clamped back to +/-1 before
+        // scaling) makes quieter passages actually use the lane instead of
+        // looking flat, without touching the real audio.
+        const VISUAL_GAIN = 2.2;
+
+        const { min: minArr, max: maxArr, bucketsPerSec } = songData.data;
+        const totalBuckets = minArr.length;
+        const startSample = Math.max(0, Math.floor(actualStart * bucketsPerSec));
+        const endSample = Math.min(totalBuckets, Math.ceil(actualEnd * bucketsPerSec));
+        const visibleBuckets = Math.max(1, endSample - startSample);
+        // Aggregate (min/max) per on-screen pixel column rather than
+        // connecting single sample points with straight lines -- this is
+        // what keeps the waveform looking like a dense, filled envelope
+        // (matching WaveformPreview.jsx's slider thumbnails) instead of a
+        // sparse zigzag, whether zoomed in (few buckets per pixel) or
+        // zoomed out (many buckets collapsed into one column).
+        const bucketsPerPixel = visibleBuckets / width;
 
         ctx.strokeStyle = color;
-        ctx.lineWidth = 1.2;
+        ctx.lineWidth = 1.5;
         ctx.globalAlpha = songIdx === 0 ? 1 : 0.6; // Song 2 slightly faded
         ctx.beginPath();
 
-        const pixelsPerSample = width / visibleSamples;
-        for (let i = 0; i < visibleSamples; i++) {
-          const sampleIdx = startSample + i;
-          if (sampleIdx >= songData.data.length) break;
-
-          const x = songData.xShift + (i * pixelsPerSample);
-
-          // Skip drawing if x is outside canvas for Song 2 shift
+        for (let px = 0; px < width; px++) {
+          const x = songData.xShift + px;
           if (x < 0 || x > width) continue;
 
-          const amplitude = songData.data[sampleIdx] || 0;
-          const y = yPos + (amplitude * (rowHeight / 3));
-
-          if (i === 0) {
-            ctx.moveTo(x, y);
-          } else {
-            ctx.lineTo(x, y);
+          const bStart = startSample + Math.floor(px * bucketsPerPixel);
+          const bEnd = Math.max(bStart + 1, startSample + Math.floor((px + 1) * bucketsPerPixel));
+          let colMin = 0, colMax = 0;
+          for (let b = bStart; b < bEnd && b < totalBuckets; b++) {
+            if (minArr[b] < colMin) colMin = minArr[b];
+            if (maxArr[b] > colMax) colMax = maxArr[b];
           }
+          colMin = Math.max(-1, colMin * VISUAL_GAIN);
+          colMax = Math.min(1, colMax * VISUAL_GAIN);
+
+          const yMin = yPos + (colMin * amplitudeScale);
+          const yMax = yPos + (colMax * amplitudeScale);
+          ctx.moveTo(x, yMin);
+          ctx.lineTo(x, yMax);
         }
         ctx.stroke();
         ctx.globalAlpha = 1;
@@ -196,7 +215,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, son
         ref={canvasRef}
         style={{
           width: '100%',
-          height: '500px',
+          height: '650px',
           borderRadius: '8px',
           background: 'rgba(99, 102, 241, 0.05)',
           border: '1px solid rgba(99, 102, 241, 0.2)',

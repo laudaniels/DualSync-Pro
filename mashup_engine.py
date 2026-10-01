@@ -519,9 +519,11 @@ class MashupEngine:
 
         try:
             import torch
-            add("gpu", torch.cuda.is_available(),
-                "No GPU detected -- separation will still work but run much slower on CPU.",
-                warning_label="slow processing")
+            gpu_ok = torch.cuda.is_available()
+            gpu_detail = (f"GPU detected ({torch.cuda.get_device_name(0)}) -- separation will use GPU acceleration."
+                          if gpu_ok else
+                          "No GPU detected -- separation will still work but run much slower on CPU.")
+            add("gpu", gpu_ok, gpu_detail, warning_label="slow processing")
         except Exception as e:
             add("gpu", False, f"Could not check (torch import failed: {e})", warning_label="slow processing")
 

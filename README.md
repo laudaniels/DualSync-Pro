@@ -71,7 +71,7 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 - **Beatmatching with Verification** — align Song 2 to Song 1 (or both to target BPM) with automatic multi-pass correction
   - Pass 1: FFmpeg tempo-stretching (stable baseline)
   - Pass 2+: Optional RubberBand for higher quality (if available)
-  - Automatic re-analysis after each pass to verify convergence (±10 BPM tolerance)
+  - Automatic re-analysis after each pass to verify convergence (±2 BPM tolerance, up to 3 passes; falls back to the closest attempt if it never converges)
 - **Key Transposition** — pitch-shift tracks to match target key
 - **Camelot Wheel Key Recommendations** — ranks up to 5 candidate keys by harmonic distance (circle-of-fifths) to both songs simultaneously, showing a quality label (🟢 Very good / 👍 Good / 🙂 Fair / 🆗 Ok) and the exact Camelot code + semitone shift needed for each song; flags the pair as "✅ No change needed" when they're already harmonically compatible
 
@@ -498,7 +498,7 @@ pip install -r requirements.txt --no-build-isolation
 ### BPM Detection & Beatmatching
 - **Detection:** Essentia's `RhythmExtractor2013` analyzes each song's beat positions and BPM, in seconds, before any separation
 - **Beatmatching:** FFmpeg tempo-stretching aligns both songs to a shared target BPM
-- **Verification:** Output BPM is measured after each pass; if off by >±10 BPM, another pass is applied
+- **Verification:** Output BPM is measured after each pass; if off by >±2 BPM, another pass is applied (up to 3 passes total, then falls back to the closest attempt)
 - **Filenames:** Show actual measured output BPM, not target BPM (e.g., if target=112, output might be 111.8)
 
 ### Beatgrid Alignment Modes
@@ -510,6 +510,7 @@ pip install -r requirements.txt --no-build-isolation
 - Computes each song's Camelot code from its detected key/scale
 - Ranks all 12 candidate keys by circle-of-fifths distance to both songs' keys simultaneously (mode-independent), scoring 0-4 (lower is more compatible) and preferring same-mode matches
 - Returns up to 5 ranked suggestions, each showing a quality label/emoji, and the exact Camelot code + semitone shift needed per song
+- The two songs' own original keys are themselves always candidates, representing "keep Song 1 as is, transpose Song 2 to it" and, symmetrically, "keep Song 2 as is, transpose Song 1 to it" (0 semitones for whichever song stays put). Both show up whenever the songs are within the harmonic-compatibility cutoff -- ranking is primarily by Song 2's own semitone shift, so whichever of the two needs the smaller shift for Song 2 tends to rank higher
 - Detects when the two songs are already harmonically compatible (same/relative/adjacent Camelot code) and shows a "✅ No change needed" banner instead
 
 ### The Process Button
@@ -612,9 +613,10 @@ React frontend requires Node.js 16+ with packages listed in `frontend/package.js
 
 ## Performance Notes
 
-- **First run:** all 7 models — Demucs `htdemucs`/`htdemucs_6s` (~134MB, `~/.cache/huggingface`) and the 5 audio-separator models (vocal ensemble, DrumSep, denoise, de-reverb — ~3.4GB, `~/.cache/audio-separator-models`) — download once, **in parallel**, behind the startup overlay, and are cached persistently, so this cost is paid only once, ever, not per song
+- **First run:** all 8 models — Demucs `htdemucs`/`htdemucs_6s`/`hdemucs_mmi` (~294MB, `~/.cache/huggingface`) and the 5 audio-separator models (vocal ensemble, DrumSep, denoise, de-reverb — ~3.4GB, `~/.cache/audio-separator-models`) — download once, **in parallel**, behind the startup overlay, and are cached persistently, so this cost is paid only once, ever, not per song
 - **Analysis:** seconds — BPM/Key detection runs before any separation, so you see real detected values right away
 - **Stem separation:** ~10-15 min per song, running for both songs in parallel (restoration is no longer part of this — it's opt-in per stem afterward)
+- **Benchmark (GPU):** on an AMD Ryzen 9 9900 (12-core) / 32GB RAM / NVIDIA GeForce RTX 3070 (8GB), processing two tracks (6:30 and 6:58) in parallel with multi-engine (9-stem) separation took ~10 minutes total
 - **Beatmatching:** 30 seconds to 2 minutes (depends on convergence)
 - **Real-time mixing:** Smooth 60+ FPS on modern browsers
 - **File downloads:** near-instant, since the final mix is written as lossless WAV directly (no lossy intermediate encode/decode step)

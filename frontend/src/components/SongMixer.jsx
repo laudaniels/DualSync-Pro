@@ -42,6 +42,7 @@ function SongMixer({
   onFileDropped,
   onChooseMode,
   onVolumeChange,
+  onSetAllVolumes,
   onToggleRestoration
 }) {
   const songName = metadata?.filename?.replace(/\.[^/.]+$/, '') || `Song ${slot + 1}`;
@@ -373,7 +374,45 @@ function SongMixer({
         </div>
       ) : (
         <div className="stem-controls">
-          <h4>🎚️ Volumes {!audioReady && <span style={{ fontWeight: 'normal', fontSize: '11px', color: '#999' }}>(⏳ preparing audio...)</span>}</h4>
+          <h4 style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+            <span>🎚️ Volumes {!audioReady && <span style={{ fontWeight: 'normal', fontSize: '11px', color: '#999' }}>(⏳ preparing audio...)</span>}</span>
+            <span style={{ display: 'flex', gap: '6px' }}>
+              <button
+                type="button"
+                onClick={() => onSetAllVolumes(slot, 0)}
+                title="Set every stem for this song to 0%"
+                style={{
+                  fontSize: '11px',
+                  fontWeight: 'normal',
+                  padding: '3px 8px',
+                  borderRadius: '5px',
+                  border: '1px solid rgba(255, 255, 255, 0.2)',
+                  background: 'transparent',
+                  color: '#ccc',
+                  cursor: 'pointer'
+                }}
+              >
+                🔇 All to 0%
+              </button>
+              <button
+                type="button"
+                onClick={() => onSetAllVolumes(slot, 1)}
+                title="Set every stem for this song to 100%"
+                style={{
+                  fontSize: '11px',
+                  fontWeight: 'normal',
+                  padding: '3px 8px',
+                  borderRadius: '5px',
+                  border: '1px solid rgba(255, 255, 255, 0.2)',
+                  background: 'transparent',
+                  color: '#ccc',
+                  cursor: 'pointer'
+                }}
+              >
+                🔊 All to 100%
+              </button>
+            </span>
+          </h4>
           {(stemNames || []).map((stem, i) => (
             <div
               key={stem}
