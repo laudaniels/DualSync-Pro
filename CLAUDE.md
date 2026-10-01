@@ -105,10 +105,11 @@ not a full mix, so kick/snare runs on the (refined, see below) `drums` output.
 
 **Pipeline (tested end-to-end with real audio):**
 1. **Stage 1 (Parallel GPU)** — both from full song:
-   - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer
-     12.1 dB SDR, averaged sample-by-sample): cleanest vocals -- verified
-     by ear against each model alone, the average won clearly (a known
-     technique, UVR's "Ensemble Mode": different architectures make
+   - **Vocal-model ensemble** (Mel-Band RoFormer by becruily + BS-RoFormer
+     12.1 dB SDR, averaged sample-by-sample): cleanest vocals -- verified by
+     ear in a live A/B/C test against a real track, the ensemble beat
+     becruily alone by a small margin and both beat the old ensemble outright
+     (a known technique, UVR's "Ensemble Mode": different architectures make
      different mistakes, averaging smooths those out)
    - **Demucs `htdemucs_6s`** (9.5 dB SDR): guitar, piano, other -- plus an
      initial bass/drums pass, refined by the next bullet (it's the only
@@ -135,8 +136,9 @@ not a full mix, so kick/snare runs on the (refined, see below) `drums` output.
 - `guitar`, `piano`, `other` — Demucs `htdemucs_6s`
 
 **Model Details:**
-- **Vocal Models (ensemble, averaged):** `vocals_mel_band_roformer.ckpt` (12.60 dB SDR)
-  and `model_bs_roformer_ep_368_sdr_12.9628.ckpt` ("BS-Roformer-Viperx-1296", 12.10 dB SDR)
+- **Vocal Models (ensemble, averaged):** `mel_band_roformer_vocals_becruily.ckpt` (no SDR
+  listed in audio-separator's own registry; chosen by live listening test, not a benchmark
+  number) and `model_bs_roformer_ep_368_sdr_12.9628.ckpt` ("BS-Roformer-Viperx-1296", 12.10 dB SDR)
 - **Drum ML:** `drumsep_5stems_mdx23c_jarredou.ckpt` (5-stem capable, we use kick+snare)
 - **Restoration (opt-in per stem, not run during separation):** `denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt`
   (27.99 dB SDR) then `dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt` (19.17 dB SDR),
@@ -178,6 +180,22 @@ model alone. `vocals_mel_band_roformer.ckpt`'s own filename contains
 stem marker, or ensembling would have silently averaged in the wrong file
 half the time.
 
+**Past decision (superseded, 2026-10-01):** `vocals_mel_band_roformer.ckpt`
+was replaced in the ensemble by `mel_band_roformer_vocals_becruily.ckpt`
+(also in audio-separator's registry, no SDR listed there). Checked
+audio-separator's model registry directly for anything better than the
+existing pipeline across every stem category; for vocals this surfaced
+becruily's model as a real, already-downloadable candidate. A live A/B/C
+listening test against a real track (not a benchmark number) confirmed it:
+becruily alone beat the old ensemble outright, and ensembling it with
+BS-Roformer (unchanged) beat becruily alone by a smaller margin -- so only
+the Mel-Band half of the ensemble changed. The same registry check found no
+comparably-available upgrade for bass/drums/guitar/piano/other (nothing
+clearly better that's already in audio-separator or a plain Demucs preset),
+and confirmed (by actually running it) that the kick/snare model already in
+use genuinely only outputs kick+snare, not the hihat/tom/ride/crash its own
+training config lists -- so hihat/tom's frequency-filter fallback stays.
+
 **Past known issue (fixed):** this stage used to call the CPJKU
 "music-source-restoration" project (a HiFi++ GAN) via
 `restoration.mixture_inference.create_mixture_system` -- a module that never
@@ -198,8 +216,8 @@ is bottlenecked by whichever of the two threads finishes last)
 ## Features & Components
 
 ### Multi-Engine Stem Separation (9 stems)
-**Models (best-in-class, verified SDR):**
-- **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged) → lead vocals
+**Models (best-in-class, chosen by listening test where no reliable SDR exists):**
+- **Vocal-model ensemble** (Mel-Band RoFormer by becruily + BS-RoFormer 12.1 dB SDR, averaged) → lead vocals
 - **Demucs htdemucs_6s** (9.5 dB SDR) → guitar, piano, other (only model that separates these at all)
 - **Demucs hdemucs_mmi** (bass 12.2 dB / drums 9.6 dB SDR) → bass, and the drums stem that feeds kick/snare/hihat/tom below
 - **MDX23C DrumSep** (SOTA) → kick, snare (from the hdemucs_mmi drums stem)
@@ -242,11 +260,13 @@ list):**
 - Bonus/reference stems (byproducts already generated for free, never
   thrown away -- see Multi-Engine Stem Separation above): the vocal
   ensemble's own two individual models' vocals + instrumental outputs
-  (`extra_vocals_melband_roformer`, `extra_instrumental_melband_roformer`,
+  (`extra_vocals_becruily`, `extra_instrumental_becruily`,
   `extra_vocals_bs_roformer`, `extra_instrumental_bs_roformer`), and
   Demucs' own unused vocals (`extra_vocals_demucs`)
-- `<stem>_original.wav`/`<stem>_restored.wav` if that stem's restoration
-  has been toggled (see Restoration above)
+- `vocals_original.wav`/`vocals_restored.wav` if vocals' restoration has
+  been toggled (see Restoration above) -- the only restorable stem
+  (`RESTORABLE_STEMS` in server.py), so it's also the only one that ever
+  gets an `_original.wav` backup in the first place
 - ACID chunks embedded on every file (BPM/key for DAW auto-detect)
 - No more separate "original/" vs "processed/" folders -- a song only has
   one current state at a time (whatever's currently active, as-is or
@@ -399,6 +419,21 @@ HuggingFace Hub's own progress reporting).
 
 ## Development Notes
 
+- **32-bit float WAV end-to-end**: every intermediate/output WAV this app
+  writes (upload conversion, beatgrid warp, time-stretch/pitch-shift passes,
+  drum-frequency splitting, final render) uses `pcm_f32le`, not ffmpeg's
+  16-bit default -- matches the float32 precision every model here (Demucs,
+  the vocal RoFormers, MDX23C DrumSep) already computes in internally, so no
+  intermediate hop re-quantizes. Demucs gets this via its own `--float32`
+  CLI flag. audio-separator needs more than just `use_soundfile=True`:
+  `CommonSeparator.write_audio_soundfile` has its own int16-hardcoding bug
+  for the common (C-contiguous) array case, so
+  `MashupEngine._ensure_audio_separator_float_output()` patches it to write
+  float32 (still applying the same peak-normalization its default pydub
+  path would have). Bit depth has no effect on separation time -- the
+  models convert to float32 tensors regardless of source precision; the
+  only cost is ~2x larger files on disk and in downloads (4 bytes/sample
+  vs. 16-bit's 2).
 - BPM detection and stem separation run in background threads
 - Multi-engine mode uses parallel GPU processing (Stage 1: vocal-model ensemble + Demucs x2)
 - Stem separation pipeline: ~12-17 min per track (quality prioritized;

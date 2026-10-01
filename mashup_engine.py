@@ -66,6 +66,16 @@ class MashupEngine:
     STEM_NAMES = ("vocals", "drums", "bass", "other")
     TARGET_SAMPLE_RATE = 44100
 
+    # Appended to every ffmpeg command that writes one of this app's own WAV
+    # files, so audio stays 32-bit float all the way through the pipeline
+    # instead of ffmpeg's WAV-muxer default (16-bit PCM) -- every model here
+    # (Demucs, the vocal RoFormers, MDX23C DrumSep) already computes in
+    # float32 internally, so writing float32 at each intermediate hop (the
+    # beatgrid warp, each time-stretch pass, drum-frequency splitting, the
+    # final render, ...) means none of those hops re-quantizes and loses
+    # precision the next stage could have used.
+    WAV_CODEC_ARGS = ["-c:a", "pcm_f32le"]
+
     # How far before a detected kick transient to actually start beat-grid
     # analysis (see _detect_kick_candidates). Cutting an audio array
     # exactly on a hard transient gives beat trackers no quiet lead-in to
@@ -151,7 +161,7 @@ class MashupEngine:
     # absence would break basic app function (nothing else can proceed
     # without it), vs. one that only disables a specific optional feature.
     AUDIO_SEPARATOR_MODEL_FILES = [
-        ("vocals_melband", "vocals_mel_band_roformer.ckpt", "Vocal model (Mel-Band RoFormer)", False),
+        ("vocals_becruily", "mel_band_roformer_vocals_becruily.ckpt", "Vocal model (Mel-Band RoFormer, becruily)", False),
         ("vocals_bsroformer", "model_bs_roformer_ep_368_sdr_12.9628.ckpt", "Vocal model (BS-RoFormer)", False),
         ("drumsep", "MDX23C-DrumSep-aufr33-jarredou.ckpt", "Kick/snare model (MDX23C DrumSep)", False),
         ("denoise", "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt", "Restoration: denoise model", False),
@@ -170,7 +180,7 @@ class MashupEngine:
     # future upstream re-upload ever legitimately changes this exact
     # file's size, update the number here along with it.
     AUDIO_SEPARATOR_MODEL_SIZES = {
-        "vocals_mel_band_roformer.ckpt": 913106900,
+        "mel_band_roformer_vocals_becruily.ckpt": 913107578,
         "model_bs_roformer_ep_368_sdr_12.9628.ckpt": 639317465,
         "MDX23C-DrumSep-aufr33-jarredou.ckpt": 437652699,
         "denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt": 913097300,
@@ -213,6 +223,63 @@ class MashupEngine:
     # the load step, not the actual (slow) separation call that follows --
     # that still runs in parallel across songs/models as intended.
     _model_load_locks = {filename: threading.Lock() for _key, filename, _label, _required in AUDIO_SEPARATOR_MODEL_FILES}
+
+    _audio_separator_float_patch_applied = False
+
+    @classmethod
+    def _ensure_audio_separator_float_output(cls):
+        """Every audio-separator model (vocal ensemble members, DrumSep
+        kick/snare, denoise/de-reverb restoration) computes in float32
+        internally, but CommonSeparator's two write paths both throw that
+        away: the default (pydub) path hardcodes int16, and so does its own
+        'use_soundfile=True' alternative -- its manual stereo-interleave
+        branch hardcodes dtype=np.int16 whenever the array isn't already
+        Fortran-contiguous, which is true for almost every freshly computed
+        array. So using use_soundfile=True alone does NOT avoid the
+        quantization; this patches write_audio_soundfile itself to keep
+        float32 (soundfile accepts a plain (frames, channels) array directly,
+        no manual interleaving needed) while still applying the same
+        peak-normalization its pydub counterpart does, so loudness matches
+        what every other stem would've gotten either way. Call sites must
+        also pass use_soundfile=True to Separator(...) so this path is
+        actually used instead of the pydub one. Idempotent -- only patches
+        once per process.
+
+        Past known issue (fixed): the original write_audio_soundfile also
+        never joins stem_path with self.output_dir -- get_stem_output_path()
+        always returns a bare filename (os.path.join() on a single argument
+        is a no-op), and only write_audio_pydub ever joined it with
+        output_dir itself. Routing through write_audio_soundfile without
+        also doing that join silently wrote every stem into the process's
+        current working directory instead of output_dir, while this app's
+        own code still looked for it under output_dir -- caught via a real
+        A/B test run (a 'System error' opening a file that was supposedly
+        just written). Fixed below by replicating write_audio_pydub's join.
+        """
+        if cls._audio_separator_float_patch_applied:
+            return
+        import os
+        from audio_separator.separator.common_separator import CommonSeparator
+        from audio_separator.separator.uvr_lib_v5 import spec_utils
+        import numpy as np
+        import soundfile as sf
+
+        def _write_audio_soundfile_float32(self, stem_path, stem_source):
+            stem_source = spec_utils.normalize(wave=stem_source, max_peak=self.normalization_threshold,
+                                                min_peak=self.amplification_threshold)
+            if np.max(np.abs(stem_source)) < 1e-6:
+                self.logger.warning("Warning: stem_source array is near-silent or empty.")
+                return
+            if self.output_dir:
+                os.makedirs(self.output_dir, exist_ok=True)
+                stem_path = os.path.join(self.output_dir, stem_path)
+            try:
+                sf.write(stem_path, np.ascontiguousarray(stem_source), self.sample_rate, subtype='FLOAT')
+            except Exception as e:
+                self.logger.error(f"Error exporting audio file: {e}")
+
+        CommonSeparator.write_audio_soundfile = _write_audio_soundfile_float32
+        cls._audio_separator_float_patch_applied = True
 
     @classmethod
     def all_startup_items(cls):
@@ -592,7 +659,7 @@ class MashupEngine:
             cmd = [
                 self.ffmpeg, "-y", "-i", str(path),
                 "-af", "apad", "-t", f"{target:.3f}",
-                padded_path
+                *self.WAV_CODEC_ARGS, padded_path
             ]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if result.returncode != 0:
@@ -1224,7 +1291,7 @@ class MashupEngine:
             # ffmpeg-decoded copy, corrupting the whole timemap.
             wav_in = tmpdir / "in.wav"
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(input_path), "-ar", "44100", str(wav_in)],
+                ["ffmpeg", "-y", "-i", str(input_path), "-ar", "44100", *self.WAV_CODEC_ARGS, str(wav_in)],
                 capture_output=True, text=True, timeout=120
             )
             if result.returncode != 0:
@@ -1285,7 +1352,7 @@ class MashupEngine:
             # beats on the same decoded WAV that gets warped.
             wav_in = tmpdir / "in.wav"
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(input_path), "-ar", "44100", str(wav_in)],
+                ["ffmpeg", "-y", "-i", str(input_path), "-ar", "44100", *self.WAV_CODEC_ARGS, str(wav_in)],
                 capture_output=True, text=True, timeout=120
             )
             if result.returncode != 0:
@@ -1386,7 +1453,7 @@ class MashupEngine:
         # Encode to the requested output path/format (the rest of the
         # pipeline feeds a plain WAV into Demucs)
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(wav_out), str(output_path)],
+            ["ffmpeg", "-y", "-i", str(wav_out), *self.WAV_CODEC_ARGS, str(output_path)],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
@@ -1425,7 +1492,7 @@ class MashupEngine:
 
             temp_output = f"{output_path}.normtmp.wav"
             result = subprocess.run(
-                ["ffmpeg", "-y", "-i", str(input_path), "-af", f"volume={gain_db:.3f}dB", temp_output],
+                ["ffmpeg", "-y", "-i", str(input_path), "-af", f"volume={gain_db:.3f}dB", *self.WAV_CODEC_ARGS, temp_output],
                 capture_output=True, text=True, timeout=120
             )
             if result.returncode != 0:
@@ -1635,7 +1702,7 @@ class MashupEngine:
                     atempo_chain = ",".join(atempo_filters)
                     cmd = [
                         "ffmpeg", "-i", str(current_input), "-af", atempo_chain,
-                        "-y", "-q:a", "9", temp_output
+                        "-y", *self.WAV_CODEC_ARGS, temp_output
                     ]
 
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -1750,7 +1817,7 @@ class MashupEngine:
                 cmd = [
                     "ffmpeg", "-i", str(input_path),
                     "-af", f"asetrate=44100*{pitch_ratio},aresample=44100,{atempo_chain}",
-                    "-y", "-q:a", "9", str(output_path)
+                    "-y", *self.WAV_CODEC_ARGS, str(output_path)
                 ]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
                 if result.returncode != 0:
@@ -2016,7 +2083,8 @@ class MashupEngine:
         # to produce) -- genuinely lossless, and it's what write_acid_chunk()
         # needs to embed tempo/key info DAWs can actually read.
         output = str(BASE_DIR / "final_remix.wav")
-        command = [self.ffmpeg, "-y", *inputs, "-filter_complex", filter_complex, "-map", "[final]", output]
+        command = [self.ffmpeg, "-y", *inputs, "-filter_complex", filter_complex, "-map", "[final]",
+                   *self.WAV_CODEC_ARGS, output]
 
         try:
             proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -2077,7 +2145,7 @@ class MashupEngine:
                 cmd = [
                     self.ffmpeg, "-i", str(drum_stem_path),
                     "-af", filters,
-                    "-y", "-q:a", "9",
+                    "-y", *self.WAV_CODEC_ARGS,
                     outputs[name]
                 ]
 
@@ -2283,18 +2351,25 @@ class MashupEngine:
         return results
 
     # Ensemble of two vocal models (see _separate_vocals_karaoke): each run
-    # independently on the full song, then averaged sample-by-sample. Verified
-    # by ear on a real clip (2026-09-27, Radar Love) -- vocals_mel_band_roformer
-    # alone (12.60 dB SDR, the documented choice) vs. this BS-Roformer model
-    # alone (12.10 dB SDR) vs. their average: the average won clearly over
-    # either alone, with BS-Roformer the stronger of the two individually.
-    # A known technique (UVR's "Ensemble Mode") -- different architectures
+    # independently on the full song, then averaged sample-by-sample. A
+    # known technique (UVR's "Ensemble Mode") -- different architectures
     # make different mistakes, so averaging smooths those out.
     # (bonus-download slug, model filename) -- the slug names the two bonus
     # "vocals_<slug>"/"instrumental_<slug>" downloads _separate_vocals_karaoke
     # also produces (see below), alongside the averaged ensemble it returns.
+    #
+    # Past decision (superseded): this ensemble originally paired BS-Roformer
+    # with vocals_mel_band_roformer.ckpt (12.60 dB SDR) -- verified by ear
+    # 2026-09-27 to beat either model alone. Replaced 2026-10-01: a live A/B/C
+    # listening test against a real track (not just SDR numbers, which
+    # audio-separator's own registry doesn't even list for this newer
+    # checkpoint) showed becruily's Mel-Band RoFormer vocals model beating
+    # the old ensemble outright, and ensembling IT with BS-Roformer (instead
+    # of the old Mel-Band model) beating becruily alone by a smaller margin
+    # -- so becruily replaced vocals_mel_band_roformer.ckpt here, BS-Roformer
+    # unchanged.
     _ENSEMBLE_VOCAL_MODELS = [
-        ("melband_roformer", "vocals_mel_band_roformer.ckpt"),
+        ("becruily", "mel_band_roformer_vocals_becruily.ckpt"),
         ("bs_roformer", "model_bs_roformer_ep_368_sdr_12.9628.ckpt"),
     ]
 
@@ -2304,8 +2379,8 @@ class MashupEngine:
         full song (not on an already-separated stem).
 
         Each model's own output files are named after the model's
-        *filename*, which for vocals_mel_band_roformer.ckpt happens to
-        contain "vocals" itself, so the non-vocals "(other)" file also
+        *filename*, which for mel_band_roformer_vocals_becruily.ckpt happens
+        to contain "vocals" itself, so the non-vocals "(other)" file also
         matches a naive 'vocal' in filename check -- matching on the
         parenthesized "(vocals)" stem marker specifically avoids silently
         picking that wrong file.
@@ -2327,12 +2402,14 @@ class MashupEngine:
                 "Multi-engine mode requires: pip install audio-separator onnxruntime\n"
                 "Models download automatically on first use."
             )
+        MashupEngine._ensure_audio_separator_float_output()
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         def _vocals_with_model(model_filename):
-            separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+            separator = Separator(output_dir=str(output_dir_path), output_format="WAV", use_soundfile=True,
+                                   model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
             with MashupEngine._model_load_locks[model_filename]:
                 separator.load_model(model_filename=model_filename)
 
@@ -2371,7 +2448,7 @@ class MashupEngine:
             ensemble = (audio_a[:n] + audio_b[:n]) / 2.0
 
             ensemble_path = str(output_dir_path / f"{Path(audio_path).stem}_(vocals)_ensemble.wav")
-            sf.write(ensemble_path, ensemble, sr_a)
+            sf.write(ensemble_path, ensemble, sr_a, subtype='FLOAT')
             return ensemble_path, bonus_stems
         except Exception as e:
             logging.error(f"Vocal separation failed: {e}")
@@ -2393,7 +2470,7 @@ class MashupEngine:
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
-        command = [sys.executable, "-m", "demucs", "-n", model_name,
+        command = [sys.executable, "-m", "demucs", "-n", model_name, "--float32",
                    "--out", str(output_dir_path), audio_path]
         percent_re = re.compile(r"(\d+)%\|")
 
@@ -2512,12 +2589,14 @@ class MashupEngine:
                 "Multi-engine mode requires: pip install audio-separator onnxruntime\n"
                 "Models download automatically on first use."
             )
+        MashupEngine._ensure_audio_separator_float_output()
 
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(exist_ok=True, parents=True)
 
         try:
-            separator = Separator(output_dir=str(output_dir_path), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+            separator = Separator(output_dir=str(output_dir_path), output_format="WAV", use_soundfile=True,
+                                   model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
             with MashupEngine._model_load_locks["MDX23C-DrumSep-aufr33-jarredou.ckpt"]:
                 separator.load_model(model_filename="MDX23C-DrumSep-aufr33-jarredou.ckpt")
 
@@ -2593,6 +2672,7 @@ class MashupEngine:
                 "ML restoration requires: pip install audio-separator onnxruntime\n"
                 "Models download automatically on first use."
             )
+        MashupEngine._ensure_audio_separator_float_output()
 
         restore_dir = Path(output_dir) / "restoration"
         restore_dir.mkdir(exist_ok=True, parents=True)
@@ -2602,8 +2682,10 @@ class MashupEngine:
         # for the de-reverb model) by however many stems there are.
         with _report_audio_separator_progress(
                 "Restoration", lambda label: progress_callback(0.0, label) if progress_callback else None):
-            denoiser = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
-            dereverber = Separator(output_dir=str(restore_dir), output_format="WAV", model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+            denoiser = Separator(output_dir=str(restore_dir), output_format="WAV", use_soundfile=True,
+                                  model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
+            dereverber = Separator(output_dir=str(restore_dir), output_format="WAV", use_soundfile=True,
+                                    model_file_dir=str(AUDIO_SEPARATOR_MODEL_DIR))
             with MashupEngine._model_load_locks["denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt"]:
                 denoiser.load_model(model_filename="denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt")
             with MashupEngine._model_load_locks["dereverb_mel_band_roformer_anvuew_sdr_19.1729.ckpt"]:
@@ -2675,7 +2757,7 @@ class MashupEngine:
                 cmd = [
                     self.ffmpeg, "-y", "-i", str(stem_path),
                     "-af", filters,
-                    "-q:a", "9", restored_path
+                    *self.WAV_CODEC_ARGS, restored_path
                 ]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
                 if result.returncode == 0 and Path(restored_path).is_file():

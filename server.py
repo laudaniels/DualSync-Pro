@@ -91,7 +91,7 @@ def upload_audio():
         wav_filename = f"{int(time.time() * 1000)}_{Path(file.filename).stem}.wav"
         wav_path = audio_dir / wav_filename
         result = subprocess.run(
-            ["ffmpeg", "-y", "-i", str(original_path), "-ar", "44100", str(wav_path)],
+            ["ffmpeg", "-y", "-i", str(original_path), "-ar", "44100", "-c:a", "pcm_f32le", str(wav_path)],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
@@ -323,13 +323,15 @@ def process_song():
         add_log_message("📦 Copying stems to server...", slot)
         for stem_name, stem_path in stem_dict.items():
             if Path(stem_path).exists():
-                # Copy to serve directory, plus an untouched backup that
+                # Copy to serve directory, plus -- for restorable stems only
+                # (see RESTORABLE_STEMS) -- an untouched backup that
                 # /api/restore-stem reverts to (the *_original.wav is never
                 # overwritten again; <stem>.wav is whichever version -- as-is
                 # or restored -- is currently "active" and actually served).
                 dest_path = session_dir / f"{stem_name}.wav"
                 shutil.copy2(stem_path, str(dest_path))
-                shutil.copy2(stem_path, str(session_dir / f"{stem_name}_original.wav"))
+                if stem_name in RESTORABLE_STEMS:
+                    shutil.copy2(stem_path, str(session_dir / f"{stem_name}_original.wav"))
                 stems[stem_name] = f"/api/audio/{timestamp}/{stem_name}.wav"
                 add_log_message(f"  ✅ {stem_name.capitalize()}", slot)
             else:
@@ -473,6 +475,26 @@ def _copy_bonus_stems(stem_dict, session_dir):
 
 
 _VALID_KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+# Which stems /api/restore-stem actually supports. Restoration (denoise +
+# de-reverb) is trained for vocal cleanup -- testing showed it measurably
+# hurts non-vocal stems (e.g. guitar came out ~11 dB quieter), so the UI
+# only ever offers the toggle for vocals. Used both to skip the (otherwise
+# pointless) <stem>_original.wav backup for every other stem, and as a
+# server-side guard in restore_stem() itself -- the UI's own restriction
+# alone wouldn't stop a direct API call for any other stem.
+RESTORABLE_STEMS = {"vocals"}
+
+
+def _format_bpm_for_filename(bpm):
+    """BPM values coming from analysis are full-precision floats
+    (e.g. 104.86241149902344) -- fine for the ACID chunk, unreadable in a
+    filename. Round to 2 decimals there; leave non-numeric values (e.g. the
+    '?' placeholder when nothing was detected) untouched."""
+    try:
+        return f"{float(bpm):.2f}"
+    except (TypeError, ValueError):
+        return bpm
 
 
 def _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label, beat_anchor=None):
@@ -652,12 +674,14 @@ def process_stems():
         for stem in stem_dict.keys():
             stem_path = stem_dict.get(stem)
             if stem_path and Path(stem_path).exists():
-                # Copy processed stem to serve directory, plus an untouched
-                # backup for /api/restore-stem to revert to (see
+                # Copy processed stem to serve directory, plus -- for
+                # restorable stems only (see RESTORABLE_STEMS) -- an
+                # untouched backup for /api/restore-stem to revert to (see
                 # /api/process-song for the full explanation).
                 dest_path = stems_dir / f"{stem}.wav"
                 shutil.copy2(str(stem_path), str(dest_path))
-                shutil.copy2(str(stem_path), str(stems_dir / f"{stem}_original.wav"))
+                if stem in RESTORABLE_STEMS:
+                    shutil.copy2(str(stem_path), str(stems_dir / f"{stem}_original.wav"))
                 processed_stems[stem] = f"/api/audio/{timestamp}/{stem}.wav"
                 add_log_message(f"  ✅ {stem.capitalize()}", slot)
             else:
@@ -705,6 +729,9 @@ def restore_stem():
 
     if not timestamp or not stem:
         return jsonify({'error': 'Missing timestamp or stem'}), 400
+
+    if stem not in RESTORABLE_STEMS:
+        return jsonify({'error': f'Restoration is not supported for "{stem}" (only: {", ".join(sorted(RESTORABLE_STEMS))})'}), 400
 
     try:
         import shutil
@@ -1032,7 +1059,8 @@ def download_stems_zip():
 
                 bpm = meta.get('bpm', '?')
                 key = meta.get('key', '?')
-                folder_name = f"{song_name}_{bpm}BPM_{key}"
+                bpm_display = _format_bpm_for_filename(bpm)
+                folder_name = f"{song_name}_{bpm_display}BPM_{key}"
 
                 logging.info(f"Processing slot {slot}: {song_name} ({key} {bpm}BPM)")
 
@@ -1043,7 +1071,7 @@ def download_stems_zip():
 
                 for stem_file in stem_files:
                     stem_label = stem_file.stem  # e.g. "vocals", "extra_vocals_bs_roformer"
-                    wav_name = f"{song_name}-{bpm}-{key}-{stem_label}.wav"
+                    wav_name = f"{song_name}-{bpm_display}-{key}-{stem_label}.wav"
                     dest_path = Path(temp_dir) / wav_name
                     _tag_stem_wav(engine, stem_file, dest_path, song_name, bpm, key, stem_label,
                                   beat_anchor=meta.get('beat_anchor'))
@@ -1110,6 +1138,7 @@ def download_unaligned_stems():
                 song_name = Path(raw_filename).stem
                 bpm = meta.get('bpm', '?')
                 key = meta.get('key', '?')
+                bpm_display = _format_bpm_for_filename(bpm)
 
                 logging.info(f"Separating unaligned original for slot {slot}: {song_name}")
 
@@ -1124,7 +1153,7 @@ def download_unaligned_stems():
                     if not Path(stem_path).exists():
                         continue
 
-                    wav_name = f"{song_name}-{bpm}-{key}-{stem_name}.wav"
+                    wav_name = f"{song_name}-{bpm_display}-{key}-{stem_name}.wav"
                     dest_path = Path(temp_dir) / wav_name
                     _tag_stem_wav(engine, stem_path, dest_path, song_name, bpm, key, f"{stem_name} (unaligned original)")
                     zip_file.write(str(dest_path), f"unaligned_original/{wav_name}")

@@ -51,7 +51,7 @@ DualSync Pro is a modern web application for creating audio mashups. Load two so
 
 ### Audio Analysis & Processing
 - **Multi-Engine Stem Separation (9 stems)** — best-in-class models for maximum quality:
-  - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged sample-by-sample) — cleanest lead vocals; a listening test showed the average beats either model alone (a known technique, UVR's "Ensemble Mode": different architectures make different mistakes, averaging smooths those out)
+  - **Vocal-model ensemble** (Mel-Band RoFormer by becruily + BS-RoFormer 12.1 dB SDR, averaged sample-by-sample) — cleanest lead vocals; a listening test showed the average beats either model alone (a known technique, UVR's "Ensemble Mode": different architectures make different mistakes, averaging smooths those out)
   - **Demucs htdemucs_6s** (9.5 dB SDR) — guitar, piano, other (the only model that separates these at all)
   - **Demucs hdemucs_mmi** (bass 12.2 dB / drums 9.6 dB SDR) — replaces htdemucs_6s's own (worse) bass and drums, since kick/snare/hi-hat/tom all derive from the drums stem
   - **MDX23C DrumSep** (SOTA) — ML-based kick and snare isolation (from the refined drums stem)
@@ -234,7 +234,7 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
 
 ### Audio Processing Core (Python)
 - **Multi-Engine Stem Separation Pipeline (9 stems):**
-  - **Vocal-model ensemble** (Mel-Band RoFormer 12.6 dB SDR + BS-RoFormer 12.1 dB SDR, averaged) — lead vocals
+  - **Vocal-model ensemble** (Mel-Band RoFormer by becruily + BS-RoFormer 12.1 dB SDR, averaged) — lead vocals
   - **Demucs htdemucs_6s** (9.5 dB SDR) — guitar, piano, other
   - **Demucs hdemucs_mmi** (bass 12.2 dB / drums 9.6 dB SDR) — bass, and the drums stem feeding kick/snare/hi-hat/tom
   - **MDX23C DrumSep** (SOTA) — kick, snare from the refined drums stem
@@ -537,8 +537,8 @@ values if processed "as is", or the shared target if beatmatched/transposed.
 
 ### Bonus/Reference Stems (included in "Download Stems" for free)
 ```
-Part3-Venus-96-C-extra_vocals_melband_roformer.wav     # one ensemble model alone
-Part3-Venus-96-C-extra_instrumental_melband_roformer.wav
+Part3-Venus-96-C-extra_vocals_becruily.wav              # one ensemble model alone
+Part3-Venus-96-C-extra_instrumental_becruily.wav
 Part3-Venus-96-C-extra_vocals_bs_roformer.wav           # the other ensemble model alone
 Part3-Venus-96-C-extra_instrumental_bs_roformer.wav
 Part3-Venus-96-C-extra_vocals_demucs.wav                # Demucs' own (unused) vocals
@@ -565,8 +565,8 @@ Audio/
 │       ├── kick.wav                          # ... (snare, hihat, tom, bass, guitar, piano, other)
 │       ├── vocals_original.wav               # pre-restoration backup (restore-stem toggle)
 │       ├── vocals_restored.wav               # cached restored version, if ever toggled on
-│       ├── extra_vocals_melband_roformer.wav # bonus/reference stems ...
-│       ├── extra_instrumental_melband_roformer.wav
+│       ├── extra_vocals_becruily.wav         # bonus/reference stems ...
+│       ├── extra_instrumental_becruily.wav
 │       ├── extra_vocals_bs_roformer.wav
 │       ├── extra_instrumental_bs_roformer.wav
 │       └── extra_vocals_demucs.wav
@@ -578,7 +578,7 @@ separated_stems/
 └── [hash]/                             # Per-song separation cache (cleared by "Clean and Reset")
 ```
 
-Downloaded files are lossless WAV with embedded metadata:
+Downloaded files are lossless, 32-bit float WAV with embedded metadata:
 - **ACID chunk:** BPM and root key, read automatically by FL Studio, Logic, Cubase, Reaper, Reason, Sound Forge, and Samplitude
 - **TIT2/TPE1:** Song name(s)
 - **TBPM:** Measured output BPM (after beatmatching)
