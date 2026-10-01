@@ -19,7 +19,13 @@
 export class DualStemPlayer {
   constructor() {
     this.audioContext = null;
-    this.delayNode = null; // Song 2 routes through this for the beat-offset slider
+    // One DelayNode per song for the beat-offset slider. A Web Audio
+    // DelayNode can only push a signal LATER, never earlier -- so a negative
+    // offset (Song 2 shifted before Song 1) is implemented by delaying Song
+    // 1's node instead, rather than Song 2's, while the other stays at 0.
+    // See setBeatOffset().
+    this.delayNodes = { 0: null, 1: null };
+    this.delayNodesConnected = { 0: false, 1: false };
     this.buffers = { 0: {}, 1: {} }; // buffers[slot][stem] -> AudioBuffer
     this.gainNodes = { 0: {}, 1: {} }; // gainNodes[slot][stem] -> GainNode (created once, kept across reprocessing)
     this.sourceNodes = { 0: {}, 1: {} }; // sourceNodes[slot][stem] -> currently-playing AudioBufferSourceNode or null
@@ -30,7 +36,7 @@ export class DualStemPlayer {
 
     this.volumes = { 0: {}, 1: {} }; // per-stem 0-1
     this.crossfader = 50; // 0-100, 0=song1 only, 100=song2 only
-    this.beatOffsetSeconds = 0;
+    this.delaySeconds = { 0: 0, 1: 0 }; // actual applied delay per song's node -- see setBeatOffset
 
     // Continuous drift correction: even a "beatmatched" Song 2 only
     // converges to within ~0.5 BPM of Song 1 (see time_stretch_audio's
@@ -66,32 +72,34 @@ export class DualStemPlayer {
       // THAN 180 seconds ("(0, 180)" is an open interval -- 180 itself also
       // throws NotSupportedError), regardless of how much headroom the
       // beat-offset range might want. 179 is comfortably inside that. At
-      // very slow tempos (below ~42 BPM) the full 32-bar range can't quite
-      // be reached live -- an acceptable edge case for a rare tempo.
+      // very slow tempos (below ~11 BPM) the full 8-bar range can't quite
+      // be reached live -- an acceptable edge case for a vanishingly rare tempo.
       // Falling back to a small, universally-safe value on any failure here
       // (rather than letting it throw) matters a lot: this.audioContext is
-      // already assigned above, so on a throw here delayNode would stay
-      // permanently null for the rest of the session -- and since Song 2's
-      // gain nodes ALWAYS route through delayNode (see _ensureGainNode),
-      // every one of them would then fail to .connect(null), silently
-      // breaking Song 2's entire audio path (this exact bug shipped once
+      // already assigned above, so on a throw here a delay node would stay
+      // permanently null for the rest of the session -- and since every
+      // song's gain nodes ALWAYS route through its own delay node (see
+      // _ensureGainNode), they'd then fail to .connect(null), silently
+      // breaking that song's entire audio path (this exact bug shipped once
       // already, from createDelay(200) exceeding the cap).
-      try {
-        this.delayNode = ctx.createDelay(179);
-      } catch (e) {
-        console.error('createDelay(179) failed, falling back to a smaller max delay:', e);
-        this.delayNode = ctx.createDelay(10);
+      for (const slot of [0, 1]) {
+        try {
+          this.delayNodes[slot] = ctx.createDelay(179);
+        } catch (e) {
+          console.error('createDelay(179) failed, falling back to a smaller max delay:', e);
+          this.delayNodes[slot] = ctx.createDelay(10);
+        }
       }
       // NOT connected here -- see play()/pause(). A DelayNode is a FIFO: at
       // a large beat offset, samples pushed into it seconds ago are still
       // queued up to come out later, regardless of whether the source that
-      // originally fed it has since been stopped. Just calling stop() on
-      // Song 2's sources (as pause() does) leaves all of that already-queued
+      // originally fed it has since been stopped. Just calling stop() on a
+      // song's sources (as pause() does) leaves all of that already-queued
       // audio to keep draining out for the full delay duration -- so at a
-      // 16-bar offset, pausing looked like Song 2 kept playing for another
-      // 16 bars. Disconnecting the delay node's OUTPUT on pause silences it
-      // immediately regardless of what's still queued inside it.
-      this.delayNodeConnected = false;
+      // 16-bar offset, pausing looked like that song kept playing for
+      // another 16 bars. Disconnecting the delay node's OUTPUT on pause
+      // silences it immediately regardless of what's still queued inside it.
+      this.delayNodesConnected = { 0: false, 1: false };
     }
     if (this.audioContext.state === 'suspended') {
       this.audioContext.resume();
@@ -100,16 +108,20 @@ export class DualStemPlayer {
   }
 
   _connectDelayNode() {
-    if (this.delayNode && !this.delayNodeConnected) {
-      this.delayNode.connect(this.audioContext.destination);
-      this.delayNodeConnected = true;
+    for (const slot of [0, 1]) {
+      if (this.delayNodes[slot] && !this.delayNodesConnected[slot]) {
+        this.delayNodes[slot].connect(this.audioContext.destination);
+        this.delayNodesConnected[slot] = true;
+      }
     }
   }
 
   _disconnectDelayNode() {
-    if (this.delayNode && this.delayNodeConnected) {
-      this.delayNode.disconnect();
-      this.delayNodeConnected = false;
+    for (const slot of [0, 1]) {
+      if (this.delayNodes[slot] && this.delayNodesConnected[slot]) {
+        this.delayNodes[slot].disconnect();
+        this.delayNodesConnected[slot] = false;
+      }
     }
   }
 
@@ -117,11 +129,7 @@ export class DualStemPlayer {
     if (this.gainNodes[slot][stem]) return this.gainNodes[slot][stem];
     const ctx = this.ensureContext();
     const gain = ctx.createGain();
-    if (slot === 1) {
-      gain.connect(this.delayNode);
-    } else {
-      gain.connect(ctx.destination);
-    }
+    gain.connect(this.delayNodes[slot]);
     this.gainNodes[slot][stem] = gain;
     return gain;
   }
@@ -181,10 +189,22 @@ export class DualStemPlayer {
   }
 
   setBeatOffset(beats, song2Bpm) {
-    this.beatOffsetSeconds = beats > 0 ? (beats / (song2Bpm || 120)) * 60 : 0;
-    if (this.delayNode && this.audioContext) {
-      const clamped = Math.max(0, Math.min(this.beatOffsetSeconds, 179));
-      this.delayNode.delayTime.setValueAtTime(clamped, this.audioContext.currentTime);
+    const offsetSeconds = (beats / (song2Bpm || 120)) * 60;
+    // A DelayNode can only push a signal LATER, never earlier -- so a
+    // negative offset (Song 2 shifted before Song 1) is realized by delaying
+    // Song 1's node instead, while Song 2's stays at 0, and vice versa for a
+    // positive offset. Exactly one of the two is ever non-zero.
+    this.delaySeconds = {
+      0: offsetSeconds < 0 ? Math.max(0, Math.min(-offsetSeconds, 179)) : 0,
+      1: offsetSeconds > 0 ? Math.max(0, Math.min(offsetSeconds, 179)) : 0
+    };
+    if (this.audioContext) {
+      const now = this.audioContext.currentTime;
+      for (const slot of [0, 1]) {
+        if (this.delayNodes[slot]) {
+          this.delayNodes[slot].delayTime.setValueAtTime(this.delaySeconds[slot], now);
+        }
+      }
     }
   }
 
@@ -224,11 +244,12 @@ export class DualStemPlayer {
     if (!period0 || !period1) return;
 
     const pos = this.getPosition();
-    const phase0 = this._wrapPhase(pos - grid0.anchor, period0);
-    // Song 2's AUDIBLE phase lags its buffer phase by the static beat-offset
-    // delay (that's the whole point of the delay node), so subtract it here
-    // to compare like-for-like "what's actually audible right now."
-    const phase1 = this._wrapPhase(pos - this.beatOffsetSeconds - grid1.anchor, period1);
+    // Each song's AUDIBLE phase lags its buffer phase by whichever delay is
+    // actually applied to its own node (see setBeatOffset -- exactly one of
+    // the two is ever non-zero), so subtract it here to compare like-for-like
+    // "what's actually audible right now."
+    const phase0 = this._wrapPhase(pos - this.delaySeconds[0] - grid0.anchor, period0);
+    const phase1 = this._wrapPhase(pos - this.delaySeconds[1] - grid1.anchor, period1);
 
     // Shortest signed distance (in seconds) from phase1 to phase0, using
     // song2's own beat period as the wraparound reference. Positive means
@@ -354,7 +375,8 @@ export class DualStemPlayer {
       this.audioContext.close().catch(() => {});
     }
     this.audioContext = null;
-    this.delayNode = null;
+    this.delayNodes = { 0: null, 1: null };
+    this.delayNodesConnected = { 0: false, 1: false };
     this.buffers = { 0: {}, 1: {} };
     this.gainNodes = { 0: {}, 1: {} };
     this.sourceNodes = { 0: {}, 1: {} };

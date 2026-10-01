@@ -58,7 +58,7 @@ export default function DualMixer() {
   // smaller than a single pixel of slider drag, so snapping silently never
   // fired). beatOffset (derived below, x4) is what the player/render still
   // consume, since those work in beats.
-  const [barOffset, setBarOffset] = useState(0); // 0-32 bars for Song 2
+  const [barOffset, setBarOffset] = useState(0); // -8 to +8 bars (32 beats) for Song 2 (negative = Song 2 shifted earlier)
   const [barOffsetDisplay, setBarOffsetDisplay] = useState(0); // Fine-tuned display value
   const beatOffset = barOffset * 4; // what the player/render actually consume
   const [driftCorrection, setDriftCorrection] = useState(50); // 0-100, live playbackRate drift correction strength for Song 2
@@ -121,7 +121,7 @@ export default function DualMixer() {
     const snapThreshold = 0.1;
     const distanceToNearestBar = Math.abs(barOffsetDisplay - nearestBar);
 
-    if (distanceToNearestBar < snapThreshold && nearestBar >= 0 && nearestBar <= 32) {
+    if (distanceToNearestBar < snapThreshold && nearestBar >= -8 && nearestBar <= 8) {
       // Snap to bar
       setBarOffset(nearestBar);
       setIsSnappedToBeat(true);
@@ -1270,22 +1270,26 @@ export default function DualMixer() {
               />
             )}
 
-            {/* Beat Offset for Song 2 with Magnetic Snap -- up to 32 bars.
+            {/* Beat Offset for Song 2 with Magnetic Snap -- +/-8 bars (32 beats).
                 The slider's own unit is BARS (precise to drag/snap at this
                 range); beatOffset (bars*4) is what's sent to the player and
-                the render, since those work in beats. */}
+                the render, since those work in beats. Negative shifts Song 2
+                EARLIER relative to Song 1 (see DualStemPlayer.setBeatOffset
+                and MashupEngine.render, both of which delay whichever song
+                needs it rather than assuming Song 2 is always the one
+                pushed later). */}
             <div className="crossfader-section" style={{ marginTop: '15px' }}>
               <label>🎵 Beat Offset (Song 2) — Fine-tune + Snap to Bars</label>
               <div className="crossfader-labels">
+                <span>-8 bars</span>
                 <span>Sync</span>
-                <span>Offset</span>
-                <span>+32 bars</span>
+                <span>+8 bars</span>
               </div>
               <div style={{ position: 'relative' }}>
                 <input
                   type="range"
-                  min="0"
-                  max="32"
+                  min="-8"
+                  max="8"
                   step="0.05"
                   value={barOffsetDisplay}
                   onChange={(e) => setBarOffsetDisplay(parseFloat(e.target.value))}
@@ -1299,11 +1303,11 @@ export default function DualMixer() {
               </div>
               <div className="crossfader-value">
                 {isSnappedToBeat ? (
-                  `🎯 Snapped: +${barOffset} bar${barOffset !== 1 ? 's' : ''} (${beatOffset} beats) — fine-tune: ${barOffsetDisplay.toFixed(2)} bars`
+                  `🎯 Snapped: ${barOffset > 0 ? '+' : ''}${barOffset} bar${Math.abs(barOffset) !== 1 ? 's' : ''} (${beatOffset} beats) — fine-tune: ${barOffsetDisplay > 0 ? '+' : ''}${barOffsetDisplay.toFixed(2)} bars`
                 ) : barOffsetDisplay === 0 ? (
                   '✓ Sync (no offset)'
                 ) : (
-                  `⚙️ Fine-tuning: +${barOffsetDisplay.toFixed(2)} bars (${(barOffsetDisplay * 4).toFixed(1)} beats)`
+                  `⚙️ Fine-tuning: ${barOffsetDisplay > 0 ? '+' : ''}${barOffsetDisplay.toFixed(2)} bars (${barOffsetDisplay > 0 ? '+' : ''}${(barOffsetDisplay * 4).toFixed(1)} beats)`
                 )}
               </div>
             </div>

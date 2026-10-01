@@ -68,8 +68,9 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, son
     const actualStart = Math.min(windowStart, totalDuration - ZOOM_WINDOW);
     const actualEnd = actualStart + ZOOM_WINDOW;
 
-    // Calculate beat offset delay in seconds
-    const delaySeconds = beatOffset > 0 ? (beatOffset / song2Bpm) * 60 : 0;
+    // Calculate beat offset delay in seconds -- negative shifts Song 2
+    // earlier (see DualStemPlayer.setBeatOffset for the matching playback behavior)
+    const delaySeconds = song2Bpm > 0 ? (beatOffset / song2Bpm) * 60 : 0;
 
     // Calculate pixel offset for Song 2 based on beat offset
     const song2PixelOffset = (delaySeconds / ZOOM_WINDOW) * width;
@@ -186,7 +187,7 @@ export default function Waveform({ kicks, currentTime, beatOffset, song2Bpm, son
     }
 
     // Draw beat offset indicator
-    if (beatOffset > 0 && delaySeconds < ZOOM_WINDOW) {
+    if (delaySeconds !== 0 && Math.abs(delaySeconds) < ZOOM_WINDOW) {
       const offsetX = ((delaySeconds - (actualStart % delaySeconds)) / ZOOM_WINDOW) * width;
       if (offsetX >= 0 && offsetX <= width) {
         ctx.strokeStyle = 'rgba(255, 193, 7, 0.5)';

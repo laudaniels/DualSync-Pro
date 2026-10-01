@@ -1981,13 +1981,14 @@ class MashupEngine:
                 # confusing knob.
                 #
                 # NOTE: the user's beat_offsets choice is intentionally NOT
-                # folded in here -- it's applied separately below as a plain
-                # forward delay (see user_delay), matching exactly what the
-                # live player does (DualStemPlayer.setBeatOffset: a direct,
-                # always-non-negative beats->seconds delay on Song 2, nothing
-                # more). This anchor is ONLY the automatic phase-correction
-                # target: where Song 2's beat would need to land to line up
-                # with Song 1's, before any of the user's own offset choice.
+                # folded in here -- it's applied separately in the delay
+                # pre-pass below (see user_delay), matching exactly what the
+                # live player does (DualStemPlayer.setBeatOffset: a direct
+                # beats->seconds delay, negative meaning Song 2 shifted
+                # before Song 1 rather than after -- see that method). This
+                # anchor is ONLY the automatic phase-correction target: where
+                # Song 2's beat would need to land to line up with Song 1's,
+                # before any of the user's own offset choice.
                 tempo_ratio = target_bpm / detected_bpm
                 pitch = float(sliders.get(f"s{slot}_pitch_shift", 0.0))
                 speed = float(sliders.get(f"s{slot}_speed", 1.0)) * tempo_ratio
@@ -2002,6 +2003,32 @@ class MashupEngine:
         # this render rather than silently falling back to another track.
         reference_slot = 0 if 0 in final_anchors else None
         beat_period = 60.0 / target_bpm if beatmatch else None
+
+        # Pre-pass: each slot's raw delay (user's beat-offset choice + any
+        # automatic beatmatch phase correction), BEFORE clamping to >= 0.
+        # adelay can only push a track later, never earlier -- a negative
+        # user offset (Song 2 shifted before Song 1, matching the live
+        # player's DualStemPlayer.setBeatOffset, which delays Song 1's own
+        # node instead in that case) would otherwise just get silently
+        # dropped here. Normalizing by the most-negative raw delay (if any)
+        # shifts every slot's delay up by the same amount, preserving every
+        # pairwise relative offset while keeping all of them >= 0.
+        raw_delays = {}
+        for slot, song in enumerate(slots):
+            if not song:
+                continue
+            detected_bpm = bpms[slot] if slot < len(bpms) else None
+            offset_beats = 0.0 if slot == 0 else (beat_offsets[slot] if slot < len(beat_offsets) else 0.0)
+            effective_bpm = target_bpm if (beatmatch and detected_bpm) else detected_bpm
+            user_delay = (offset_beats * 60.0 / effective_bpm) if (offset_beats and effective_bpm) else 0.0
+
+            auto_delay = 0.0
+            if beatmatch and reference_slot is not None and slot != reference_slot and slot in final_anchors:
+                auto_delay = (final_anchors[reference_slot] - final_anchors[slot]) % beat_period
+
+            raw_delays[slot] = user_delay + auto_delay
+
+        delay_shift = max(0.0, -min(raw_delays.values())) if raw_delays else 0.0
 
         crossfade = float(params.get("crossfader", 50)) / 100.0
         fades = {0: min(1.0, 2 * (1 - crossfade)), 1: min(1.0, 2 * crossfade)}
@@ -2049,28 +2076,12 @@ class MashupEngine:
 
             chain, _duration_scale = self._effects(chain, sliders, slot, tempo_ratio)
 
-            # Two INDEPENDENT delay contributions, both always >= 0 (adelay
-            # can only push a track later, never earlier -- summing two
-            # non-negative delays can never go negative, unlike trying to
-            # fold the user's offset into the anchor before modulo-wrapping):
-            #
-            # 1. The user's own beat-offset choice, as a plain forward delay
-            #    -- matches the live player exactly (DualStemPlayer's
-            #    DelayNode: beats/bpm*60, nothing more), so what you hear in
-            #    the final render matches what you heard live, bars and all.
-            offset_beats = 0.0 if slot == 0 else (beat_offsets[slot] if slot < len(beat_offsets) else 0.0)
-            effective_bpm = target_bpm if (beatmatch and detected_bpm) else detected_bpm
-            user_delay = (offset_beats * 60.0 / effective_bpm) if (offset_beats and effective_bpm) else 0.0
-
-            # 2. Automatic phase correction from beatmatching -- a small,
-            #    modulo-one-beat nudge so this track's OWN natural beat lines
-            #    up with the reference's, independent of whatever the user
-            #    additionally asked for above.
-            auto_delay = 0.0
-            if beatmatch and reference_slot is not None and slot != reference_slot and slot in final_anchors:
-                auto_delay = (final_anchors[reference_slot] - final_anchors[slot]) % beat_period
-
-            total_delay = user_delay + auto_delay
+            # This slot's share of the two delay contributions computed in
+            # the pre-pass above (user's beat-offset choice + automatic
+            # beatmatch phase correction), shifted by delay_shift so every
+            # slot's absolute delay is >= 0 while preserving their relative
+            # offsets -- see that pre-pass for why.
+            total_delay = raw_delays.get(slot, 0.0) + delay_shift
             if total_delay > 0.005:
                 chain += f",adelay={int(round(total_delay * 1000))}:all=1"
 

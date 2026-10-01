@@ -91,7 +91,7 @@ const TIER_BY_SCORE = {
   1: { label: 'Very good', emoji: '🟢' },
   2: { label: 'Good', emoji: '👍' },
   3: { label: 'Fair', emoji: '🙂' },
-  4: { label: 'Ok', emoji: '🆗' }
+  4: { label: 'Ok', emoji: '🟠' }
 };
 
 // Semitone distance (shortest path, -6 to +6)

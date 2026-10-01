@@ -20,7 +20,7 @@ export default function App() {
       </main>
 
       <footer className="app-footer">
-        <p>Load up to 2 songs → AI separates into stems → Mix & create mashups in real-time</p>
+        <p>Load up to 2 songs → AI separates into stems → Mix & create mashups in real-time (C) Lau Daniels</p>
       </footer>
     </div>
   )
