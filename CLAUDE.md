@@ -267,6 +267,15 @@ list):**
   been toggled (see Restoration above) -- the only restorable stem
   (`RESTORABLE_STEMS` in server.py), so it's also the only one that ever
   gets an `_original.wav` backup in the first place
+- `<song>-<bpm>-<key>-full_song.wav` -- the full-song WAV the stems were
+  actually separated from (as-is/aligned/snapped, and beatmatched/
+  transposed if a target was ever applied), not glob-matched like the
+  stems since it lives directly under `Audio/`, not in the stems folder.
+  The frontend tracks which file that is per slot (`sourceWavFilename`,
+  refreshed after every (re)process -- see `source_wav_filename`/
+  `processed_wav_filename` in `/api/analyze-song`/`/api/process-song`/
+  `/api/process-stems`) and sends it along with the zip request; skipped
+  if that file is missing (e.g. a pre-this-feature session)
 - ACID chunks embedded on every file (BPM/key for DAW auto-detect)
 - No more separate "original/" vs "processed/" folders -- a song only has
   one current state at a time (whatever's currently active, as-is or

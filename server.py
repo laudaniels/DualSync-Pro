@@ -701,7 +701,14 @@ def process_stems():
             'target_bpm': target_bpm,
             'source_bpm': source_bpm,
             'measured_key': measured_key_name,
-            'target_key': target_key
+            'target_key': target_key,
+            # The full-song WAV these stems were ACTUALLY separated from --
+            # original_file unless beatmatch/transpose ran, in which case
+            # it's the processed/transposed copy. Lets the frontend keep its
+            # sourceWavFilename pointing at whatever file really matches the
+            # CURRENT stems (see /api/download-stems-zip, which bundles it in
+            # as the full reference track).
+            'processed_wav_filename': current_input.name
         })
     except Exception as e:
         logging.error(f"Process error: {e}", exc_info=True)
@@ -1029,6 +1036,14 @@ def download_stems_zip():
     the served directory in the first place (real ML kick/snare from
     DrumSep are used instead), so there's nothing to exclude.
 
+    Also includes, if the frontend sent a source_wav_filename for that slot,
+    the full-song WAV the current stems were actually separated from
+    (as-is/aligned/snapped, and beatmatched/transposed if a target was ever
+    applied -- see /api/process-song's and /api/process-stems'
+    source_wav_filename/processed_wav_filename) -- a reference track that
+    matches the stems exactly, e.g. for realigning in a DAW without having
+    to re-mix all the stems back together first.
+
     Each WAV carries an ACID chunk (BPM/key) so DAWs can auto-detect tempo
     on import -- see _tag_stem_wav."""
     data = request.json
@@ -1077,6 +1092,24 @@ def download_stems_zip():
                                   beat_anchor=meta.get('beat_anchor'))
                     zip_file.write(str(dest_path), f"{folder_name}/{wav_name}")
                     logging.debug(f"  ✓ {folder_name}/{wav_name}")
+
+                # Full-song reference track the above stems were actually
+                # separated from, if the frontend tracked one for this slot
+                # (see the docstring above) -- not glob-matched like the
+                # stems since it lives directly under Audio/, not in this
+                # song's stems/<timestamp>/ folder.
+                source_wav_filename = meta.get('source_wav_filename')
+                if source_wav_filename:
+                    source_wav_path = BASE_DIR / 'Audio' / source_wav_filename
+                    if source_wav_path.is_file():
+                        wav_name = f"{song_name}-{bpm_display}-{key}-full_song.wav"
+                        dest_path = Path(temp_dir) / wav_name
+                        _tag_stem_wav(engine, source_wav_path, dest_path, song_name, bpm, key, 'full_song',
+                                      beat_anchor=meta.get('beat_anchor'))
+                        zip_file.write(str(dest_path), f"{folder_name}/{wav_name}")
+                        logging.debug(f"  ✓ {folder_name}/{wav_name}")
+                    else:
+                        logging.warning(f"Full-song reference not found for slot {slot}: {source_wav_path}")
 
         # Cleanup temp directory
         import shutil

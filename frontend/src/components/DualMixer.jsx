@@ -416,7 +416,8 @@ export default function DualMixer() {
         stems: data.processed_stems,
         timestamp,
         ...(data.measured_bpm && { measured_bpm: data.measured_bpm, currentBpm: data.measured_bpm }),
-        ...(data.measured_key && { currentKey: data.measured_key })
+        ...(data.measured_key && { currentKey: data.measured_key }),
+        ...(data.processed_wav_filename && { sourceWavFilename: data.processed_wav_filename })
       };
       return updated;
     });
@@ -874,7 +875,8 @@ export default function DualMixer() {
                 target_bpm: data.target_bpm,
                 currentBpm: data.measured_bpm
               }),
-              ...(data.measured_key && { currentKey: data.measured_key })
+              ...(data.measured_key && { currentKey: data.measured_key }),
+              ...(data.processed_wav_filename && { sourceWavFilename: data.processed_wav_filename })
             };
           }
           return newMetadata;
@@ -1709,7 +1711,13 @@ export default function DualMixer() {
                     filename: m.filename,
                     bpm: getCurrentBpm(i) ?? generateBpmLabel(m, false),
                     key: getCurrentKey(i) ?? m.key,
-                    beat_anchor: m.beat_anchor
+                    beat_anchor: m.beat_anchor,
+                    // The full-song WAV the CURRENT stems were actually
+                    // separated from -- lets the backend bundle it in as a
+                    // reference track alongside the stems (see
+                    // runSeparationAsIs/WithTarget/processStems, which keep
+                    // this pointed at whatever that file currently is).
+                    source_wav_filename: m.sourceWavFilename
                   } : null);
 
                   handleDownload('stems', '/api/download-stems-zip', {

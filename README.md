@@ -233,7 +233,7 @@ All files are lossless WAV with an embedded ACID chunk (BPM + key, DAW-readable)
   - `POST /api/restore-stem` — apply or revert denoise + de-reverb restoration for one stem on demand (vocals only in the UI)
   - `GET /api/process-status` — returns current processing progress (0-100%), current stage, and real-time log messages
   - `POST /api/render-final-mix` — mix all 9 stems into the final lossless WAV, with an ACID chunk + ID3 tags
-  - `POST /api/download-stems-zip` — download every generated stem for both songs as tagged WAV in a ZIP, one folder per song
+  - `POST /api/download-stems-zip` — download every generated stem for both songs as tagged WAV in a ZIP, one folder per song, plus the full-song WAV each song's stems were actually separated from
   - `POST /api/download-unaligned-stems` — download the pre-alignment 9 stems as tagged WAV in a ZIP
   - `GET /api/download-file/<filename>` — download single audio file
   - `GET /api/audio/<path>` — serve individual audio files
@@ -554,6 +554,7 @@ Part3-Venus-96-C-extra_instrumental_becruily.wav
 Part3-Venus-96-C-extra_vocals_bs_roformer.wav           # the other ensemble model alone
 Part3-Venus-96-C-extra_instrumental_bs_roformer.wav
 Part3-Venus-96-C-extra_vocals_demucs.wav                # Demucs' own (unused) vocals
+Part3-Venus-96-C-full_song.wav                          # the full song the stems above came from
 ```
 
 ### With Manual BPM Override
