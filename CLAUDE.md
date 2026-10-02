@@ -443,6 +443,18 @@ HuggingFace Hub's own progress reporting).
   models convert to float32 tensors regardless of source precision; the
   only cost is ~2x larger files on disk and in downloads (4 bytes/sample
   vs. 16-bit's 2).
+- **Memory release after each audio-separator model use**: `server.py` is a
+  long-lived process, and every vocal-ensemble member / DrumSep / restoration
+  model load creates a fresh `audio_separator.Separator` (loading a multi-GB
+  checkpoint) rather than reusing one -- confirmed via `free`/`ps` that RSS
+  climbed several GB per separation and kept climbing run over run instead of
+  settling back down, eventually swapping. `_release_separator_memory()`
+  (`del` the Separator, then `gc.collect()` + `torch.cuda.empty_cache()`) runs
+  right after each one is done being used, since CPython's generational GC
+  triggers off allocation *count*, not size, and can leave a handful of huge
+  objects uncollected for a long time without a nudge. Demucs doesn't need
+  this -- it always runs as its own OS subprocess (`_run_demucs`), so its
+  memory is fully released by the OS when that process exits.
 - BPM detection and stem separation run in background threads
 - Multi-engine mode uses parallel GPU processing (Stage 1: vocal-model ensemble + Demucs x2)
 - Stem separation pipeline: ~12-17 min per track (quality prioritized;

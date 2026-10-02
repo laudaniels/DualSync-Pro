@@ -17,6 +17,33 @@ BASE_DIR = Path(__file__).resolve().parent
 AUDIO_SEPARATOR_MODEL_DIR = Path.home() / ".cache" / "audio-separator-models"
 
 
+def _release_separator_memory():
+    """Proactively reclaim memory after a Separator (and its loaded
+    multi-GB checkpoint) is no longer needed, instead of waiting on
+    Python's cyclic GC to eventually notice. This is a long-lived server
+    process that creates a FRESH Separator instance per model load (vocal
+    ensemble x2, DrumSep x1 on every separation; denoise+de-reverb x2 on
+    every restore-toggle) -- confirmed via `free`/`ps` that RSS climbs by
+    several GB per separation and keeps climbing run over run rather than
+    settling back down, eventually pushing the box into heavy swapping.
+    CPython's generational GC triggers off allocation *count*, not size, so
+    a handful of huge objects can sit uncollected for a long time without a
+    nudge; torch.cuda.empty_cache() additionally returns its caching
+    allocator's now-unused blocks (freed by the gc.collect() just before
+    it) to the driver instead of holding them for reuse that never comes,
+    since this process won't load that exact model again until the next
+    separation. Caller must `del` its own Separator reference(s) first --
+    this only forces the collection/cache-release that follows."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 class _AudioSeparatorLogBridge(logging.Handler):
     """Turns audio-separator's own phase-transition log lines (model load
     start, separation start) into progress_callback updates, tagged with
@@ -2441,7 +2468,10 @@ class MashupEngine:
             # (its "(other)"/"(Instrumental)" complement) -- there's normally
             # just one, but keep this robust to a model with more than two.
             instrumental_matches = [p for p in resolved if p not in vocals_matches]
-            return vocals_matches[0], (instrumental_matches[0] if instrumental_matches else None)
+            result = vocals_matches[0], (instrumental_matches[0] if instrumental_matches else None)
+            del separator
+            _release_separator_memory()
+            return result
 
         try:
             bonus_stems = {}
@@ -2634,6 +2664,8 @@ class MashupEngine:
                     f"{[Path(p).name for p in resolved]}. Update the keyword matching "
                     "above to match this model's actual naming."
                 )
+            del separator
+            _release_separator_memory()
             return mapping
         except Exception as e:
             logging.error(f"MDX23C DrumSep failed: {e}")
@@ -2740,6 +2772,8 @@ class MashupEngine:
 
         if progress_callback:
             progress_callback(1.0, "Denoise + de-reverb complete")
+        del denoiser, dereverber
+        _release_separator_memory()
         return restored
 
     def _apply_spectral_restoration(self, stems, output_dir, progress_callback=None):
