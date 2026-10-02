@@ -117,10 +117,10 @@ When you upload an MP3 file:
 
 Both songs are analyzed independently and in parallel (independent uploads).
 
-![Initial processing — Song 1](docs/images/02-initial-processing-song1.png)
+![Initial processing — Song 1](docs/images/Start-up2.png)
 *Figure 2 — Song 1 during initial upload/processing, with its alignment-mode choice.*
 
-![Initial processing — Song 2](docs/images/start-up-3.png)
+![Initial processing — Song 2](docs/images/Start-up3.png)
 *Figure 3 — Song 2 during initial upload/processing, including the "Snap beat grid to Song 1" option once Song 1 is ready.*
 
 ### 2. Choose How to Process
@@ -132,6 +132,9 @@ Once **both** songs are analyzed, you can:
 Then click one button, which reads either:
 - **"Process as is"** (no target BPM/Key set) — each song keeps its own detected BPM/Key
 - **"Process with Target BPM/Key"** (once you've set one or both) — both songs are beatmatched/transposed to the same shared target before separating
+
+![Processing ](docs/images/BPM-Key-Download.png)
+*Figure 4 — Choose the desired processing parameters*
 
 ### 3. Stem Separation
 Clicking that button kicks off the (slow) part for **both songs in parallel**:
@@ -145,6 +148,12 @@ Clicking that button kicks off the (slow) part for **both songs in parallel**:
 5. The volume/mixer view only appears once **both** songs have finished separating
 
 Set a new target and click the button again any time afterward (now labeled "Process All Changes") to reprocess the already-separated stems to a different BPM/Key — it always starts fresh from the originally-detected values, not from wherever the last reprocess left off.
+
+![Realtime Player 1](docs/images/Realtime-Player-1.png)
+*Figure 5 — Top of the volume sliders*
+
+![Realtime Player 2 ](docs/images/Realtime-Player-2.png)
+*Figure 6 — Top of the volume sliders*
 
 ### 4. Mix in Real-Time
 After processing:
